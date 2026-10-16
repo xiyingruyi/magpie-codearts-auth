@@ -3,3 +3,6 @@ _probe/
 *.tgz
 *.log
 .DS_Store
+
+# token 缺 workflow scope，暂时不提交 CI；补 scope 后删掉这行即可
+.github/workflows/
