@@ -48,10 +48,12 @@ AccessKeyId:SecretAccessKey
 |---|---|
 | `claimed` | 签到成功且 `create_time` 落在今天 |
 | `done` | 今天已经签过 |
-| `ineligible` | 当前不在签到活动期内（活动结束 / 未开始） |
-| `inactive` | 账号未开通该权益或未实名 |
+| `ineligible` | 上游未推进签到时间（账号不参与签到活动 / 活动已结束） |
+| `inactive` | 账号未开通该权益或未实名 / 未登录 |
 | `captcha` | 需要人机验证，提示到控制台手动签到 |
 | `failed` | 其它错误（宿主 30 分钟后重试） |
+
+> **实测注意**：老套餐（AgentCenter）账号不参与签到活动 —— 上游对这类账号**不报错**，`POST /benefit/claim` 会原样返回旧的 `create_time`（余额也不变）。插件据此判定为 `ineligible`，避免宿主每 30 分钟无意义重试。
 
 ## 对话通道（重要）
 

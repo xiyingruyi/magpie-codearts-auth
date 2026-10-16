@@ -358,6 +358,30 @@ test("usage: 未登录时返回 error", async () => {
   assert.deepEqual(u.windows, []);
 });
 
+test("usage: 免费额度 window 的 used/limit 成对（magpie 百分比 = used/limit）", async () => {
+  const plugin = await mod.default({}, {});
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("tokens/balance")) {
+      return new Response(JSON.stringify({ result: { total_quota: 10000000, total_balance: 9700000, used_amount: 300000 } }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ result: { create_time: Date.now() } }), { status: 200 });
+  };
+  try {
+    const u = await plugin.auth.usage(async () => ({
+      type: "api", key: "AK1234567890123456789", metadata: { sk: "SKabcdefghijklmnopqrs" },
+    }));
+    const w = u.windows[0];
+    assert.equal(w.used, 300000);
+    assert.equal(w.limit, 10000000);
+    assert.equal(w.amount, 9700000);
+    // 百分比有意义（3%），不会像 299501% 那样离谱
+    assert.ok(w.used / w.limit < 1, "used/limit 必须 < 1");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
 test("checkin: 未登录 → inactive", async () => {
   const plugin = await mod.default({}, {});
   const c = await plugin.auth.checkin(async () => undefined);

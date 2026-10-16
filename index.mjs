@@ -383,10 +383,18 @@ export default async function codeartsPlugin(_input, options) {
           return {
             balance: `${Math.round(total)} 积分`,
             windows: [
-              { name: "免费额度", used, display: `${Math.round(total)} / ${Math.round(quota)}` },
+              {
+                name: "免费额度",
+                // magpie 的百分比 = used / limit，所以两者都要给
+                used: Number.isFinite(used) ? used : undefined,
+                limit: Number.isFinite(quota) && quota > 0 ? quota : undefined,
+                amount: Number.isFinite(total) ? total : undefined,
+                display: `${Math.round(total)} / ${Math.round(quota)}`,
+              },
               {
                 name: "每日签到",
                 used: signedToday ? 0 : 1,
+                limit: 1,
                 display: signedToday ? "今日已签 ✓" : "今日未签（+1000）",
                 aside: true,
               },
