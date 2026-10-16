@@ -55,6 +55,19 @@ AccessKeyId:SecretAccessKey
 
 > **实测注意**：老套餐（AgentCenter）账号不参与签到活动 —— 上游对这类账号**不报错**，`POST /benefit/claim` 会原样返回旧的 `create_time`（余额也不变）。插件据此判定为 `ineligible`，避免宿主每 30 分钟无意义重试。
 
+## Usage 卡片字段语义（实测定论）
+
+magpie 的 `usage()` window 有三个容易搞错的字段，本插件已按实测语义填写：
+
+| 字段 | 含义 | magpie 如何渲染 |
+|---|---|---|
+| `used` | **已用百分比**（0~100+，可超 100） | 直接显示为 `N%` |
+| `amount` | 绝对值计量（这里是**剩余**额度） | 与 `limit` 组合成 `(amount / limit)` |
+| `limit` | 绝对值总量 | 同上 |
+| `unit` | 计量单位文案 | 拼在括号数字后（如「积分」） |
+
+**踩坑记录**：曾把 `used` 填成绝对值 `299530`，`magpie quota` 就显示成 `299530%`。受控实验（`used:50 → 50%`、`used:3 → 3%`）定论：**`used` 是百分比，不是绝对值**。正确做法是 `used = used_amount / total_quota * 100`。
+
 ## 对话通道（重要）
 
 上游 `/api/v2/chat/completions` 有**两条严格区分的通道**：

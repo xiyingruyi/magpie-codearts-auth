@@ -358,7 +358,7 @@ test("usage: 未登录时返回 error", async () => {
   assert.deepEqual(u.windows, []);
 });
 
-test("usage: 免费额度 window 的 used/limit 成对（magpie 百分比 = used/limit）", async () => {
+test("usage: 免费额度 window 的 used 是百分比、amount/limit 是绝对值（实测定论）", async () => {
   const plugin = await mod.default({}, {});
   const realFetch = globalThis.fetch;
   globalThis.fetch = async (url) => {
@@ -372,11 +372,14 @@ test("usage: 免费额度 window 的 used/limit 成对（magpie 百分比 = used
       type: "api", key: "AK1234567890123456789", metadata: { sk: "SKabcdefghijklmnopqrs" },
     }));
     const w = u.windows[0];
-    assert.equal(w.used, 300000);
+    // 🔴 used 是百分比：300000/10000000 = 3%
+    assert.equal(w.used, 3);
+    assert.ok(w.used >= 0 && w.used <= 100, "used 必须落在 0~100 的百分比区间");
+    // amount/limit 是绝对值，magpie 渲染成 "(amount / limit)"
     assert.equal(w.limit, 10000000);
     assert.equal(w.amount, 9700000);
-    // 百分比有意义（3%），不会像 299501% 那样离谱
-    assert.ok(w.used / w.limit < 1, "used/limit 必须 < 1");
+    assert.equal(w.unit, "积分");
+    assert.equal(w.display, "9700000 / 10000000");
   } finally {
     globalThis.fetch = realFetch;
   }

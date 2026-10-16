@@ -380,15 +380,22 @@ export default async function codeartsPlugin(_input, options) {
           const quota = Number(bal.total_quota ?? 0);
           const used = Number(bal.used_amount ?? 0);
           const signedToday = Number(claim?.create_time ?? 0) >= startOfTodayMs();
+          // 🔴 magpie 的 window 语义（实测定论，勿改）：
+          //   used   = 已用百分比（0~100+），magpie 直接把它渲染成 "N%"
+          //   amount = 绝对值计量（配合 limit 渲染成 "(amount / limit)"）
+          //   limit  = 绝对值总量
+          // 之前误把 used 填成绝对值 299530，magpie 就显示成了 "299530%"。
+          const pct = quota > 0 ? (used / quota) * 100 : undefined;
           return {
             balance: `${Math.round(total)} 积分`,
             windows: [
               {
                 name: "免费额度",
-                // magpie 的百分比 = used / limit，所以两者都要给
-                used: Number.isFinite(used) ? used : undefined,
+                used: Number.isFinite(pct) ? Math.round(pct * 10) / 10 : undefined,
                 limit: Number.isFinite(quota) && quota > 0 ? quota : undefined,
+                // 剩余额度：quotaCount() 默认(quotaLeft=false)渲染 amount / limit
                 amount: Number.isFinite(total) ? total : undefined,
+                unit: "积分",
                 display: `${Math.round(total)} / ${Math.round(quota)}`,
               },
               {
