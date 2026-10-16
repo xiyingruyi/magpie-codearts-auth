@@ -225,13 +225,22 @@ function startOfTodayMs() {
  * outcome 必须是 claimed | done | ineligible | inactive | captcha | failed 之一；
  * 非枚举值会被宿主归一为 failed 并在 message 里附「the plugin answered no outcome」。
  */
-function checkinOutcome(posted, createMs, err) {
+function checkinOutcome(posted, createMs, err, beforeMs) {
   const nowDay = startOfTodayMs();
   const ok = createMs !== undefined && Number(createMs) >= nowDay;
   if (posted && ok) {
     return { outcome: "claimed", credit: 1000, message: "已签到 +1000 积分" };
   }
   if (ok) return { outcome: "done" };
+  // 发起过签到（POST 成功返回但时间戳未推进）：
+  // 上游对「不在活动期 / 账号不参与」的账号不报错，只是原样返回旧时间戳。
+  // 此时重试无意义 —— 归为 ineligible，避免宿主每 30 分钟空转。
+  if (posted && beforeMs !== undefined) {
+    return {
+      outcome: "ineligible",
+      message: "签到未生效：上游未推进签到时间（该账号可能不参与签到活动，或活动已结束）",
+    };
+  }
   const code = String(err?.errorCode ?? "");
   const msg = String(err?.message ?? "");
   // 活动已结束 / 不在活动期 → 不是失败，不必重试
@@ -394,15 +403,15 @@ export default async function codeartsPlugin(_input, options) {
           if (auth?.type !== "api" || !auth.key) return { outcome: "inactive", message: "未登录" };
           const { ak, sk } = creds(auth);
           const before = await claimStatus(ak, sk).catch(() => ({}));
-          const already = Number(before?.create_time ?? 0) >= startOfTodayMs();
-          if (already) return { outcome: "done", streak: 0, message: "今日已签到" };
+          const beforeMs = Number(before?.create_time ?? 0);
+          if (beforeMs >= startOfTodayMs()) return { outcome: "done", streak: 0, message: "今日已签到" };
           try {
             await claimToday(ak, sk);
           } catch (e) {
             return checkinOutcome(false, undefined, e);
           }
           const after = await claimStatus(ak, sk).catch(() => ({}));
-          return checkinOutcome(true, after?.create_time);
+          return checkinOutcome(true, after?.create_time, undefined, beforeMs);
         } catch (e) {
           return checkinOutcome(false, undefined, e);
         }

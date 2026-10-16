@@ -196,6 +196,19 @@ test("checkinOutcome: 普通错误 → failed", () => {
   assert.equal(r.outcome, "failed");
 });
 
+test("checkinOutcome: POST 成功但时间戳未推进 → ineligible（不空转重试）", () => {
+  const old = startOfTodayMs() - 86400000;
+  const r = checkinOutcome(true, old, undefined, old);
+  assert.equal(r.outcome, "ineligible");
+  assert.match(r.message, /未推进/);
+});
+
+test("checkinOutcome: 时间戳虽老但未发起签到 → failed", () => {
+  const old = startOfTodayMs() - 86400000;
+  const r = checkinOutcome(false, old, undefined, old);
+  assert.equal(r.outcome, "failed");
+});
+
 test("checkinOutcome: 无参 → failed（不产生非枚举值）", () => {
   const r = checkinOutcome(false, undefined);
   assert.equal(r.outcome, "failed");
@@ -203,6 +216,7 @@ test("checkinOutcome: 无参 → failed（不产生非枚举值）", () => {
 
 test("checkinOutcome: 所有 outcome 都在 magpie 枚举内", () => {
   const allowed = ["claimed", "done", "ineligible", "inactive", "captcha", "failed"];
+  const old = startOfTodayMs() - 86400000;
   const cases = [
     checkinOutcome(true, startOfTodayMs() + 1),
     checkinOutcome(false, startOfTodayMs() + 1),
@@ -211,6 +225,8 @@ test("checkinOutcome: 所有 outcome 都在 magpie 枚举内", () => {
     checkinOutcome(false, undefined, { message: "captcha" }),
     checkinOutcome(false, undefined, { message: "err" }),
     checkinOutcome(false, undefined),
+    checkinOutcome(true, old, undefined, old),
+    checkinOutcome(false, old, undefined, old),
   ];
   for (const c of cases) assert.ok(allowed.includes(c.outcome), c.outcome);
 });
