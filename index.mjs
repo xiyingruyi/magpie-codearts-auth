@@ -57,22 +57,37 @@ const AGENT_MODELS = ["openpangu-2.0-pro", "openpangu-2.0-flash", "GLM-5.2"];
 const BENEFIT_MODELS = ["glm-5.3-flash", "deepseek-v4-pro-0813", "deepseek-v4-flash-0731", "deepseek-v4.1-flash"];
 
 /**
+ * 上游 `max_tokens` **参数的硬上限**（实测出来的，不是猜的）。
+ *
+ * 实测：`max_tokens=65536` 正常返回；`65537` 起上游报
+ * `RANGE_VALIDATOR max_tokens should be between 1 and 65536`，而 magpie 会把这条
+ * 400 包成 **HTTP 200 的空流** —— 客户端只看到「成功但没有内容」，没有任何错误。
+ *
+ * 🔴 云端 `gateway/config` 返回的 `max_tokens`（393216 / 384000 …）是**模型能力**，
+ *    不是这个参数的允许范围。把它直接发布成 magpie 的 `limit.output`，等于邀请每个
+ *    消费方去要一个必然失败的数（magpie 的 `withMaxOutput` 只在下调时才动手，
+ *    不会把 393216 降到 65536）。所以发布前按参数上限收敛。
+ */
+const MAX_OUTPUT_TOKENS = 65536;
+
+/**
  * 静态兜底清单 —— **只在 `provider.models` 拉云端清单失败时**才会被用到。
  *
- * 🔴 `context` / `output` 一律留 **0（= 不设限）**，绝不猜：
- *    magpie 的 `limit` 不是说明文字而是**硬上限**，一个猜出来的正数会真的把
- *    请求截断（这几个模型上游实测是 1M 上下文 / 384k 输出，猜 200000/32000 会把
- *    长上下文任务压爆）。真实上限由 `provider.models` 从云端 `context_window` /
- *    `max_tokens` 填回来。
+ * 🔴 `context` 留 **0（= 不设限）**，绝不猜：magpie 的 `limit` 不是说明文字而是
+ *    **硬上限**，一个猜出来的正数会真的把请求截断（这几个模型上游实测 1M 上下文，
+ *    猜 200000 会把长上下文任务压爆）。真实值由 `provider.models` 从云端
+ *    `context_window` 填回来。
+ *    `output` 则用**实测的参数上限** `MAX_OUTPUT_TOKENS` —— 它是真的，不是猜的，
+ *    而且不设限会让客户端去要一个上游必然拒绝的数（见上）。
  */
 const MODEL_META = {
-  "glm-5.3-flash": { name: "GLM-5.3 Flash", context: 0, output: 0, benefit: true },
-  "deepseek-v4-pro-0813": { name: "DeepSeek V4 Pro", context: 0, output: 0, benefit: true },
-  "deepseek-v4-flash-0731": { name: "DeepSeek V4 Flash", context: 0, output: 0, benefit: true },
-  "deepseek-v4.1-flash": { name: "DeepSeek V4.1 Flash", context: 0, output: 0, benefit: true },
-  "openpangu-2.0-pro": { name: "OpenPangu 2.0 Pro", context: 0, output: 0, benefit: false },
-  "openpangu-2.0-flash": { name: "OpenPangu 2.0 Flash", context: 0, output: 0, benefit: false },
-  "GLM-5.2": { name: "GLM-5.2", context: 0, output: 0, benefit: false },
+  "glm-5.3-flash": { name: "GLM-5.3 Flash", context: 0, output: MAX_OUTPUT_TOKENS, benefit: true },
+  "deepseek-v4-pro-0813": { name: "DeepSeek V4 Pro", context: 0, output: MAX_OUTPUT_TOKENS, benefit: true },
+  "deepseek-v4-flash-0731": { name: "DeepSeek V4 Flash", context: 0, output: MAX_OUTPUT_TOKENS, benefit: true },
+  "deepseek-v4.1-flash": { name: "DeepSeek V4.1 Flash", context: 0, output: MAX_OUTPUT_TOKENS, benefit: true },
+  "openpangu-2.0-pro": { name: "OpenPangu 2.0 Pro", context: 0, output: MAX_OUTPUT_TOKENS, benefit: false },
+  "openpangu-2.0-flash": { name: "OpenPangu 2.0 Flash", context: 0, output: MAX_OUTPUT_TOKENS, benefit: false },
+  "GLM-5.2": { name: "GLM-5.2", context: 0, output: MAX_OUTPUT_TOKENS, benefit: false },
 };
 
 /** 对话端点的绝对地址（loader 里判断「这是不是对话请求」用）。 */
@@ -341,6 +356,15 @@ function optNumber(v) {
   return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
+/**
+ * `limit.output` 的取值：正数才有效，并且收敛到上游参数上限。
+ * 云端给 393216（模型能力）→ 发布 65536（参数允许的最大值）。
+ */
+function outputLimit(v) {
+  const n = optNumber(v);
+  return n === undefined ? undefined : Math.min(n, MAX_OUTPUT_TOKENS);
+}
+
 /** 余额字段取值：只有拿到有限数才算「有值」（0 合法，null / "" / NaN 不算）。 */
 function num(v) {
   if (v === null || v === undefined || v === "") return undefined;
@@ -378,14 +402,19 @@ function checkinOutcome(posted, createMs, err, beforeMs) {
     return { outcome: "claimed", credit: 1000, message: "已签到 +1000 积分" };
   }
   if (ok) return { outcome: "done" };
-  // 发起过签到（POST 成功返回但时间戳未推进）：
-  // 上游对「不在活动期 / 账号不参与」的账号不报错，只是原样返回旧时间戳。
-  // 此时重试无意义 —— 归为 ineligible，避免宿主每 30 分钟空转。
-  if (posted && beforeMs !== undefined) {
-    return {
-      outcome: "ineligible",
-      message: "签到未生效：上游未推进签到时间（该账号可能不参与签到活动，或活动已结束）",
-    };
+  if (posted) {
+    // 拿到时间戳但没推进：上游对「不在活动期 / 账号不参与」的账号不报错，
+    // 只是原样返回旧时间戳。此时重试无意义 —— 归为 ineligible（宿主视为当天已结算）。
+    if (createMs !== undefined) {
+      return {
+        outcome: "ineligible",
+        message: "签到未生效：上游未推进签到时间（该账号可能不参与签到活动，或活动已结束）",
+      };
+    }
+    // 连时间戳都没拿到：无法判定是否生效。**不能**判 ineligible ——
+    // 宿主把非 failed 的 outcome 当作「今天已结算」，当天不会再试，
+    // 而签到其实可能已经成功。交给宿主稍后重试确认。
+    return { outcome: "failed", message: "签到已提交但上游未返回签到时间，稍后重试确认" };
   }
   const code = String(err?.errorCode ?? "");
   const msg = String(err?.message ?? "");
@@ -634,21 +663,29 @@ export default async function codeartsPlugin(_input, options) {
           const before = await claimStatus(ak, sk).catch(() => ({}));
           const beforeMs = Number(before?.create_time ?? 0);
           if (beforeMs >= startOfTodayMs()) return { outcome: "done", streak: 0, message: "今日已签到" };
+          // 🔴 POST 的返回体是**第一手证据**（参考实现 benefit.py 的 do_claim
+          //    就是从 POST 响应里读 create_time）。直接丢掉它、只信随后那次 GET，
+          //    会把「签到成功」误判成「没生效」—— 上游对已领过的返回常常不带 result。
+          let posted;
           try {
-            await claimToday(ak, sk);
+            posted = await claimToday(ak, sk);
           } catch (e) {
             return checkinOutcome(false, undefined, e);
           }
-          // 回读状态只为确认「今天签到生效了」。读失败（网络抖动）**不能**当成
-          // 「上游没推进」—— 那会被判成 ineligible，宿主就再也不重试了，
-          // 而积分其实已经到账。读不到就报 failed，让宿主 30 分钟后再确认。
-          let after;
-          try {
-            after = await claimStatus(ak, sk);
-          } catch (e) {
-            return { outcome: "failed", message: `签到已提交，但状态回读失败，稍后重试确认: ${String(e?.message ?? e).slice(0, 100)}` };
+          let createMs = num(posted?.create_time);
+          if (createMs === undefined) {
+            // POST 没给时间戳 → 回读一次确认。读失败（网络抖动）**不能**当成
+            // 「上游没推进」—— 那会被判成 ineligible，宿主当天就不再重试了，
+            // 而积分其实已经到账。读不到就报 failed，让宿主 30 分钟后再确认。
+            let after;
+            try {
+              after = await claimStatus(ak, sk);
+            } catch (e) {
+              return { outcome: "failed", message: `签到已提交，但状态回读失败，稍后重试确认: ${String(e?.message ?? e).slice(0, 100)}` };
+            }
+            createMs = num(after?.create_time);
           }
-          return checkinOutcome(true, after?.create_time, undefined, beforeMs);
+          return checkinOutcome(true, createMs, undefined, beforeMs);
         } catch (e) {
           return checkinOutcome(false, undefined, e);
         }
@@ -685,7 +722,8 @@ export default async function codeartsPlugin(_input, options) {
               id,
               limit: {
                 context: optNumber(m.context_window ?? m.contextWindow),
-                output: optNumber(m.max_tokens ?? m.maxTokens),
+                // 云端 max_tokens 是模型能力，可能远超上游参数上限 —— 收敛后再发布
+                output: outputLimit(m.max_tokens ?? m.maxTokens),
               },
               reasoning: false,
               tool_call: true,
@@ -707,7 +745,7 @@ export const _internal = {
   rfc3986, sdkSignedHeaders, envelope, creds, bare, parseCredential,
   claimStatus, claimToday, fetchBalance, fetchBenefitModels,
   checkinOutcome, startOfTodayMs, isBenefitChannel, codeartsModels,
-  upstreamSessionId, sessionHeaders, num, round1, CN_OFFSET_MS,
-  channelCache, channelTable, MODEL_META, BENEFIT_MODELS, AGENT_MODELS,
+  upstreamSessionId, sessionHeaders, num, round1, optNumber, outputLimit, CN_OFFSET_MS,
+  channelCache, channelTable, MODEL_META, BENEFIT_MODELS, AGENT_MODELS, MAX_OUTPUT_TOKENS,
   SNAP_HOST, CHAT_PATH, OPENGW_HOST,
 };

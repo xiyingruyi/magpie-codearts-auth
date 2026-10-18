@@ -6,6 +6,7 @@ const mod = await import("../index.mjs");
 const {
   rfc3986, sdkSignedHeaders, creds, parseCredential, num, round1,
   checkinOutcome, startOfTodayMs, isBenefitChannel, codeartsModels,
+  outputLimit, MAX_OUTPUT_TOKENS,
   upstreamSessionId, sessionHeaders, CN_OFFSET_MS,
   channelCache, channelTable, MODEL_META, BENEFIT_MODELS, AGENT_MODELS,
   SNAP_HOST, CHAT_PATH, OPENGW_HOST,
@@ -368,11 +369,24 @@ test("codeartsModels: 含全部内置模型且形状正确", () => {
   }
 });
 
-test("codeartsModels: 不猜 context/output（0 = 不设限）", () => {
+test("codeartsModels: context 不猜；output 用实测参数上限（不是猜的）", () => {
   for (const [id, v] of Object.entries(codeartsModels())) {
     assert.equal(v.limit.context, 0, `${id} 的 context 不该是猜出来的正数`);
-    assert.equal(v.limit.output, 0, `${id} 的 output 不该是猜出来的正数`);
+    // output 不能是 0（= 不设限）：客户端会去要 393216，上游 400 → magpie 包成 200 空流
+    assert.equal(v.limit.output, MAX_OUTPUT_TOKENS, `${id} 的 output 应为实测上限`);
+    assert.ok(v.limit.output > 0);
   }
+});
+
+test("outputLimit: 云端超过参数上限的值被收敛，正常值原样保留", () => {
+  assert.equal(outputLimit(393216), MAX_OUTPUT_TOKENS, "393216 → 65536");
+  assert.equal(outputLimit(384000), MAX_OUTPUT_TOKENS);
+  assert.equal(outputLimit(131072), MAX_OUTPUT_TOKENS);
+  assert.equal(outputLimit(4096), 4096, "上限以内的真实值不能动");
+  assert.equal(outputLimit(65536), 65536, "恰好等于上限");
+  assert.equal(outputLimit(0), undefined, "0 = 没给");
+  assert.equal(outputLimit(undefined), undefined);
+  assert.equal(outputLimit("abc"), undefined);
 });
 
 // ---------------------------------------------------------------------------
@@ -826,6 +840,51 @@ test("checkin: 未登录 → inactive", async () => {
  * 宿主把 ineligible 当成「今天已结算」，当天不再重试；而 failed 会 30 分钟后重试。
  * 用 .catch(() => ({})) 吞掉回读错误，就会把一次成功的签到永久标成「不参与活动」。
  */
+test("checkin: POST 自己带回今天的时间戳 → claimed（不再丢掉 POST 的返回体）", async () => {
+  const plugin = await mod.default({}, {});
+  const real = globalThis.fetch;
+  let call = 0;
+  const today = Date.now();
+  globalThis.fetch = async () => {
+    call += 1;
+    if (call === 1) return new Response(JSON.stringify({ result: { create_time: today - 86400_000 } }), { status: 200 }); // 读旧状态
+    if (call === 2) return new Response(JSON.stringify({ result: { create_time: today } }), { status: 200 });           // POST：权威证据
+    throw new Error("回读不该被调用：POST 已经带回时间戳");
+  };
+  try {
+    const got = await plugin.auth.checkin(async () => ({ type: "api", key: AK, metadata: { sk: SK } }));
+    assert.equal(got.outcome, "claimed", `POST 带回今天的时间戳就该判 claimed，实际 ${got.outcome}`);
+    assert.equal(call, 2, "POST 已有时间戳就不必再回读");
+  } finally {
+    globalThis.fetch = real;
+  }
+});
+
+test("checkin: POST 与回读都没给时间戳 → failed（可重试），不是终局 ineligible", async () => {
+  const plugin = await mod.default({}, {});
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({ error_code: "0000" }), { status: 200 }); // 200 但没有 result
+  try {
+    const got = await plugin.auth.checkin(async () => ({ type: "api", key: AK, metadata: { sk: SK } }));
+    assert.equal(got.outcome, "failed", `无法确认时必须可重试，实际 ${got.outcome}`);
+  } finally {
+    globalThis.fetch = real;
+  }
+});
+
+test("checkin: POST 原样返回旧时间戳（账号不参与活动）→ ineligible", async () => {
+  const plugin = await mod.default({}, {});
+  const real = globalThis.fetch;
+  const yesterday = Date.now() - 86400_000;
+  globalThis.fetch = async () => new Response(JSON.stringify({ result: { create_time: yesterday } }), { status: 200 });
+  try {
+    const got = await plugin.auth.checkin(async () => ({ type: "api", key: AK, metadata: { sk: SK } }));
+    assert.equal(got.outcome, "ineligible", `时间戳确实未推进才是 ineligible，实际 ${got.outcome}`);
+  } finally {
+    globalThis.fetch = real;
+  }
+});
+
 test("checkin: 签到成功但回读状态失败 → failed（可重试），不是 ineligible", async () => {
   const plugin = await mod.default({}, {});
   const real = globalThis.fetch;
@@ -885,7 +944,8 @@ test("provider.models: 云端清单覆盖并保留真实 context/output", async 
     const base = { "GLM-5.2": { id: "GLM-5.2", name: "GLM-5.2", limit: { context: 0, output: 0 } } };
     const r = await plugin.provider.models({ models: base }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
     assert.equal(r["deepseek-v4-pro-0813"].limit.context, 1000000);
-    assert.equal(r["deepseek-v4-pro-0813"].limit.output, 393216);
+    // 云端 393216 是模型能力，上游 max_tokens 参数上限 65536 —— 发布前收敛
+    assert.equal(r["deepseek-v4-pro-0813"].limit.output, MAX_OUTPUT_TOKENS);
     assert.equal(r["GLM-5.2"].limit.context, 200000);
     // 缓存按账号隔离：AK 那一层里能查到本账号的判定
     const mine = channelCache.get(AK);
