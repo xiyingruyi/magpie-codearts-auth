@@ -619,10 +619,10 @@ test("usage: amount / limit 与 used 百分比自洽（宿主按 amount/limit �
   });
 });
 
-test("usage: balance 文本说的是剩余 token", async () => {
+test("usage: balance 文本只有「数量 + 单位」（宿主会自动追加 left）", async () => {
   const u = await usageWith(balanceResponder({ total_quota: 10000000, total_balance: 7819948, used_amount: 2180052 }));
-  assert.match(u.balance, /7819948/);
-  assert.match(u.balance, /tokens/);
+  assert.equal(u.balance, "7819948 tokens");
+  assert.doesNotMatch(u.balance, /剩余|left/);
 });
 
 test("usage: 字段缺失时回退 daily_token_limit / daily_tokens_used", async () => {

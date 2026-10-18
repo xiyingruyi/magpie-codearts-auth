@@ -518,13 +518,14 @@ export default async function codeartsPlugin(_input, options) {
               window.limit = quota;
               window.display = `${Math.round(usedAbs)} / ${Math.round(quota)}`;
             } else if (left !== undefined) {
-              window.display = `${Math.round(left)} tokens 剩余`;
+              window.display = `${Math.round(left)} tokens`;
             }
           } else if (left !== undefined) {
-            window.display = `${Math.round(left)} tokens 剩余`;
+            window.display = `${Math.round(left)} tokens`;
           }
           return {
-            balance: left !== undefined ? `${Math.round(left)} tokens 剩余` : "已登录",
+            // magpie 会在 balance 后面自动追加 "left"，这里只写「数量 + 单位」
+            balance: left !== undefined ? `${Math.round(left)} tokens` : "已登录",
             windows: [
               window,
               // 签到状态是**纯状态行**（aside）：不填 limit、不刷成 100%。
