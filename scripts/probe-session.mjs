@@ -100,7 +100,9 @@ function tally(rs) {
   return Object.entries(out).map(([k, v]) => `${k}×${v}`).join(" ") || "(none)";
 }
 
-const mask = (s) => `${String(s).slice(0, 4)}…${String(s).slice(-4)}`;
+// 账号只用一个不可逆指纹标识：AK 的头尾 4 个字符同样是凭据片段，
+// 终端回滚缓冲区、截图、粘贴到 issue 都会把它带出去。指纹只用于分辨账号。
+const mask = (s) => `#${upstreamSessionId(s).slice(4, 12)}`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function burst(withSession) {

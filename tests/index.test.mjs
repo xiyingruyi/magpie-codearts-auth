@@ -449,21 +449,51 @@ test("loader: 无凭据返回空对象", async () => {
 test("loader: 有凭据时给出 baseURL 与 fetch", async () => {
   const plugin = await mod.default({}, {});
   const l = await plugin.auth.loader(async () => ({ type: "api", key: AK, metadata: { sk: SK } }));
-  assert.equal(l.baseURL, SNAP_HOST);
+  // baseURL 必须含 /api/v2：宿主按 baseURL + "/chat/completions" 拼
+  assert.equal(l.baseURL, `${SNAP_HOST}/api/v2`);
   assert.equal(typeof l.fetch, "function");
 });
 
+test("loader: 宿主拼出来的 URL 正好是对话端点（URL 拼接回归）", async () => {
+  const plugin = await mod.default({}, {});
+  const l = await plugin.auth.loader(async () => ({ type: "api", key: AK, metadata: { sk: SK } }));
+  assert.equal(hostUrl(l.baseURL), `${SNAP_HOST}${CHAT_PATH}`);
+  // 端到端：宿主给的 URL → 发出去仍是对端点，且带 maas 三头
+  const s = await callLoader(plugin, { init: { method: "POST", body: JSON.stringify({ model: "deepseek-v4.1-flash" }) } });
+  assert.equal(s.url, `${SNAP_HOST}${CHAT_PATH}`);
+  assert.equal(s.init.headers.get("maas_type"), "benefit");
+});
+
+/**
+ * 模拟宿主 internal/provider/plugins.go 的 pluginFetch URL 拼接。
+ *
+ * 宿主并不用 provider.api 拼 URL：它给插件 provider 的对话地址是固定的
+ * `plugin://<id>/v1`（Chat 协议），于是
+ *   rest  = "/v1/chat/completions"
+ *   url   = baseURL + TrimPrefix(rest, "/v1")  ← 因为 rest 以 "/v1/" 开头
+ *         = baseURL + "/chat/completions"
+ *
+ * 插件把 provider.api 设成 `${SNAP_HOST}${CHAT_PATH}`，而 baseURL 给了
+ * `${SNAP_HOST}/api/v2` —— 两者拼起来正好是对话端点。
+ */
+function hostUrl(baseURL) {
+  const base = String(baseURL).replace(/\/+$/, "");
+  const rest = "/v1/chat/completions";
+  return rest.startsWith("/v1/") ? base + rest.slice(3) : base + rest;
+}
+
 /**
  * 跑一次 loader 的 fetch，返回实际发出去的 {url, init}。
- * 只接手 SNAP_HOST 的地址，所以对话测试必须用真实对话 URL。
+ * 只接手 SNAP_HOST 的地址，所以对话测试必须用宿主会给的 URL。
  */
-async function callLoader(plugin, { key = AK, sk = SK, url = `${SNAP_HOST}${CHAT_PATH}`, init = {} } = {}) {
+async function callLoader(plugin, { key = AK, sk = SK, url, init = {} } = {}) {
   const l = await plugin.auth.loader(async () => ({ type: "api", key, metadata: { sk } }));
+  const target = url ?? hostUrl(l.baseURL);
   let seen;
   const real = globalThis.fetch;
   globalThis.fetch = async (u, i) => { seen = { url: u, init: i }; return new Response("{}", { status: 200 }); };
   try {
-    await l.fetch(url, init);
+    await l.fetch(target, init);
   } finally {
     globalThis.fetch = real;
   }
@@ -478,6 +508,40 @@ test("loader.fetch: benefit 模型带三头，agent 模型不带", async () => {
   assert.equal(a.init.headers.get("maas_type"), "benefit");
   assert.doesNotMatch(b.init.headers.get("Authorization"), /maas_type/, "agent 模型不该带 maas_type");
   assert.equal(b.init.headers.get("maas_type"), null);
+});
+
+test("loader.fetch: 不把 magpie 只给插件看的交接头转给上游", async () => {
+  const plugin = await mod.default({}, {});
+  const s = await callLoader(plugin, {
+    init: {
+      method: "POST",
+      body: JSON.stringify({ model: "deepseek-v4.1-flash" }),
+      headers: {
+        "x-magpie-work-dir": "/Users/someone/private/repo",
+        "x-magpie-work-git": "https://github.com/someone/private",
+        accept: "application/json",
+      },
+    },
+  });
+  assert.equal(s.init.headers.get("x-magpie-work-dir"), null, "工作目录不能泄露给上游厂商");
+  assert.equal(s.init.headers.get("x-magpie-work-git"), null, "仓库地址不能泄露给上游厂商");
+  assert.equal(s.init.headers.get("accept"), "application/json", "其它头照旧保留");
+});
+
+test("loader.fetch: 同主机但换了后缀的域名不会被当成自己（防签名外泄）", async () => {
+  const plugin = await mod.default({}, {});
+  const l = await plugin.auth.loader(async () => ({ type: "api", key: AK, metadata: { sk: SK } }));
+  const evil = `${SNAP_HOST}.evil.example/api/v2/chat/completions`;
+  let seen;
+  const real = globalThis.fetch;
+  globalThis.fetch = async (u, i) => { seen = { url: u, init: i }; return new Response("{}", { status: 200 }); };
+  try {
+    await l.fetch(evil, { method: "POST", body: JSON.stringify({ model: "deepseek-v4.1-flash" }) });
+  } finally {
+    globalThis.fetch = real;
+  }
+  assert.equal(seen.url, evil);
+  assert.equal(seen.init.headers, undefined, "签名绝不能发给形似域名");
 });
 
 test("loader.fetch: 每次请求都带同一个会话 ID（并发上限的钥匙）", async () => {

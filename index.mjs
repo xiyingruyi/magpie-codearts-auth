@@ -79,6 +79,28 @@ const MODEL_META = {
 const CHAT_ABS = `${SNAP_HOST}${CHAT_PATH}`;
 
 /**
+ * magpie 宿主塞进插件 fetch 的「仅供插件阅读」的交接头（host.js 的 MAGPIE_ONLY）：
+ * 它们告诉插件调用方的工作目录/仓库，**不是给上游厂商看的**。
+ * 宿主通常会自己擦掉，但那是宿主的实现细节 —— 插件自己再擦一遍。
+ */
+const MAGPIE_ONLY_HEADERS = ["x-magpie-work-dir", "x-magpie-work-git"];
+
+/**
+ * 两个 URL 是否同一个主机。
+ *
+ * 用 origin 比较而不是 `startsWith(SNAP_HOST)`：字符串前缀会把
+ * `https://snap-access.cn-north-4.myhuaweicloud.com.evil.example/…`
+ * 当成自己的地址，把 AK/SK 签名送出去。URL 解析失败一律视为「不是」。
+ */
+function sameHost(a, b) {
+  try {
+    return new URL(a).origin === new URL(b).origin;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * 云端 channel 缓存：modelId → "agent" | "benefit" | ""（未知）。
  * 由 provider.models 写入，供 loader 判定通道。跨请求存活（模块级）。
  *
@@ -430,12 +452,18 @@ export default async function codeartsPlugin(_input, options) {
         // 🔴 会话头在 loader 里只算一次：同一账号所有请求复用同一个 ID
         const session = sessionHeaders(ak);
         return {
-          baseURL: SNAP_HOST,
+          // 🔴 baseURL 是 `SNAP_HOST + /api/v2`，不是 SNAP_HOST 本身。
+          // 宿主（internal/provider/plugins.go 的 pluginFetch）把 provider.api 里的
+          // `/v1` 段切掉、再拼到 baseURL 后面：baseURL + "/chat/completions"。
+          // 所以 baseURL 必须已经含 `/api/v2`，否则请求会打到
+          // `…/chat/completions`（少一段）而 404。
+          baseURL: `${SNAP_HOST}/api/v2`,
           async fetch(input, init) {
-            // 只接手本 provider 自己的地址。别的地址原样转发 —— 绝不能改写目标、
+            // 只接手本 provider 自己的主机。别的地址原样转发 —— 绝不能改写目标、
             // 也绝不能把我们的签名套到别的 URL 上。
             const asked = typeof input === "string" ? input : String(input?.url ?? "");
-            if (!asked.startsWith(SNAP_HOST)) return fetch(input, init);
+            if (!sameHost(asked, SNAP_HOST)) return fetch(input, init);
+            const target = asked;
 
             // Request 对象作 input 时，方法和 body 在它身上而不是 init 里
             const req = typeof input === "string" ? null : input;
@@ -456,25 +484,28 @@ export default async function codeartsPlugin(_input, options) {
 
             // 福利/老套餐通道判定（黑名单 + 云端 channel）。这三个头只属于对话端点，
             // 发到别的路径上会被上游当成 unsupported model。会话头则所有对话请求都带。
+            const isChat = target === CHAT_ABS || target.startsWith(`${CHAT_ABS}?`);
             let model = "";
-            if (bodyStr && asked.startsWith(CHAT_ABS)) {
+            if (isChat && bodyStr) {
               try { model = String(JSON.parse(bodyStr).model ?? ""); } catch { /* 保持空 */ }
             }
-            const extra = asked.startsWith(CHAT_ABS) && isBenefitChannel(model)
+            const extra = isChat && isBenefitChannel(model)
               ? { ...session, maas_type: "benefit", "model-id": model, "model-name": model }
               : session;
-            const headers = sdkSignedHeaders(method, asked, bodyStr, ak, sk, extra);
+            const headers = sdkSignedHeaders(method, target, bodyStr, ak, sk, extra);
 
             // 原请求的其它头（例如 accept: text/event-stream）要保留：
             // 流式与非流式靠它区分，丢了会让上游按非流式应答。
             const merged = new Headers(req?.headers);
             new Headers(init?.headers).forEach((v, k) => merged.set(k, v));
             for (const [k, v] of Object.entries(headers)) merged.set(k, v);
-            // host 只参与签名，不能手动发
+            // host 只参与签名，不能手动发；magpie 自己的交接头只给插件读，
+            // 不能转给上游厂商（别指望宿主替我们擦，新版本可能不再擦）
             merged.delete("host");
+            for (const k of MAGPIE_ONLY_HEADERS) merged.delete(k);
 
             const forwarded = bodyStr === "" ? undefined : bodyStr;
-            return fetch(asked, {
+            return fetch(target, {
               method,
               headers: merged,
               ...(forwarded !== undefined ? { body: forwarded } : {}),
@@ -501,6 +532,11 @@ export default async function codeartsPlugin(_input, options) {
           let left = num(bal.total_balance);
           if (usedAbs === undefined && quota !== undefined && left !== undefined) usedAbs = quota - left;
           if (left === undefined && quota !== undefined && usedAbs !== undefined) left = quota - usedAbs;
+          // 上游偶尔会给出「已用 > 总量」或负余额（跨天/统计滞后）。数值不能为负，
+          // 否则宿主会把 used 画成负百分比、显示成「剩得比总量还多」。
+          if (usedAbs !== undefined && usedAbs < 0) usedAbs = 0;
+          if (left !== undefined && left < 0) left = 0;
+          if (quota !== undefined && usedAbs !== undefined && usedAbs > quota) usedAbs = quota;
 
           // 🔴 magpie 的 window 语义（对照宿主源码与社区插件约定，勿改）：
           //   used   = **已用百分比**（0~100+），宿主直接渲染成 "N%"
@@ -571,11 +607,12 @@ export default async function codeartsPlugin(_input, options) {
         // 尽力拉云端模型清单；失败保留 config 静态列表
         try {
           const { ak, sk } = creds(auth ?? {});
-          const rows = await fetchBenefitModels(ak, sk);
-          if (!rows.length) return provider.models;
-          // 先清空再重填：channel 跟账号走，留着上一个账号的判定会串通道
-          channelCache.clear();
-          const out = { ...provider.models };
+            const rows = await fetchBenefitModels(ak, sk);
+            // 先清空再重填：channel 跟账号走，留着上一个账号的判定会串通道。
+            // 空清单也要清 —— 否则上一个账号的记录会一直生效。
+            channelCache.clear();
+            if (!rows.length) return provider.models;
+            const out = { ...provider.models };
           for (const m of rows) {
             const id = String(m.model_id ?? m.modelId ?? m.id ?? "").trim();
             if (!id) continue;
