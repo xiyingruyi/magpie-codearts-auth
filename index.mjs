@@ -386,6 +386,33 @@ function num(v) {
   return Number.isFinite(n) ? n : undefined;
 }
 
+/**
+ * 把对话请求体里超过上游参数上限的输出字段收敛到 `MAX_OUTPUT_TOKENS`。
+ *
+ * 为什么必须由插件来做：宿主只在**路由组内**按成员上限收敛
+ * （`gateway.go` 的 `outputLimit` + `withMaxOutput`），组外只有用户手动设过
+ * 「Max output」才会下降。而裸模型 `codearts/x` 一旦收到 `max_tokens=65537`，
+ * 上游会 400，magpie 又把它包成 HTTP 200 的空流 —— 客户端只看到「成功、没内容」。
+ * 插件的 fetch 是最后一个能看见并改写请求体的地方，就在这里收敛。
+ *
+ * 返回改写后的 body 字符串；没有改动时返回 `null`（调用方沿用原 body 与签名）。
+ */
+function clampChatBody(bodyStr) {
+  if (!bodyStr) return null;
+  let obj;
+  try { obj = JSON.parse(bodyStr); } catch { return null; }
+  if (!obj || typeof obj !== "object") return null;
+  let changed = false;
+  for (const k of ["max_tokens", "max_completion_tokens", "max_output_tokens"]) {
+    const n = Number(obj[k]);
+    if (Number.isFinite(n) && n > MAX_OUTPUT_TOKENS) {
+      obj[k] = MAX_OUTPUT_TOKENS;
+      changed = true;
+    }
+  }
+  return changed ? JSON.stringify(obj) : null;
+}
+
 /** 保留一位小数（百分比的展示精度）。 */
 function round1(n) {
   return Math.round(Number(n) * 10) / 10;
@@ -574,6 +601,12 @@ export default async function codeartsPlugin(_input, options) {
             // 福利/老套餐通道判定（黑名单 + 云端 channel）。这三个头只属于对话端点，
             // 发到别的路径上会被上游当成 unsupported model。会话头则所有对话请求都带。
             const isChat = target === CHAT_ABS || target.startsWith(`${CHAT_ABS}?`);
+            // 🔴 上游 max_tokens 硬上限 65536。组外宿主不会替我们降，超过就是
+            //    400 → 被包成 200 空流。在签名之前改，签名才对得上实际 body。
+            if (isChat) {
+              const clamped = clampChatBody(bodyStr);
+              if (clamped !== null) bodyStr = clamped;
+            }
             let model = "";
             if (isChat && bodyStr) {
               try { model = String(JSON.parse(bodyStr).model ?? ""); } catch { /* 保持空 */ }
@@ -758,7 +791,7 @@ export default async function codeartsPlugin(_input, options) {
 export const _internal = {
   rfc3986, sdkSignedHeaders, envelope, creds, bare, parseCredential, redact,
   claimStatus, claimToday, fetchBalance, fetchBenefitModels,
-  checkinOutcome, startOfTodayMs, isBenefitChannel, codeartsModels,
+  checkinOutcome, startOfTodayMs, isBenefitChannel, codeartsModels, clampChatBody,
   upstreamSessionId, sessionHeaders, num, round1, optNumber, outputLimit, CN_OFFSET_MS,
   channelCache, channelTable, MODEL_META, AGENT_MODELS, MAX_OUTPUT_TOKENS,
   SNAP_HOST, CHAT_PATH, OPENGW_HOST,

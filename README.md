@@ -14,7 +14,7 @@
 
 ```sh
 magpie plugin add github:liuxigreen/magpie-codearts-auth   # 上游原版
-magpie plugin add github:xiyingruyi/magpie-codearts-auth   # 本 fork（含 0.2.8 修复）
+magpie plugin add github:xiyingruyi/magpie-codearts-auth   # 本 fork（含 0.2.9 修复）
 magpie plugin login codearts
 magpie quota
 ```
@@ -172,7 +172,7 @@ CODEARTS_AK=... CODEARTS_SK=... node scripts/probe-session.mjs <模式> [并发�
 
 此外补齐了 `ineligible` / `captcha` / `inactive` 三种签到 outcome（骨架版遇到会落到 `failed` 并每 30 分钟无意义重试）。
 
-## 0.2.4 – 0.2.8（本 fork）
+## 0.2.4 – 0.2.9（本 fork）
 
 在 0.2.3 基础上的改动，逐条都有单测覆盖：
 
@@ -196,8 +196,9 @@ CODEARTS_AK=... CODEARTS_SK=... node scripts/probe-session.mjs <模式> [并发�
 | ⑯ | 把云端 `max_tokens`（393216 / 384000）直接发布成 `limit.output`，而上游**参数**上限是 65536：客户端照着要 393216 → 上游 400 `RANGE_VALIDATOR` → magpie 包成 **HTTP 200 的空流**，看起来「成功但没内容」 | 新增 `MAX_OUTPUT_TOKENS = 65536`（实测值，非猜测），云端值与静态兜底都收敛到它 |
 | ⑰ | 签到只看 POST 之后那次 GET：POST 自己带回的 `create_time` 被丢弃，GET 若返回 200 但没有 `result` 就判成**终局 `ineligible`**（宿主当天不再重试、UI 显示「不参与活动」，而积分其实已到账） | POST 的返回体作为第一手证据；GET 仅作回退；两者都拿不到时间戳时报 `failed`（可重试） |
 | ⑱ | 上游错误体会**回显 Access Key**（`the access key LTAI5t… is malformed`），而这条消息会进登录失败提示、提供商页 `listError` 与 magpie 日志 | 新增 `redact()`，所有错误路径出站前把 AK/SK 换成 `***`；原因（malformed / 业务码）保留 |
+| ⑲ | 宿主只在**路由组内**按成员上限收敛 `max_tokens`，组外只有用户手设「Max output」才下降。所以裸模型 `codearts/x` 收到 393216 时上游照旧 400 → 200 空流 | loader 在**签名前**把 `max_tokens` / `max_completion_tokens` / `max_output_tokens` 收敛到 65536，签名对应改写后的 body |
 
-测试从 45 条增到 100 条，覆盖上述每一条以及「`used` 永不为 NaN」「空响应不抛错」
+测试从 45 条增到 103 条，覆盖上述每一条以及「`used` 永不为 NaN」「空响应不抛错」
 「余额字段为 0 不被 `||` 吞掉」等边界。
 
 > **为什么要改 `baseURL` 而不是在 fetch 里硬编码端点**：0.2.3 的 `fetch` 无视宿主给的

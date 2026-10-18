@@ -5,7 +5,7 @@ import { createHash, createHmac } from "node:crypto";
 const mod = await import("../index.mjs");
 const {
   rfc3986, sdkSignedHeaders, creds, parseCredential, num, round1,
-  checkinOutcome, startOfTodayMs, isBenefitChannel, codeartsModels, redact,
+  checkinOutcome, startOfTodayMs, isBenefitChannel, codeartsModels, redact, clampChatBody,
   outputLimit, MAX_OUTPUT_TOKENS,
   upstreamSessionId, sessionHeaders, CN_OFFSET_MS,
   channelCache, channelTable, MODEL_META, AGENT_MODELS,
@@ -536,6 +536,43 @@ test("loader.fetch: 非对话路径不补 /api/v2（/v1/model/builtin 不属于 
   const u = `${SNAP_HOST}/v1/model/builtin`;
   const s = await callLoader(plugin, { url: u, init: { method: "GET" } });
   assert.equal(s.url, u);
+});
+
+test("clampChatBody: 超过 65536 的输出字段被收敛，其余原样", () => {
+  const big = JSON.stringify({ model: "m", max_tokens: 393216, messages: [] });
+  assert.equal(JSON.parse(clampChatBody(big)).max_tokens, MAX_OUTPUT_TOKENS);
+  const ok = JSON.stringify({ model: "m", max_tokens: 4096 });
+  assert.equal(clampChatBody(ok), null, "上限以内不该改写");
+  assert.equal(clampChatBody(JSON.stringify({ model: "m" })), null, "没这个字段不该改写");
+  assert.equal(clampChatBody("not json"), null, "不是 JSON 就交给上游");
+  assert.equal(clampChatBody(""), null);
+  // 三个名字都认
+  const three = JSON.stringify({ max_completion_tokens: 999999, max_output_tokens: 70000 });
+  const got = JSON.parse(clampChatBody(three));
+  assert.equal(got.max_completion_tokens, MAX_OUTPUT_TOKENS);
+  assert.equal(got.max_output_tokens, MAX_OUTPUT_TOKENS);
+});
+
+test("loader.fetch: 裸模型 max_tokens=393216 在签名前被降到 65536（签名与实际 body 一致）", async () => {
+  const plugin = await mod.default({}, {});
+  const s = await callLoader(plugin, {
+    init: { method: "POST", body: JSON.stringify({ model: "deepseek-v4.1-flash", max_tokens: 393216 }) },
+  });
+  const sent = JSON.parse(s.init.body);
+  assert.equal(sent.max_tokens, MAX_OUTPUT_TOKENS, "发出去的就该是 65536");
+  assert.equal(sent.model, "deepseek-v4.1-flash", "其它字段不能丢");
+  // 签名覆盖的是**改写后**的 body：用同样的 body 重算必须一致
+  const expected = sdkSignedHeaders("POST", s.url, s.init.body, AK, SK, {
+    ...sessionHeaders(AK), maas_type: "benefit", "model-id": "deepseek-v4.1-flash", "model-name": "deepseek-v4.1-flash",
+  });
+  assert.equal(s.init.headers.get("Authorization"), expected.Authorization, "签名必须对应实际发出的 body");
+});
+
+test("loader.fetch: 上限以内的 max_tokens 不被改写", async () => {
+  const plugin = await mod.default({}, {});
+  const body = JSON.stringify({ model: "deepseek-v4.1-flash", max_tokens: 4096 });
+  const s = await callLoader(plugin, { init: { method: "POST", body } });
+  assert.equal(s.init.body, body, "原样转发，连字节都不该变");
 });
 
 test("loader.fetch: benefit 模型带三头，agent 模型不带", async () => {
