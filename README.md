@@ -6,14 +6,15 @@
 |---|---|
 | 授权 | 华为云访问密钥 **AK/SK**（华为云官方 SDK-HMAC-SHA256 签名），登录时自动验证有效性 |
 | **每日签到** ⭐ | 实现 magpie 原生 `auth.checkin` 钩子（magpie ≥ v0.1.1083）——Settings → Usage → Plugins 打开 **Daily check-in**，每天每账号自动签到领取 **1000 积分**，Usage 卡片显示签到状态，也可 **Check in now** 手动签 |
-| 免费额度 | `auth.usage` 显示免费额度余额（已用/总量）与今日签到状态 |
+| 免费额度 | `auth.usage` 显示**每日免费 Token** 的已用/总量与今日签到状态 |
 | 对话 | `POST snap-access /api/v2/chat/completions`（OpenAI 形态），按模型自动选通道 |
 | 模型 | 登录后自动同步云端模型清单（含 `channel` 字段），失败时回退内置列表 |
 
 ## 安装
 
 ```sh
-magpie plugin add github:liuxigreen/magpie-codearts-auth   # 或本地文件夹 / .tgz
+magpie plugin add github:liuxigreen/magpie-codearts-auth   # 上游原版
+magpie plugin add github:xiyingruyi/magpie-codearts-auth   # 本 fork（含 0.2.4 修复）
 magpie plugin login codearts
 magpie quota
 ```
@@ -57,16 +58,79 @@ AccessKeyId:SecretAccessKey
 
 ## Usage 卡片字段语义（实测定论）
 
-magpie 的 `usage()` window 有三个容易搞错的字段，本插件已按实测语义填写：
+magpie 的 `usage()` window 字段，本插件按宿主源码逐条对齐：
 
 | 字段 | 含义 | magpie 如何渲染 |
 |---|---|---|
-| `used` | **已用百分比**（0~100+，可超 100） | 直接显示为 `N%` |
-| `amount` | 绝对值计量（这里是**剩余**额度） | 与 `limit` 组合成 `(amount / limit)` |
-| `limit` | 绝对值总量 | 同上 |
-| `unit` | 计量单位文案 | 拼在括号数字后（如「积分」） |
+| `used` | **已用百分比**（0~100+，可超 100） | 直接显示为 `N%`，`>=98` 染成「spent」红条 |
+| `amount` | 该窗口的**已用**绝对量 | 与 `limit` 组合成 `amount / limit` |
+| `limit` | 绝对值总量（0 / 缺省 = 不设限） | 同上；`limit > 0` 才显示括号数字 |
+| `unit` | 计量单位文案 | 拼在数字后（这里是 `tokens`） |
+| `aside` | `true` = 只展示，**不参与路由、不参与「用尽」判定** | 侧栏一行 |
 
-**踩坑记录**：曾把 `used` 填成绝对值 `299530`，`magpie quota` 就显示成 `299530%`。受控实验（`used:50 → 50%`、`used:3 → 3%`）定论：**`used` 是百分比，不是绝对值**。正确做法是 `used = used_amount / total_quota * 100`。
+**踩坑记录一（0.2.2）**：`used` 被填成绝对值 `299530`，`magpie quota` 显示成 `299530%`。
+受控实验（`used:50 → 50%`）定论：**`used` 是百分比**。
+
+**踩坑记录二（0.2.3，仍在）**：`amount` 被填成**剩余**（`total_balance`），而宿主
+`quotaCount()` 是按 `amount / limit` 当「已用」渲染的。于是明明只用了 21.8%，
+卡片却显示 `7819948 / 10000000`——看起来像「用掉了 78%」。0.2.4 改为填已用。
+
+**踩坑记录三（0.2.3，仍在）**：`total_quota = 10,000,000` 是**每日免费 Token**
+（官方口径：每位用户每日 1000 万 Tokens，当日 24:00 清零，**不与积分包互通**），
+不是积分。控制台里那一万多积分是签到/邀请/学生认证等活动发的另一种货币（`CREDIT`），
+插件没有接口去读它。0.2.4 起窗口名与单位改为 `每日免费 Token` / `tokens`，不再混称「积分」。
+
+### 显示成「额度用尽」的真凶（0.2.4 修复）
+
+代码里没有一处会返回「已用尽」——这个标记是 **magpie 宿主**贴上去的。
+
+上游对每个账号有 **3 个并发会话**的上限，超了返回：
+
+```
+400 {"error_code":"TM.00001041","error_msg":"并发会话数已达上限(3个)，请关闭部分会话后重试。"}
+```
+
+这条**并发**错误里的「已达**上限**」命中了宿主 `internal/gateway/routing.go` 的
+`usedUpWords` 正则（含中文词 `上限`），于是被判成 `failQuota`，账号被标「额度用尽」
+并休息 15 分钟（`quotaRest`）—— 而此时额度可能一格都没少。
+
+**证据**：宿主的路由日志里有一条 `used: 0, amount: 10000000`（额度满格）的账号
+仍被标 `fail: "quota"`；某天 78 条 `TM.00001041` 中有 55 条 `rest.why = "quota"`。
+
+**修法**：所有对话请求带上稳定的 `x-ot-session-id` / `user-session-id`（由 AK 派生，
+同一账号恒定），上游就会把它们算作同一个会话，从源头避免这条错误。
+会话 ID 只发给对话端点，余额/签到等 opengw 接口不带——登录正是靠余额接口做的，
+不给它加额外的头。
+
+### 实测（2026-10-18，单账号流式并发）
+
+`scripts/probe-session.mjs`，两轮之间留 100–120 秒让上游回收会话，避免上一轮
+残留把下一轮一起带进上限：
+
+| 并发 | 不带会话头 | 带稳定会话头 |
+|---|---|---|
+| 3 | ok×2 **CONCURRENCY×1** | ok×3 |
+| 4 | ok×2 **CONCURRENCY×2** | ok×4 |
+| 8 | ok×2 **CONCURRENCY×6** | ok×8 |
+| 16 | ok×2 **CONCURRENCY×14** | ok×16 |
+
+三点结论：
+1. 上游的「3 个并发会话」是按**会话**计数 —— 不带会话头时每个请求各算一个，
+   所以第 3 个之后全部 `TM.00001041`；
+2. 复用同一个会话 ID 后，**会话内并发不受这个上限约束**（16 并发全过）；
+3. 这也是为什么不必再把 magpie 的「并发上限」调低 —— 那个设置是另一回事。
+
+### 其它两处顺手修掉的问题
+
+- **静态兜底清单不再猜 context/output**：magpie 的 `limit` 是**硬上限**，
+  写死 200000/32000 会真的把长上下文请求截断（上游实测 1M 上下文 / 384k 输出）。
+  兜底一律留 0（= 不设限），真实值由云端 `context_window` / `max_tokens` 填回。
+- **签到状态行不再刷满**：未签到时原来的 `used: 1, limit: 1` 是恰好 100%，
+  虽然 `aside` 已让它不参与路由，但满格红条仍会被误读成「额度用尽」。
+  现在它是纯状态行，不带 `limit`、`used` 恒为 0。
+
+> **宿主的责任仍在**：把并发错误归类成 `failQuota` 是 magpie 的判定缺陷，
+> 插件只能避开它、不能改它。若你用的是别的 CodeArts 插件，仍会遇到同样的问题。
 
 ## 对话通道（重要）
 
@@ -85,10 +149,18 @@ magpie 的 `usage()` window 有三个容易搞错的字段，本插件已按实�
 
 ```sh
 node --check index.mjs            # 语法检查
-node --test tests/index.test.mjs  # 纯函数单测（无网络，Node ≥ 18）
+node --test tests/index.test.mjs  # 纯函数 + loader 单测（无网络，Node ≥ 18）
 ```
 
-可测辅助函数经 `_internal` 导出；涉及上游交互的函数（`claimToday` / `fetchBalance` 等）需真实 AK/SK，不在 CI 覆盖范围。
+可测辅助函数经 `_internal` 导出。涉及真实上游的并发验证可跑（凭据只从环境变量读）：
+
+```sh
+CODEARTS_AK=... CODEARTS_SK=... node scripts/probe-session.mjs <模式> [并发数]
+```
+
+`<模式>`：`nosid` 只跑不带会话头、`sid` 只跑带的、`both`（默认）先 `nosid` 再
+冷却 90 秒跑 `sid`。**一次只跑一种模式很重要** —— 上游按*活跃*会话计数，
+上一轮的流式连接若还没被回收，会把下一轮一起带进上限（这一点踩过）。
 
 ## 与官方骨架版（0.1.0）的差异
 
@@ -100,6 +172,24 @@ node --test tests/index.test.mjs  # 纯函数单测（无网络，Node ≥ 18）
 
 此外补齐了 `ineligible` / `captcha` / `inactive` 三种签到 outcome（骨架版遇到会落到 `failed` 并每 30 分钟无意义重试）。
 
+## 0.2.4（本 fork）
+
+在 0.2.3 基础上的改动，逐条都有单测覆盖：
+
+| # | 问题 | 修法 |
+|---|---|---|
+| ① | 不带 `x-ot-session-id`，撞上游「每账号 3 个并发会话」上限 → `TM.00001041` → 被 magpie 判成**额度用尽**并休息 15 分钟 | 所有对话请求带稳定会话 ID（由 AK 派生） |
+| ② | `amount` 填的是**剩余**，宿主当**已用**渲染 → 「只用了 21.8%」显示成 `7819948 / 10000000` | `amount` 改填已用 |
+| ③ | 窗口把每日免费 **Token** 标成「积分」，与控制台积分是两种货币 | 改名「每日免费 Token」、`unit: "tokens"` |
+| ④ | 静态兜底的 `context: 200000 / output: 32000` 是猜的，而 `limit` 是**硬上限**，会截断长上下文 | 兜底一律 0（不设限），真实值取云端 |
+| ⑤ | 签到窗口未签到时 `used: 1 / limit: 1` = 恰好 100%，满格红条像「用尽」 | 改成不带 `limit` 的纯状态行 |
+| ⑥ | 天界按**机器本地时区**算，机器不在东八区时「今日已签」判定差一天 | 固定按 UTC+8（上游 24:00 清零） |
+| ⑦ | loader 里 `init.body` 非字符串时被 `String()` 成 `"[object Object]"`，签名与实际 body 不一致；`Request` 对象的 method/body 被忽略；调用方的 `accept: text/event-stream` 等头被丢弃 | 按实际 URL/方法/body 签名，保留调用方其它头，非本 provider 地址原样转发 |
+| ⑧ | 云端 `channel` 缓存跨账号串用 | 每次拉到清单先清空再重填 |
+
+测试从 45 条增到 84 条，覆盖上述每一条以及「`used` 永不为 NaN」「空响应不抛错」
+「余额字段为 0 不被 `||` 吞掉」等边界。
+
 ## 致谢与免责声明
 
 本插件的协议实现基于社区开源逆向成果（MIT）：
@@ -108,6 +198,8 @@ node --test tests/index.test.mjs  # 纯函数单测（无网络，Node ≥ 18）
 - [Johnsheng1/codearts2api](https://github.com/Johnsheng1/codearts2api)（Python，`benefit.py` 签到实现与签名算法）
 
 在此致谢。本项目为**非官方**社区插件，与华为云 / CodeArts 无任何关联；使用本插件产生的账号风险（含违反上游服务条款的限制）由使用者自行承担；上游协议变更可能导致插件随时失效。
+
+本 fork（`xiyingruyi/magpie-codearts-auth`）同样以 MIT 发布，保留原作者署名。
 
 ## License
 

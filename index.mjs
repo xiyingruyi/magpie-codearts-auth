@@ -21,6 +21,17 @@
  *    硬编码白名单 ⇒ 云端同步来的新模型会走错通道报 `unsupported model`。本版按
  *    黑名单判定，并优先采用云端返回的 `channel` 字段。
  * ③ 模型清单：保留云端返回的 `channel` 字段（上游 server.py 正是用它构建黑名单）。
+ *
+ * --- 0.2.4 的四处修正（见 README「0.2.4」节） ---
+ * ④ 会话 ID：所有请求带上稳定的 `x-ot-session-id`。不带时上游按请求各自计一个新
+ *    会话，几个并发就撞上「每账号 3 个并发会话」的上限，返回 TM.00001041 ——
+ *    而 magpie 会把这条错误里的「上限」二字当成额度用尽的特征（宿主
+ *    `internal/gateway/routing.go` 的 usedUpWords 含 `上限`），把账号误标成
+ *    「额度用尽」并休息 15 分钟。这是「额度明明没用完却显示已用完」的根因。
+ * ⑤ usage window 的 `amount` 是「已用」不是「剩余」（宿主 quotaCount 按
+ *    `amount / limit` 渲染），`unit` 是 tokens 不是积分（与控制台的积分是两种货币）。
+ * ⑥ 模型 context/output 不再猜（猜出来的正数会被宿主当成硬上限，把长上下文截断）。
+ * ⑦ 签到状态窗口不再填满 100%（`aside` 虽已免责路由，但满格红条会被误读成额度用尽）。
  */
 
 import { createHash, createHmac } from "node:crypto";
@@ -43,20 +54,36 @@ const CONFIG_PATH = "/api/v1/gateway/config";
  */
 const AGENT_MODELS = ["openpangu-2.0-pro", "openpangu-2.0-flash", "GLM-5.2"];
 /** 已知福利模型（仅用于静态兜底展示；判定走黑名单，不依赖此表）。 */
-const BENEFIT_MODELS = ["glm-5.3-flash", "deepseek-v4-pro-0813", "deepseek-v4-flash-0731"];
+const BENEFIT_MODELS = ["glm-5.3-flash", "deepseek-v4-pro-0813", "deepseek-v4-flash-0731", "deepseek-v4.1-flash"];
 
+/**
+ * 静态兜底清单 —— **只在 `provider.models` 拉云端清单失败时**才会被用到。
+ *
+ * 🔴 `context` / `output` 一律留 **0（= 不设限）**，绝不猜：
+ *    magpie 的 `limit` 不是说明文字而是**硬上限**，一个猜出来的正数会真的把
+ *    请求截断（这几个模型上游实测是 1M 上下文 / 384k 输出，猜 200000/32000 会把
+ *    长上下文任务压爆）。真实上限由 `provider.models` 从云端 `context_window` /
+ *    `max_tokens` 填回来。
+ */
 const MODEL_META = {
-  "glm-5.3-flash": { name: "GLM-5.3 Flash", context: 200000, output: 32000, benefit: true },
-  "deepseek-v4-pro-0813": { name: "DeepSeek V4 Pro", context: 200000, output: 32000, benefit: true },
-  "deepseek-v4-flash-0731": { name: "DeepSeek V4 Flash", context: 200000, output: 32000, benefit: true },
-  "openpangu-2.0-pro": { name: "OpenPangu 2.0 Pro", context: 200000, output: 32000, benefit: false },
-  "openpangu-2.0-flash": { name: "OpenPangu 2.0 Flash", context: 200000, output: 32000, benefit: false },
-  "GLM-5.2": { name: "GLM-5.2", context: 200000, output: 32000, benefit: false },
+  "glm-5.3-flash": { name: "GLM-5.3 Flash", context: 0, output: 0, benefit: true },
+  "deepseek-v4-pro-0813": { name: "DeepSeek V4 Pro", context: 0, output: 0, benefit: true },
+  "deepseek-v4-flash-0731": { name: "DeepSeek V4 Flash", context: 0, output: 0, benefit: true },
+  "deepseek-v4.1-flash": { name: "DeepSeek V4.1 Flash", context: 0, output: 0, benefit: true },
+  "openpangu-2.0-pro": { name: "OpenPangu 2.0 Pro", context: 0, output: 0, benefit: false },
+  "openpangu-2.0-flash": { name: "OpenPangu 2.0 Flash", context: 0, output: 0, benefit: false },
+  "GLM-5.2": { name: "GLM-5.2", context: 0, output: 0, benefit: false },
 };
+
+/** 对话端点的绝对地址（loader 里判断「这是不是对话请求」用）。 */
+const CHAT_ABS = `${SNAP_HOST}${CHAT_PATH}`;
 
 /**
  * 云端 channel 缓存：modelId → "agent" | "benefit" | ""（未知）。
  * 由 provider.models 写入，供 loader 判定通道。跨请求存活（模块级）。
+ *
+ * 每次成功拉到云端清单时**先整体清空再重填**：channel 是跟着账号走的
+ * （不同订阅可能不同），不清就会把上一个账号的判定留给下一个账号用。
  */
 const channelCache = new Map();
 
@@ -72,6 +99,40 @@ function isBenefitChannel(modelId, knownChannel = "") {
   if (ch === "agent") return false;
   // 无 channel 信息 → 黑名单：命中 AgentCenter 名单才算老套餐，其余按 benefit
   return !AGENT_MODELS.some((m) => m.toLowerCase() === id.toLowerCase());
+}
+
+// ---------------------------------------------------------------------------
+// 上游会话 ID（并发上限的钥匙）
+// ---------------------------------------------------------------------------
+
+/**
+ * 该账号在上游的会话 ID —— **必须稳定复用**。
+ *
+ * 上游按请求头 `x-ot-session-id` 统计并发会话，每账号上限 3 个。不带这个头时，
+ * 上游只能按每个请求各记一个新会话，几个并发（主任务 + 子任务 + 后台任务）就
+ * 打满上限，返回 `TM.00001041 并发会话数已达上限(3个)`。
+ *
+ * 而这条错误会被 magpie **误判成额度用尽**：宿主 `internal/gateway/routing.go`
+ * 的 `usedUpWords` 正则里含中文词 `上限`，`TM.00001041` 的文案「已达上限」正好
+ * 命中 → 判为 `failQuota` → 账号被标「额度用尽」并休息 15 分钟。额度其实没用完。
+ * 带上稳定的会话 ID 后并发会话恒为 1，从源头避免这条错误。
+ *
+ * 由 AK 派生：同一账号恒定不变（跨请求、跨重启），换账号自然换新 ID。
+ * 纯函数、不缓存 —— 与上游 IDE 侧的做法一致。
+ */
+function upstreamSessionId(ak) {
+  const key = String(ak ?? "").trim();
+  if (!key) return "";
+  return "ses_" + createHash("sha256").update(key).digest("hex").slice(0, 16);
+}
+
+/**
+ * 会话请求头（参与签名）。IDE 同时发这两个名字，这里保持一致。
+ * 无 AK 时返回空对象，调用方按「没有就不发」处理。
+ */
+function sessionHeaders(ak) {
+  const sid = upstreamSessionId(ak);
+  return sid ? { "x-ot-session-id": sid, "user-session-id": sid } : {};
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +183,9 @@ function sdkSignedHeaders(method, url, bodyStr, ak, sk, extraHeaders = {}) {
 async function envelope(path, { method = "GET", body, ak, sk, timeout = 30_000 }) {
   const url = `${OPENGW_HOST}${path}`;
   const bodyStr = body !== undefined ? JSON.stringify(body) : "";
+  // 会话头只发给**对话端点**：并发上限是按对话会话算的，余额/签到这些
+  // opengw 接口不是会话，多签一个头只是徒增「上游不认这个头」的风险
+  // （登录就是靠余额接口做的，一旦它挂了整个插件都登不进来）。
   const headers = sdkSignedHeaders(method, url, bodyStr, ak, sk);
   let res, text;
   try {
@@ -213,11 +277,29 @@ function optNumber(v) {
   return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
-/** 本地时区当天 0 点（毫秒）。 */
-function startOfTodayMs() {
-  const d = new Date();
-  d.setHours(0, 0, 0, 0);
-  return d.getTime();
+/** 余额字段取值：只有拿到有限数才算「有值」（0 合法，null / "" / NaN 不算）。 */
+function num(v) {
+  if (v === null || v === undefined || v === "") return undefined;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+/** 保留一位小数（百分比的展示精度）。 */
+function round1(n) {
+  return Math.round(Number(n) * 10) / 10;
+}
+
+/**
+ * 上游「今天」的 0 点（毫秒）。
+ *
+ * 🔴 上游的每日免费 Token 按**中国时区 24:00 清零**，所以天界必须按 UTC+8 算，
+ *    不能按机器本地时区 —— 否则机器不在东八区时，签到判定与「今日已签」会差一天。
+ *    中国无夏令时，固定偏移即可。
+ */
+const CN_OFFSET_MS = 8 * 60 * 60 * 1000;
+
+function startOfTodayMs(now = Date.now()) {
+  return Math.floor((now + CN_OFFSET_MS) / 86400000) * 86400000 - CN_OFFSET_MS;
 }
 
 /**
@@ -345,22 +427,58 @@ export default async function codeartsPlugin(_input, options) {
         const auth = await getAuth();
         if (auth?.type !== "api" || !auth.key) return {};
         const { ak, sk } = creds(auth);
+        // 🔴 会话头在 loader 里只算一次：同一账号所有请求复用同一个 ID
+        const session = sessionHeaders(ak);
         return {
           baseURL: SNAP_HOST,
           async fetch(input, init) {
-            const bodyStr = String(init?.body ?? "{}");
+            // 只接手本 provider 自己的地址。别的地址原样转发 —— 绝不能改写目标、
+            // 也绝不能把我们的签名套到别的 URL 上。
+            const asked = typeof input === "string" ? input : String(input?.url ?? "");
+            if (!asked.startsWith(SNAP_HOST)) return fetch(input, init);
+
+            // Request 对象作 input 时，方法和 body 在它身上而不是 init 里
+            const req = typeof input === "string" ? null : input;
+            const method = String(init?.method ?? req?.method ?? "GET").toUpperCase();
+            const rawBody = init?.body ?? null;
+            let bodyStr = "";
+            if (typeof rawBody === "string") {
+              bodyStr = rawBody;
+            } else if (rawBody instanceof Uint8Array) {
+              bodyStr = new TextDecoder().decode(rawBody);
+            } else if (rawBody !== null && rawBody !== undefined) {
+              // 其它形态（ReadableStream 等）无法参与签名，交给原样转发
+              return fetch(input, init);
+            } else if (req?.body) {
+              // Request 对象自带的 body：读克隆，不能消费掉原件
+              bodyStr = await req.clone().text();
+            }
+
+            // 福利/老套餐通道判定（黑名单 + 云端 channel）。这三个头只属于对话端点，
+            // 发到别的路径上会被上游当成 unsupported model。会话头则所有对话请求都带。
             let model = "";
-            try { model = String(JSON.parse(bodyStr).model ?? ""); } catch { /* 保持空 */ }
-            // 福利/老套餐通道判定（黑名单 + 云端 channel）
-            const extra = isBenefitChannel(model)
-              ? { maas_type: "benefit", "model-id": model, "model-name": model }
-              : {};
-            const headers = sdkSignedHeaders("POST", `${SNAP_HOST}${CHAT_PATH}`, bodyStr, ak, sk, extra);
-            return fetch(`${SNAP_HOST}${CHAT_PATH}`, {
-              method: "POST",
-              headers,
-              body: bodyStr,
-              signal: init?.signal,
+            if (bodyStr && asked.startsWith(CHAT_ABS)) {
+              try { model = String(JSON.parse(bodyStr).model ?? ""); } catch { /* 保持空 */ }
+            }
+            const extra = asked.startsWith(CHAT_ABS) && isBenefitChannel(model)
+              ? { ...session, maas_type: "benefit", "model-id": model, "model-name": model }
+              : session;
+            const headers = sdkSignedHeaders(method, asked, bodyStr, ak, sk, extra);
+
+            // 原请求的其它头（例如 accept: text/event-stream）要保留：
+            // 流式与非流式靠它区分，丢了会让上游按非流式应答。
+            const merged = new Headers(req?.headers);
+            new Headers(init?.headers).forEach((v, k) => merged.set(k, v));
+            for (const [k, v] of Object.entries(headers)) merged.set(k, v);
+            // host 只参与签名，不能手动发
+            merged.delete("host");
+
+            const forwarded = bodyStr === "" ? undefined : bodyStr;
+            return fetch(asked, {
+              method,
+              headers: merged,
+              ...(forwarded !== undefined ? { body: forwarded } : {}),
+              signal: init?.signal ?? req?.signal,
             });
           },
         };
@@ -376,34 +494,47 @@ export default async function codeartsPlugin(_input, options) {
             claimStatus(ak, sk).catch(() => null),
           ]);
           if (!bal) return { error: "额度接口无数据", windows: [] };
-          const total = Number(bal.total_balance ?? 0);
-          const quota = Number(bal.total_quota ?? 0);
-          const used = Number(bal.used_amount ?? 0);
           const signedToday = Number(claim?.create_time ?? 0) >= startOfTodayMs();
-          // 🔴 magpie 的 window 语义（实测定论，勿改）：
-          //   used   = 已用百分比（0~100+），magpie 直接把它渲染成 "N%"
-          //   amount = 绝对值计量（配合 limit 渲染成 "(amount / limit)"）
+          // 字段名在不同响应里不完全一致：优先 total_*，回退 daily_*，再回退互相反推
+          const quota = num(bal.total_quota) ?? num(bal.daily_token_limit);
+          let usedAbs = num(bal.used_amount) ?? num(bal.daily_tokens_used);
+          let left = num(bal.total_balance);
+          if (usedAbs === undefined && quota !== undefined && left !== undefined) usedAbs = quota - left;
+          if (left === undefined && quota !== undefined && usedAbs !== undefined) left = quota - usedAbs;
+
+          // 🔴 magpie 的 window 语义（对照宿主源码与社区插件约定，勿改）：
+          //   used   = **已用百分比**（0~100+），宿主直接渲染成 "N%"
+          //   amount = **已用**的绝对值，宿主 quotaCount() 渲染成 "amount / limit"
           //   limit  = 绝对值总量
-          // 之前误把 used 填成绝对值 299530，magpie 就显示成了 "299530%"。
-          const pct = quota > 0 ? (used / quota) * 100 : undefined;
+          //   unit   = 计量单位，拼在数字后面
+          //   aside  = 只展示，不参与路由，也不参与「用尽」判定
+          // 曾把 used 填成绝对值（显示 299530%），又把 amount 填成「剩余」
+          // （于是 "7819948 / 10000000" 被读成「已用 78%」，而真实已用是 21.8%）。
+          const window = { name: "每日免费 Token", used: 0, unit: "tokens" };
+          if (quota !== undefined && quota > 0) {
+            if (usedAbs !== undefined) {
+              window.used = round1((usedAbs / quota) * 100);
+              window.amount = usedAbs;
+              window.limit = quota;
+              window.display = `${Math.round(usedAbs)} / ${Math.round(quota)}`;
+            } else if (left !== undefined) {
+              window.display = `${Math.round(left)} tokens 剩余`;
+            }
+          } else if (left !== undefined) {
+            window.display = `${Math.round(left)} tokens 剩余`;
+          }
           return {
-            balance: `${Math.round(total)} 积分`,
+            balance: left !== undefined ? `${Math.round(left)} tokens 剩余` : "已登录",
             windows: [
-              {
-                name: "免费额度",
-                used: Number.isFinite(pct) ? Math.round(pct * 10) / 10 : undefined,
-                limit: Number.isFinite(quota) && quota > 0 ? quota : undefined,
-                // 剩余额度：quotaCount() 默认(quotaLeft=false)渲染 amount / limit
-                amount: Number.isFinite(total) ? total : undefined,
-                unit: "积分",
-                display: `${Math.round(total)} / ${Math.round(quota)}`,
-              },
+              window,
+              // 签到状态是**纯状态行**（aside）：不填 limit、不刷成 100%。
+              // 满格红条（宿主把 used>=98 渲染成 spent）会被当成「额度用尽」，
+              // 而签到和额度是两回事。
               {
                 name: "每日签到",
-                used: signedToday ? 0 : 1,
-                limit: 1,
-                display: signedToday ? "今日已签 ✓" : "今日未签（+1000）",
+                used: 0,
                 aside: true,
+                display: signedToday ? "今日已签 ✓" : "今日未签（+1000 积分）",
               },
             ],
           };
@@ -441,6 +572,8 @@ export default async function codeartsPlugin(_input, options) {
           const { ak, sk } = creds(auth ?? {});
           const rows = await fetchBenefitModels(ak, sk);
           if (!rows.length) return provider.models;
+          // 先清空再重填：channel 跟账号走，留着上一个账号的判定会串通道
+          channelCache.clear();
           const out = { ...provider.models };
           for (const m of rows) {
             const id = String(m.model_id ?? m.modelId ?? m.id ?? "").trim();
@@ -473,5 +606,7 @@ export const _internal = {
   rfc3986, sdkSignedHeaders, envelope, creds, bare, parseCredential,
   claimStatus, claimToday, fetchBalance, fetchBenefitModels,
   checkinOutcome, startOfTodayMs, isBenefitChannel, codeartsModels,
+  upstreamSessionId, sessionHeaders, num, round1, CN_OFFSET_MS,
   channelCache, MODEL_META, BENEFIT_MODELS, AGENT_MODELS,
+  SNAP_HOST, CHAT_PATH, OPENGW_HOST,
 };
