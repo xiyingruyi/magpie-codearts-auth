@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash, createHmac } from "node:crypto";
+import { readFileSync } from "node:fs";
 
 const mod = await import("../index.mjs");
 const {
@@ -249,13 +250,14 @@ test("sdkSignedHeaders: 会话头也参与签名后签名仍可复算", () => {
 // ---------------------------------------------------------------------------
 
 test("checkinOutcome: 今日已签 → done", () => {
-  assert.equal(checkinOutcome(false, startOfTodayMs() + 1000).outcome, "done");
+  assert.equal(checkinOutcome(true, startOfTodayMs() + 1000).outcome, "done");
 });
 
-test("checkinOutcome: 刚签到成功 → claimed + credit", () => {
+test("checkinOutcome: 刚签到成功 → done，不编造 credit", () => {
   const r = checkinOutcome(true, startOfTodayMs() + 1000);
-  assert.equal(r.outcome, "claimed");
-  assert.equal(r.credit, 1000);
+  assert.equal(r.outcome, "done");
+  // 上游没有字段说明这次发了多少；报一个 1000 是在撒谎
+  assert.equal(r.credit, undefined);
 });
 
 test("checkinOutcome: 活动结束 → ineligible", () => {
@@ -274,14 +276,20 @@ test("checkinOutcome: 普通错误 → failed", () => {
   assert.equal(checkinOutcome(false, undefined, { message: "网络超时" }).outcome, "failed");
 });
 
-test("checkinOutcome: POST 成功但时间戳未推进 → ineligible（不空转重试）", () => {
+test("checkinOutcome: POST 受理即 done —— create_time 与签到无关，不能据它判失败", () => {
+  // 旧实现把「时间戳未推进」判成 ineligible，于是卡片永远显示未签。
   const old = startOfTodayMs() - 86400000;
   const r = checkinOutcome(true, old, undefined, old);
-  assert.equal(r.outcome, "ineligible");
-  assert.match(r.message, /未推进/);
+  assert.equal(r.outcome, "done");
+  // 上游没有任何字段说这次发多少，不编造 credit
+  assert.equal(r.credit, undefined);
 });
 
-test("checkinOutcome: 时间戳虽老但未发起签到 → failed", () => {
+test("checkinOutcome: POST 受理但没有时间戳 → 仍然 done", () => {
+  assert.equal(checkinOutcome(true, undefined).outcome, "done");
+});
+
+test("checkinOutcome: 未发起签到、时间戳再新也不算已签", () => {
   const old = startOfTodayMs() - 86400000;
   assert.equal(checkinOutcome(false, old, undefined, old).outcome, "failed");
 });
@@ -982,21 +990,36 @@ test("usage: 拿不到 quota 时不填 limit/amount，也不产生 NaN", async (
 
 test("usage: 完全空响应也不抛错", async () => {
   const u = await usageWith(balanceResponder({}));
-  assert.equal(u.windows.length, 2);
+  assert.equal(u.windows.length, 1);
   assert.ok(Number.isFinite(u.windows[0].used));
 });
 
-test("usage: 签到窗口是 aside 状态行 —— 没有 limit、永远不是 100%", async () => {
-  for (const signed of [true, false]) {
-    const claimTime = signed ? Date.now() : 0;
+// 🔴 2026-10-19：插件不再自己画签到状态行。
+//    原来那行读 claim.create_time，而该字段是权益记录的创建时间，从不随签到
+//    推进（两个真实账号上它与 update_time 相同、落在首次登录时刻；8 种请求
+//    变体都没有让它动过），于是卡片上永远写着「今日未签」—— 用户开了自动签到
+//    也还是这句。签到结果由宿主从 plugin-checkin.json 显示，插件不该再画一份。
+test("usage: 不再画自己的「今日签到」状态行（宿主负责）", async () => {
+  for (const claimTime of [Date.now(), 0, Date.now() - 86400_000]) {
     const u = await usageWith(balanceResponder({ total_quota: 10000000, total_balance: 9000000, used_amount: 1000000 }, claimTime));
-    const w = u.windows[1];
-    assert.equal(w.name, "每日签到");
-    assert.equal(w.aside, true);
-    assert.equal(w.limit, undefined, "不该有 limit（否则宿主渲染成 x/1 的额度条）");
-    assert.ok(w.used < 98, "不该刷成 100%（宿主把 used>=98 渲染成 spent 红条）");
-    assert.match(w.display, signed ? /已签/ : /未签/);
+    assert.equal(u.windows.length, 1, "只剩额度窗口");
+    assert.equal(u.windows[0].name, "每日免费 Token");
+    for (const w of u.windows) {
+      assert.doesNotMatch(String(w.display ?? ""), /未签|已签/, "任何窗口都不该再出现签到判断");
+    }
   }
+});
+
+// 断言的是「真实行为」：usage 钩子现在只打余额接口这一个请求。
+test("usage: 不再为签到状态多打一次 claim 端点", async () => {
+  const urls = [];
+  const respond = async (url) => {
+    urls.push(String(url));
+    return new Response(JSON.stringify({ result: { total_quota: 10000000, total_balance: 9000000, used_amount: 1000000 } }), { status: 200 });
+  };
+  await usageWith(respond);
+  assert.equal(urls.filter((u) => u.includes("benefit/claim")).length, 0);
+  assert.equal(urls.filter((u) => u.includes("tokens/balance")).length, 1);
 });
 
 test("usage: 额度窗口在任何路径下 used 都不为 NaN（宿主会直接渲染）", async () => {
@@ -1027,15 +1050,13 @@ test("usage: 余额接口失败 → 返回 error 而不是抛错", async () => {
   assert.deepEqual(u.windows, []);
 });
 
-test("usage: 查询余额/签到不带会话头（opengw 不是对话会话，且登录依赖它）", async () => {
+test("usage: 余额查询不带会话头（opengw 不是对话会话，且登录依赖它）", async () => {
   const seen = [];
   await usageWith(async (url, init) => {
     seen.push(init.headers);
-    return String(url).includes("tokens/balance")
-      ? new Response(JSON.stringify({ result: { total_quota: 10, total_balance: 5, used_amount: 5 } }), { status: 200 })
-      : new Response(JSON.stringify({ result: { create_time: Date.now() } }), { status: 200 });
+    return new Response(JSON.stringify({ result: { total_quota: 10, total_balance: 5, used_amount: 5 } }), { status: 200 });
   });
-  assert.equal(seen.length, 2, "余额 + 签到各一次");
+  assert.equal(seen.length, 1, "usage 只该问余额一次（签到状态由宿主显示）");
   for (const h of seen) {
     assert.equal(h["x-ot-session-id"], undefined, "opengw 接口不该带会话头");
     assert.match(h.Authorization, /SignedHeaders=content-type;host;x-sdk-date, Signature=/);
@@ -1086,84 +1107,62 @@ test("checkin: 未登录 → inactive", async () => {
 });
 
 /**
- * 签到 POST 成功后，回读状态失败**不能**判成 ineligible。
- * 宿主把 ineligible 当成「今天已结算」，当天不再重试；而 failed 会 30 分钟后重试。
- * 用 .catch(() => ({})) 吞掉回读错误，就会把一次成功的签到永久标成「不参与活动」。
+ * 签到钩子：只发一次 POST，按「受理即今日已签」报 done。
+ *
+ * 旧实现先 GET 一次状态、再 POST、再回读，全是为了从 create_time 推签到
+ * 状态。实测那个字段是权益记录的创建时间，从不随签到推进（见
+ * checkinOutcome 的注释），所以这一整套推导连同它带来的 ineligible 都是错的。
  */
-test("checkin: POST 自己带回今天的时间戳 → claimed（不再丢掉 POST 的返回体）", async () => {
+test("checkin: 只发一次 POST，受理即 done", async () => {
   const plugin = await mod.default({}, {});
   const real = globalThis.fetch;
-  let call = 0;
-  const today = Date.now();
-  globalThis.fetch = async () => {
-    call += 1;
-    if (call === 1) return new Response(JSON.stringify({ result: { create_time: today - 86400_000 } }), { status: 200 }); // 读旧状态
-    if (call === 2) return new Response(JSON.stringify({ result: { create_time: today } }), { status: 200 });           // POST：权威证据
-    throw new Error("回读不该被调用：POST 已经带回时间戳");
+  const urls = [];
+  globalThis.fetch = async (url, init) => {
+    urls.push(`${init?.method ?? "GET"} ${String(url)}`);
+    return new Response(JSON.stringify({ result: { create_time: Date.now() - 86400_000 } }), { status: 200 });
   };
   try {
     const got = await plugin.auth.checkin(async () => ({ type: "api", key: AK, metadata: { sk: SK } }));
-    assert.equal(got.outcome, "claimed", `POST 带回今天的时间戳就该判 claimed，实际 ${got.outcome}`);
-    assert.equal(call, 2, "POST 已有时间戳就不必再回读");
+    assert.equal(got.outcome, "done", `受理就该是 done，实际 ${got.outcome}`);
+    assert.equal(urls.length, 1, `只该打一次接口，实际 ${urls.join(", ")}`);
+    assert.match(urls[0], /^POST .*\/benefit\/claim/);
   } finally {
     globalThis.fetch = real;
   }
 });
 
-test("checkin: POST 与回读都没给时间戳 → failed（可重试），不是终局 ineligible", async () => {
-  const plugin = await mod.default({}, {});
-  const real = globalThis.fetch;
-  globalThis.fetch = async () => new Response(JSON.stringify({ error_code: "0000" }), { status: 200 }); // 200 但没有 result
-  try {
-    const got = await plugin.auth.checkin(async () => ({ type: "api", key: AK, metadata: { sk: SK } }));
-    assert.equal(got.outcome, "failed", `无法确认时必须可重试，实际 ${got.outcome}`);
-  } finally {
-    globalThis.fetch = real;
-  }
-});
-
-test("checkin: POST 原样返回旧时间戳（账号不参与活动）→ ineligible", async () => {
+test("checkin: 旧时间戳不再被判成 ineligible（这就是「开了自动签到还显示未签」的根因）", async () => {
   const plugin = await mod.default({}, {});
   const real = globalThis.fetch;
   const yesterday = Date.now() - 86400_000;
   globalThis.fetch = async () => new Response(JSON.stringify({ result: { create_time: yesterday } }), { status: 200 });
   try {
     const got = await plugin.auth.checkin(async () => ({ type: "api", key: AK, metadata: { sk: SK } }));
-    assert.equal(got.outcome, "ineligible", `时间戳确实未推进才是 ineligible，实际 ${got.outcome}`);
+    assert.equal(got.outcome, "done");
   } finally {
     globalThis.fetch = real;
   }
 });
 
-test("checkin: 签到成功但回读状态失败 → failed（可重试），不是 ineligible", async () => {
+test("checkin: 上游没给 result 也报 done（200 + 0000 就是受理）", async () => {
   const plugin = await mod.default({}, {});
   const real = globalThis.fetch;
-  const yesterday = Date.now() - 86400_000;
-  let call = 0;
-  globalThis.fetch = async (url) => {
-    const u = String(url);
-    if (!u.includes("/benefit/claim")) throw new Error("unexpected " + u);
-    call += 1;
-    if (call === 1) return new Response(JSON.stringify({ result: { create_time: yesterday } }), { status: 200 }); // 读旧状态
-    if (call === 2) return new Response(JSON.stringify({ result: {} }), { status: 200 });                        // POST 成功
-    throw new Error("network blip");                                                                            // 回读失败
-  };
+  globalThis.fetch = async () => new Response(JSON.stringify({ error_code: "0000" }), { status: 200 });
   try {
     const got = await plugin.auth.checkin(async () => ({ type: "api", key: AK, metadata: { sk: SK } }));
-    assert.equal(got.outcome, "failed", `回读失败必须可重试，实际 ${got.outcome}`);
+    assert.equal(got.outcome, "done");
   } finally {
     globalThis.fetch = real;
   }
 });
 
-test("checkin: 回读时间戳未推进 → ineligible（账号确实不在活动期）", async () => {
+test("checkin: 网络失败 → failed（宿主 30 分钟后重试）", async () => {
   const plugin = await mod.default({}, {});
   const real = globalThis.fetch;
-  const yesterday = Date.now() - 86400_000;
-  globalThis.fetch = async () => new Response(JSON.stringify({ result: { create_time: yesterday } }), { status: 200 });
+  globalThis.fetch = async () => { throw new Error("network blip"); };
   try {
     const got = await plugin.auth.checkin(async () => ({ type: "api", key: AK, metadata: { sk: SK } }));
-    assert.equal(got.outcome, "ineligible");
+    assert.equal(got.outcome, "failed");
   } finally {
     globalThis.fetch = real;
   }
@@ -1296,4 +1295,24 @@ test("provider.models: 云端没有 limit 时不写死 0 以外的猜测值", as
   } finally {
     globalThis.fetch = real;
   }
+});
+
+// 🔴 magpie 给插件的 auth.usage / auth.checkin 钩子只有 20 秒
+// （internal/provider/plugin_usage.go 的 context.WithTimeout），从钩子被调起
+// 那一刻开始走。插件单次请求的预算必须留出余量，否则上游一慢就是
+// 「宿主先放弃、插件后报超时」—— 卡片显示「暂时无法获取最新额度」、
+// 签到记成 failed。0.2.12 之前 envelope 默认 30 秒，比宿主的期限还长。
+test("envelope 的默认超时必须在 magpie 的 20 秒钩子期限内留足余量", () => {
+  const src = readFileSync(new URL("../index.mjs", import.meta.url), "utf8");
+  const m = src.match(/async function envelope\(path[^)]*timeout = ([\d_]+)/);
+  assert.ok(m, "找不到 envelope 的默认超时");
+  const t = Number(m[1].replace(/_/g, ""));
+  assert.ok(t < 20_000, `envelope 默认超时 ${t}ms 必须小于 20000ms`);
+  assert.ok(20_000 - t >= 4_000, `要给宿主留足余量，实际只剩 ${20_000 - t}ms`);
+});
+
+test("签到链上的每次调用都走 envelope 的默认预算（不另设更长的）", () => {
+  const src = readFileSync(new URL("../index.mjs", import.meta.url), "utf8");
+  const fn = src.slice(src.indexOf("async checkin(getAuth)"), src.indexOf("provider: {"));
+  assert.ok(!/timeout\s*:/.test(fn), "checkin 里不该再给单个请求设更长的超时");
 });

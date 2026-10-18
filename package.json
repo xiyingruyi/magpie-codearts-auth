@@ -1,6 +1,6 @@
 {
   "name": "magpie-codearts-auth",
-  "version": "0.2.11",
+  "version": "0.2.12",
   "description": "magpie/OpenCode provider plugin: Huawei Cloud CodeArts (码道) — AK/SK sign-in, daily benefit check-in (auth.checkin), free daily-token quota, GLM/Pangu chat",
   "type": "module",
   "main": "./index.mjs",

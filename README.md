@@ -5,8 +5,8 @@
 | 能力 | 说明 |
 |---|---|
 | 授权 | 华为云访问密钥 **AK/SK**（华为云官方 SDK-HMAC-SHA256 签名），登录时自动验证有效性 |
-| **每日签到** ⭐ | 实现 magpie 原生 `auth.checkin` 钩子（magpie ≥ v0.1.1083）——Settings → Usage → Plugins 打开 **Daily check-in**，每天每账号自动签到领取 **1000 积分**，Usage 卡片显示签到状态，也可 **Check in now** 手动签 |
-| 免费额度 | `auth.usage` 显示**每日免费 Token** 的已用/总量与今日签到状态 |
+| **每日签到** ⭐ | 实现 magpie 原生 `auth.checkin` 钩子（magpie ≥ v0.1.1083）——Settings → Usage → Plugins 打开 **Daily check-in**，每天每账号自动签到；签到结果由 magpie 显示在卡片与 `magpie accounts checkin` 里 |
+| 免费额度 | `auth.usage` 显示**每日免费 Token** 的已用/总量 |
 | 对话 | `POST snap-access /api/v2/chat/completions`（OpenAI 形态），按模型自动选通道 |
 | 模型 | 登录后自动同步云端模型清单（含 `channel` 字段），失败时回退内置列表 |
 
@@ -14,7 +14,7 @@
 
 ```sh
 magpie plugin add github:liuxigreen/magpie-codearts-auth   # 上游原版
-magpie plugin add github:xiyingruyi/magpie-codearts-auth   # 本 fork（含 0.2.11 修复）
+magpie plugin add github:xiyingruyi/magpie-codearts-auth   # 本 fork（含 0.2.12 修复）
 magpie plugin login codearts
 magpie quota
 ```
@@ -39,22 +39,33 @@ AccessKeyId:SecretAccessKey
 ## 每日签到
 
 - **协议**：`POST https://opengw.developer.huaweicloud.com/api/v1/benefit/claim`（空 body，AK/SK 签名，服务端按天幂等）
-- **状态**：`GET` 同路径返回 `result.create_time`（最近签到毫秒时间戳），当天已签则 `outcome: done`
 - **调度**：Settings → Usage → Plugins 的 Daily check-in 开关（默认关）打开后，每天每账号自动签一次（启动 2 分钟后首查、每 30 分钟轮询，`failed` 30 分钟后重试）
-- **奖励**：官方活动每日签到 +1000 积分（积分自发放起 30 天有效；活动结束时间以官网为准）
+- **结果**：插件只发这一次 POST，`error_code 0000` 即「今日已受理」→ `done`。签到状态由 **magpie 宿主**显示（`SubscriptionQuota.checkin`，来自 `plugin-checkin.json` 里插件钩子的真实回答），插件不再自己画一行状态。
+
+> **2026-10 实测：`create_time` 不是签到时间。** 旧版（≤ 0.2.11）把
+> `GET/POST /benefit/claim` 返回的 `result.create_time` 当作「最近签到时间」，据此
+> 判断今天签没签。实测两个真实账号：该值与同一响应的 `update_time` **逐字节相同**，
+> 分别落在「账号首次登录码道」和更早的时刻；随后用 8 种请求变体（不同 header、
+> body、query）连打，**一次都没有推进过**。它是账号/权益记录的**创建**时间。
+>
+> 后果正是「明明开了自动签到，卡片上却一直写今日未签」：判定永远为假 → 每天报
+> `ineligible`（宿主显示「not eligible for the check-in」），卡片上那行自绘的状态
+> 也永远是「未签」。上游没有第二个接口能读到签到状态（`/api/v1/benefit/*`、
+> `/api/v1/user/*` 的 12 个候选路径扫过，除 `claim` 与 `tokens/balance` 外一律
+> 404 `APIG.0101`），控制台里的积分是另一种货币（`CREDIT`），插件读不到。
+>
+> 0.2.12 起：不再从 `create_time` 推导任何结论，也不再自绘签到窗口；以「POST 被
+> 受理」为止，不编造本次积分（上游没有任何字段说发了多少）。
 
 插件向 magpie 返回的标准 outcome：
 
 | outcome | 触发条件 |
 |---|---|
-| `claimed` | 签到成功且 `create_time` 落在今天 |
-| `done` | 今天已经签过 |
-| `ineligible` | 上游未推进签到时间（账号不参与签到活动 / 活动已结束） |
+| `done` | POST 得到 `error_code 0000`（服务端按天幂等，含「今天已经领过」） |
+| `ineligible` | 上游明确说不在活动期 / 活动已结束 |
 | `inactive` | 账号未开通该权益或未实名 / 未登录 |
 | `captcha` | 需要人机验证，提示到控制台手动签到 |
-| `failed` | 其它错误（宿主 30 分钟后重试） |
-
-> **实测注意**：老套餐（AgentCenter）账号不参与签到活动 —— 上游对这类账号**不报错**，`POST /benefit/claim` 会原样返回旧的 `create_time`（余额也不变）。插件据此判定为 `ineligible`，避免宿主每 30 分钟无意义重试。
+| `failed` | 网络/超时/其它错误（宿主 30 分钟后重试） |
 
 ## Usage 卡片字段语义（实测定论）
 

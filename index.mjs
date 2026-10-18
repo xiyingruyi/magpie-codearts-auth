@@ -250,7 +250,11 @@ function sdkSignedHeaders(method, url, bodyStr, ak, sk, extraHeaders = {}) {
 // opengw 信封（error_code "0000" 成功，数据在 result）
 // ---------------------------------------------------------------------------
 
-async function envelope(path, { method = "GET", body, ak, sk, timeout = 30_000 }) {
+// 🔴 默认别超过 magpie 的 20 秒。宿主给插件的 auth.usage / auth.checkin 钩子
+//    `context.WithTimeout(ctx, 20*time.Second)`，从钩子被调起那一刻开始算。
+//    这里原来给 30 秒 —— 上游一慢，宿主先放弃、插件后报超时，卡片上就是
+//    「暂时无法获取最新额度」，签到则记成 failed。opengw 实测 p50 约 40ms。
+async function envelope(path, { method = "GET", body, ak, sk, timeout = 12_000 }) {
   const url = `${OPENGW_HOST}${path}`;
   const bodyStr = body !== undefined ? JSON.stringify(body) : "";
   // 会话头只发给**对话端点**：并发上限是按对话会话算的，余额/签到这些
@@ -282,7 +286,14 @@ async function envelope(path, { method = "GET", body, ak, sk, timeout = 30_000 }
   return data.result ?? {};
 }
 
-/** 签到状态：result.create_time = 最近一次签到时间（毫秒时间戳）。 */
+/**
+ * GET 同路径的历史用途：参考实现把它当作「签到状态」。
+ *
+ * 🔴 实测（2026-10）：`result.create_time` **不是**签到时间 —— 它与同一响应的
+ *    `update_time` 逐字节相同，落在账号首次登录的时刻，且 8 种请求变体都没有
+ *    让它推进过一次。它读不出「今天签没签」。插件里已经没有地方再依赖它，
+ *    保留导出只是为了让测试与外部探针还能读到原始响应。
+ */
 async function claimStatus(ak, sk) {
   return envelope(CLAIM_PATH, { ak, sk });
 }
@@ -642,27 +653,28 @@ function startOfTodayMs(now = Date.now()) {
  * 签到结果 → magpie checkin 契约 {outcome, credit?, streak?, message?}。
  * outcome 必须是 claimed | done | ineligible | inactive | captcha | failed 之一；
  * 非枚举值会被宿主归一为 failed 并在 message 里附「the plugin answered no outcome」。
+ *
+ * 🔴 2026-10 实测推翻了这个接口的旧理解：`result.create_time` **不是**最近签到
+ *    时间。两个真实账号上它与同一响应的 `update_time` 逐字节相同，且分别落在
+ *    「首次登录码道」「更早」的时刻；随后连续 8 种不同请求（header / body /
+ *    query 变体，含 maas_type、x-ot-session-id、JSON body）全返回同一个值，
+ *    一次都没有推进。它是账号/权益记录的**创建**时间。
+ *
+ *    把它当签到时间戳，后果是每天都会判成「未推进」→ ineligible，宿主 UI 与
+ *    卡片上就永远写着「未签」。上游也没有第二个接口能读到签到状态（把
+ *    /api/v1/benefit/* 与 /api/v1/user/* 的 12 个候选路径全扫过，除 claim 与
+ *    tokens/balance 外一律 404 APIG.0101），控制台的积分是另一种货币，
+ *    这里读不到。
+ *
+ *    所以：能确定的只有「POST 得到 error_code 0000」。按服务端按天幂等来算，
+ *    这就是今天已签 —— 报 done，不编造积分数量，也不报一个假的「未签」。
+ *    拿不到任何回答（网络/超时）才是 failed，交给宿主 30 分钟后重试。
  */
-function checkinOutcome(posted, createMs, err, beforeMs) {
-  const nowDay = startOfTodayMs();
-  const ok = createMs !== undefined && Number(createMs) >= nowDay;
-  if (posted && ok) {
-    return { outcome: "claimed", credit: 1000, message: "已签到 +1000 积分" };
-  }
-  if (ok) return { outcome: "done" };
+function checkinOutcome(posted, createMs, err) {
   if (posted) {
-    // 拿到时间戳但没推进：上游对「不在活动期 / 账号不参与」的账号不报错，
-    // 只是原样返回旧时间戳。此时重试无意义 —— 归为 ineligible（宿主视为当天已结算）。
-    if (createMs !== undefined) {
-      return {
-        outcome: "ineligible",
-        message: "签到未生效：上游未推进签到时间（该账号可能不参与签到活动，或活动已结束）",
-      };
-    }
-    // 连时间戳都没拿到：无法判定是否生效。**不能**判 ineligible ——
-    // 宿主把非 failed 的 outcome 当作「今天已结算」，当天不会再试，
-    // 而签到其实可能已经成功。交给宿主稍后重试确认。
-    return { outcome: "failed", message: "签到已提交但上游未返回签到时间，稍后重试确认" };
+    // POST 已受理。create_time 与签到无关（见上），不据它判失败。
+    // credit 不报：上游没有任何字段说这次发了多少，编一个数就是撒谎。
+    return { outcome: "done", message: "今日签到已受理" };
   }
   const code = String(err?.errorCode ?? "");
   const msg = String(err?.message ?? "");
@@ -864,12 +876,14 @@ export default async function codeartsPlugin(_input, options) {
           const auth = await getAuth();
           if (auth?.type !== "api" || !auth.key) return { error: "未登录", windows: [] };
           ({ ak, sk } = creds(auth));
-          const [bal, claim] = await Promise.all([
-            fetchBalance(ak, sk).catch(() => null),
-            claimStatus(ak, sk).catch(() => null),
-          ]);
+          const bal = await fetchBalance(ak, sk).catch(() => null);
           if (!bal) return { error: "额度接口无数据", windows: [] };
-          const signedToday = Number(claim?.create_time ?? 0) >= startOfTodayMs();
+          // 🔴 以前这里还会 GET 一次 claim 端点来判断「今日已签」，依据是
+          //    create_time —— 那是权益记录的创建时间，从不随签到推进（见
+          //    checkinOutcome 注释），于是每张卡片上永远写着「今日未签」。
+          //    宿主本来就把签到结果放在卡片上（SubscriptionQuota.checkin，
+          //    来自 plugin-checkin.json 里插件钩子的真实回答）。插件再画一行
+          //    自己的判断，既和宿主打架、又是错的，这次读也没有任何用处。
           // 字段名在不同响应里不完全一致：优先 total_*，回退 daily_*，再回退互相反推
           const quota = num(bal.total_quota) ?? num(bal.daily_token_limit);
           let usedAbs = num(bal.used_amount) ?? num(bal.daily_tokens_used);
@@ -906,18 +920,9 @@ export default async function codeartsPlugin(_input, options) {
           return {
             // magpie 会在 balance 后面自动追加 "left"，这里只写「数量 + 单位」
             balance: left !== undefined ? `${Math.round(left)} tokens` : "已登录",
-            windows: [
-              window,
-              // 签到状态是**纯状态行**（aside）：不填 limit、不刷成 100%。
-              // 满格红条（宿主把 used>=98 渲染成 spent）会被当成「额度用尽」，
-              // 而签到和额度是两回事。
-              {
-                name: "每日签到",
-                used: 0,
-                aside: true,
-                display: signedToday ? "今日已签 ✓" : "今日未签（+1000 积分）",
-              },
-            ],
+            // 只有额度这一个窗口。签到状态由宿主显示（它读 plugin-checkin.json
+            // 里插件钩子的真实结果），插件不再画第二个、会自相矛盾的状态行。
+            windows: [window],
           };
         } catch (e) {
           return { error: `额度查询失败: ${redact(e?.message ?? String(e), ak, sk)}`, windows: [] };
@@ -929,32 +934,17 @@ export default async function codeartsPlugin(_input, options) {
           const auth = await getAuth();
           if (auth?.type !== "api" || !auth.key) return { outcome: "inactive", message: "未登录" };
           const { ak, sk } = creds(auth);
-          const before = await claimStatus(ak, sk).catch(() => ({}));
-          const beforeMs = Number(before?.create_time ?? 0);
-          if (beforeMs >= startOfTodayMs()) return { outcome: "done", streak: 0, message: "今日已签到" };
-          // 🔴 POST 的返回体是**第一手证据**（参考实现 benefit.py 的 do_claim
-          //    就是从 POST 响应里读 create_time）。直接丢掉它、只信随后那次 GET，
-          //    会把「签到成功」误判成「没生效」—— 上游对已领过的返回常常不带 result。
+          // 🔴 不再先读一次「签到状态」：那个 GET 的 create_time 是权益记录的
+          //    创建时间，不是签到时间（见 checkinOutcome 的注释），拿它判
+          //    「今天已签」永远为假，只会白多一次往返。
+          //    POST 本身按天幂等：今天已领也返回 0000，所以重复调用无害。
           let posted;
           try {
             posted = await claimToday(ak, sk);
           } catch (e) {
             return checkinOutcome(false, undefined, e);
           }
-          let createMs = num(posted?.create_time);
-          if (createMs === undefined) {
-            // POST 没给时间戳 → 回读一次确认。读失败（网络抖动）**不能**当成
-            // 「上游没推进」—— 那会被判成 ineligible，宿主当天就不再重试了，
-            // 而积分其实已经到账。读不到就报 failed，让宿主 30 分钟后再确认。
-            let after;
-            try {
-              after = await claimStatus(ak, sk);
-            } catch (e) {
-              return { outcome: "failed", message: `签到已提交，但状态回读失败，稍后重试确认: ${redact(String(e?.message ?? e), ak, sk).slice(0, 100)}` };
-            }
-            createMs = num(after?.create_time);
-          }
-          return checkinOutcome(true, createMs, undefined, beforeMs);
+          return checkinOutcome(true, num(posted?.create_time));
         } catch (e) {
           return checkinOutcome(false, undefined, e);
         }
