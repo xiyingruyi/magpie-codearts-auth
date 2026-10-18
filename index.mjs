@@ -387,21 +387,34 @@ function num(v) {
 }
 
 /**
- * 把对话请求体里超过上游参数上限的输出字段收敛到 `MAX_OUTPUT_TOKENS`。
+ * 改写对话请求体，使它符合上游的硬性要求：
  *
- * 为什么必须由插件来做：宿主只在**路由组内**按成员上限收敛
- * （`gateway.go` 的 `outputLimit` + `withMaxOutput`），组外只有用户手动设过
- * 「Max output」才会下降。而裸模型 `codearts/x` 一旦收到 `max_tokens=65537`，
- * 上游会 400，magpie 又把它包成 HTTP 200 的空流 —— 客户端只看到「成功、没内容」。
- * 插件的 fetch 是最后一个能看见并改写请求体的地方，就在这里收敛。
+ * ① **输出上限**收敛到 `MAX_OUTPUT_TOKENS`
+ *    宿主只在**路由组内**按成员上限收敛（`gateway.go` 的 `outputLimit` +
+ *    `withMaxOutput`），组外只有用户手动设过「Max output」才会下降。裸模型
+ *    `codearts/x` 收到 `max_tokens=65537` 时上游 400，magpie 又把它包成
+ *    HTTP 200 的空流 —— 客户端只看到「成功、没内容」。
+ *
+ * ② **显式 `stream` 布尔值**
+ *    🔴 上游对**缺省** `stream` 的请求按 **SSE** 应答（实测：body 不带该字段 →
+ *    `content-type: text/event-stream`）。而 SSE 里的错误事件长这样：
+ *        data:{"error_code":"4005","error_msg":"unsupported model","result":null}
+ *    magpie 的嗅探器只认 OpenAI 形态的 `{"error": …}`，于是把它当成一个没有
+ *    内容的正常结束 → 客户端拿到的仍是 **HTTP 200 + content:null + 0 tokens**，
+ *    真正的错误（模型不存在、参数非法）被完全吞掉。带上显式 `stream: false`
+ *    后，同样的请求上游返回 **HTTP 400 + application/json**，错误原样透出
+ *    （实测对比：不带 = 200 空回答；带 = 400 `unsupported model`）。
+ *    OpenAI 语义里缺省 `stream` 就是 false，这里只是把默认值写明。
+ *    已经有 `stream` 字段的请求**一律不动** —— magpie 的翻译路径会显式写
+ *    `stream: true` 并期待 SSE，改它会破坏那条路径。
  *
  * 返回改写后的 body 字符串；没有改动时返回 `null`（调用方沿用原 body 与签名）。
  */
-function clampChatBody(bodyStr) {
+function normalizeChatBody(bodyStr) {
   if (!bodyStr) return null;
   let obj;
   try { obj = JSON.parse(bodyStr); } catch { return null; }
-  if (!obj || typeof obj !== "object") return null;
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return null;
   let changed = false;
   for (const k of ["max_tokens", "max_completion_tokens", "max_output_tokens"]) {
     const n = Number(obj[k]);
@@ -410,7 +423,172 @@ function clampChatBody(bodyStr) {
       changed = true;
     }
   }
+  if (!("stream" in obj)) {
+    obj.stream = false;
+    changed = true;
+  }
   return changed ? JSON.stringify(obj) : null;
+}
+
+/** @deprecated 保留旧名，等价于 `normalizeChatBody`（测试与外部脚本用）。 */
+const clampChatBody = normalizeChatBody;
+
+/**
+ * 从上游响应体里认出错误。
+ *
+ * 上游并不总是用 HTTP 状态码表达失败：`unsupported model` 这类是
+ * **HTTP 200 + `{"error_code":"4005","error_msg":"unsupported model"}`**
+ * （实测，非流式下就是原样 JSON）。magpie 的嗅探器只认 OpenAI 的
+ * `{"error": …}` 形态，于是把它当成「一个没有 choices 的正常结束」——
+ * 客户端收到 `HTTP 200 + content:null + 0 tokens`，错误彻底消失。
+ *
+ * 返回 `{code, message}`；不是错误时返回 null。
+ */
+function upstreamError(text) {
+  let obj;
+  try { obj = JSON.parse(text); } catch { return null; }
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return null;
+  const code = obj.error_code;
+  const codeBad = code !== undefined && code !== null && !["0000", 0].includes(code);
+  // 没有 choices 又没有正文，也视为错误（上游偶尔只给 error_msg）
+  const noAnswer = !Array.isArray(obj.choices) && !obj.id && (obj.error_msg || obj.error);
+  if (!codeBad && !noAnswer) return null;
+  const message = String(obj.error_msg ?? obj.error?.message ?? obj.error ?? "upstream error");
+  return { code: String(code ?? obj.error?.code ?? ""), message };
+}
+
+/** 错误响应：400 + OpenAI 错误形态（magpie 的 APIError 从中取出 message）。 */
+function errorResponse({ code, message }) {
+  const body = JSON.stringify({ error: { message, type: "codearts_error", code } });
+  return new Response(body, {
+    status: 400,
+    statusText: "Bad Request",
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/** 重写响应体时不能沿用的头（body 已不是原始字节）。 */
+const REWRITTEN_HEADERS = ["content-length", "content-encoding", "transfer-encoding"];
+
+function cloneHeadersWithout(headers) {
+  const out = new Headers(headers);
+  for (const k of REWRITTEN_HEADERS) out.delete(k);
+  return out;
+}
+
+/**
+ * 流式响应里，错误同样以 `data:{"error_code": …}` 的形式出现：
+ *   · 作为**首个事件**（实测 `unsupported model` 就是这样）；
+ *   · 或夹杂在正常分片中间（限流、额度类错误）。
+ * 直接透传的话，OpenAI 客户端只会把它当未知分片丢掉，最后得到空回答。
+ *
+ * 两段处理：
+ *   ① 先窥探首个 data 行；是错误就取消上游流，整条改成 400 JSON（最干净）；
+ *   ② 不是错误就把已读分片补回，后续按行转发，并把途中出现的错误事件改写为
+ *      OpenAI 形态 `{"error":{…}}` —— magpie 的嗅探器认这个，会据此把流标成失败。
+ * 转发逐行进行，未改写的行原样重编码（UTF-8 往返无损），不会破坏分片边界。
+ */
+async function rewriteStreamError(res) {
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let text = "";
+  let err = null;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      text += dec.decode(value, { stream: true });
+      const lines = text.split("\n");
+      if (!text.endsWith("\n")) lines.pop(); // 最后一段可能不完整，先不看
+      const line = lines.find((l) => {
+        const t = l.startsWith("data:") ? l.slice(5).trim() : "";
+        return t && t !== "[DONE]";
+      });
+      if (line) { err = upstreamError(line.slice(5).trim()); break; }
+      if (text.length > 64 * 1024) break; // 不像错误流，别无限缓冲
+    }
+  } catch {
+    // 读失败就按原样把已有分片交出去
+  }
+  if (err) {
+    try { await reader.cancel(); } catch { /* 已经断了 */ }
+    return errorResponse(err);
+  }
+  return new Response(streamWithErrorEvents(text, dec, reader), {
+    status: res.status,
+    statusText: res.statusText,
+    headers: cloneHeadersWithout(res.headers),
+  });
+}
+
+/**
+ * 流式中途的错误事件 → OpenAI 的 `{"error": …}`，其余行原样。
+ *
+ * `prefix` 是窥探阶段已经读到的文本 —— 它可能**不止一行**（一次 read 通常拿到
+ * 一大块），所以必须喂进同一个行处理器，不能当成原始字节直接透传，否则同一块
+ * 里后续的错误事件就漏改了。
+ */
+function streamWithErrorEvents(prefix, dec, reader) {
+  const enc = new TextEncoder();
+  let buf = prefix;
+  const rewrite = (line) => {
+    const t = line.startsWith("data:") ? line.slice(5).trim() : "";
+    if (!t || t === "[DONE]") return line;
+    const err = upstreamError(t);
+    if (!err) return line;
+    return `data:${JSON.stringify({ error: { message: err.message, type: "codearts_error", code: err.code } })}`;
+  };
+  return new ReadableStream({
+    start(controller) {
+      const lines = buf.split("\n");
+      buf = lines.pop();
+      if (lines.length) controller.enqueue(enc.encode(lines.map(rewrite).join("\n") + "\n"));
+    },
+    async pull(controller) {
+      let value, done;
+      try {
+        ({ value, done } = await reader.read());
+      } catch (e) {
+        controller.error(e);
+        return;
+      }
+      if (done) {
+        if (buf) {
+          controller.enqueue(enc.encode(rewrite(buf)));
+          buf = "";
+        }
+        controller.close();
+        return;
+      }
+      buf += dec.decode(value, { stream: true });
+      const lines = buf.split("\n");
+      buf = lines.pop();
+      if (lines.length) controller.enqueue(enc.encode(lines.map(rewrite).join("\n") + "\n"));
+    },
+    cancel(reason) {
+      reader.cancel(reason).catch(() => {});
+    },
+  });
+}
+
+/**
+ * 把「HTTP 200 里藏着的错误」翻成真正的错误响应，其余原样返回。
+ * 只对对话端点调用（其它路径由宿主自己处理）。
+ */
+async function normalizeChatResponse(res) {
+  if (!res || res.status !== 200 || !res.body) return res;
+  const ct = String(res.headers.get("content-type") ?? "").toLowerCase();
+  if (ct.includes("text/event-stream")) return rewriteStreamError(res);
+  if (!ct.includes("application/json")) return res;
+  let text;
+  try { text = await res.text(); } catch { return res; }
+  const err = upstreamError(text);
+  if (err) return errorResponse(err);
+  return new Response(text, {
+    status: res.status,
+    statusText: res.statusText,
+    headers: cloneHeadersWithout(res.headers),
+  });
 }
 
 /** 保留一位小数（百分比的展示精度）。 */
@@ -556,7 +734,13 @@ export default async function codeartsPlugin(_input, options) {
             } catch (e) {
               return { type: "failed", error: `AK/SK 验证失败: ${redact(e?.message ?? String(e), ak, sk)}` };
             }
-            return { type: "success", key: ak, metadata: { sk } };
+            // 🔴 metadata 里必须把 `credential` 显式盖成空串。
+            //    宿主 `save()` 的实现是 `md = { ...inputs, ...result.metadata }`
+            //    （internal/plugin/host.js），而 inputs 里就带着 prompt 收集的
+            //    原始 "AK:SK" 组合串。不盖的话这份**完整凭据**会被原样写进
+            //    `plugin-auth.json` 的 `metadata.credential`，与 `key` 和
+            //    `metadata.sk` 重复三份。返回同名键即可覆盖它（result 后合并、优先）。
+            return { type: "success", key: ak, metadata: { sk, credential: "" } };
           },
         },
       ],
@@ -601,11 +785,12 @@ export default async function codeartsPlugin(_input, options) {
             // 福利/老套餐通道判定（黑名单 + 云端 channel）。这三个头只属于对话端点，
             // 发到别的路径上会被上游当成 unsupported model。会话头则所有对话请求都带。
             const isChat = target === CHAT_ABS || target.startsWith(`${CHAT_ABS}?`);
-            // 🔴 上游 max_tokens 硬上限 65536。组外宿主不会替我们降，超过就是
-            //    400 → 被包成 200 空流。在签名之前改，签名才对得上实际 body。
+            // 🔴 上游 max_tokens 硬上限 65536；且缺省 stream 会按 SSE 应答，
+            //    把上游错误吞成 200 空回答。两件事都在**签名之前**改，
+            //    签名才对得上实际发出的 body。
             if (isChat) {
-              const clamped = clampChatBody(bodyStr);
-              if (clamped !== null) bodyStr = clamped;
+              const fixed = normalizeChatBody(bodyStr);
+              if (fixed !== null) bodyStr = fixed;
             }
             let model = "";
             if (isChat && bodyStr) {
@@ -627,21 +812,29 @@ export default async function codeartsPlugin(_input, options) {
             for (const k of MAGPIE_ONLY_HEADERS) merged.delete(k);
 
             const forwarded = bodyStr === "" ? undefined : bodyStr;
-            return fetch(target, {
+            const res = await fetch(target, {
               method,
               headers: merged,
               ...(forwarded !== undefined ? { body: forwarded } : {}),
               signal: init?.signal ?? req?.signal,
             });
+            // 上游会把「模型不存在」这类错误藏在 HTTP 200 里（见 normalizeChatResponse）
+            return isChat ? normalizeChatResponse(res) : res;
           },
         };
       },
 
       async usage(getAuth) {
+        // 🔴 ak/sk 必须在 try **外面**声明：下面 catch 要用它们做脱敏。
+        //    写成 try 内的 const 时，creds() 抛错（凭据不完整）会先跳出块，
+        //    catch 里的 ak/sk 变成 TDZ 之外的未绑定标识符 —— 抛 ReferenceError，
+        //    宿主拿到的是异常而不是「额度查询失败」的 error 字段。
+        let ak = "";
+        let sk = "";
         try {
           const auth = await getAuth();
           if (auth?.type !== "api" || !auth.key) return { error: "未登录", windows: [] };
-          const { ak, sk } = creds(auth);
+          ({ ak, sk } = creds(auth));
           const [bal, claim] = await Promise.all([
             fetchBalance(ak, sk).catch(() => null),
             claimStatus(ak, sk).catch(() => null),
@@ -794,5 +987,6 @@ export const _internal = {
   checkinOutcome, startOfTodayMs, isBenefitChannel, codeartsModels, clampChatBody,
   upstreamSessionId, sessionHeaders, num, round1, optNumber, outputLimit, CN_OFFSET_MS,
   channelCache, channelTable, MODEL_META, AGENT_MODELS, MAX_OUTPUT_TOKENS,
+  normalizeChatBody, upstreamError, normalizeChatResponse, rewriteStreamError,
   SNAP_HOST, CHAT_PATH, OPENGW_HOST,
 };

@@ -6,7 +6,8 @@ const mod = await import("../index.mjs");
 const {
   rfc3986, sdkSignedHeaders, creds, parseCredential, num, round1,
   checkinOutcome, startOfTodayMs, isBenefitChannel, codeartsModels, redact, clampChatBody,
-  outputLimit, MAX_OUTPUT_TOKENS,
+  outputLimit, MAX_OUTPUT_TOKENS, normalizeChatBody,
+  upstreamError, normalizeChatResponse,
   upstreamSessionId, sessionHeaders, CN_OFFSET_MS,
   channelCache, channelTable, MODEL_META, AGENT_MODELS,
   SNAP_HOST, CHAT_PATH, OPENGW_HOST,
@@ -442,6 +443,26 @@ test("authorize: 只有 AK 没 SK → 提示格式", async () => {
   assert.match(r.error, /冒号/);
 });
 
+test("authorize: 成功时返回的 metadata 把宿主会合并进来的 credential 盖成空串", async () => {
+  // 宿主 save(): md = { ...inputs, ...result.metadata } —— inputs 里就带着
+  // prompt 收集的原始 "AK:SK" 组合串，不盖就会原样落到 plugin-auth.json。
+  const plugin = await mod.default({}, {});
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({ result: { total_quota: 1, total_balance: 1 } }), { status: 200 });
+  let r;
+  try {
+    r = await plugin.auth.methods[0].authorize({ credential: `${AK}:${SK}` });
+  } finally {
+    globalThis.fetch = real;
+  }
+  assert.equal(r.type, "success");
+  assert.equal(r.key, AK);
+  assert.equal(r.metadata.sk, SK);
+  assert.equal(r.metadata.credential, "", "必须覆盖 prompt 里的组合串");
+  const merged = { credential: `${AK}:${SK}`, ...r.metadata };
+  assert.equal(merged.credential, "", "合并后不能残留 AK:SK");
+});
+
 test("method.prompts: 使用单个 credential 项（AK 必须走 prompts）", async () => {
   const plugin = await mod.default({}, {});
   const prompts = plugin.auth.methods[0].prompts;
@@ -503,14 +524,15 @@ function hostUrl(baseURL) {
  * 跑一次 loader 的 fetch，返回实际发出去的 {url, init}。
  * 只接手 SNAP_HOST 的地址，所以对话测试必须用宿主会给的 URL。
  */
-async function callLoader(plugin, { key = AK, sk = SK, url, init = {} } = {}) {
+async function callLoader(plugin, { key = AK, sk = SK, url, init = {}, respond } = {}) {
   const l = await plugin.auth.loader(async () => ({ type: "api", key, metadata: { sk } }));
   const target = url ?? hostUrl(l.baseURL);
   let seen;
   const real = globalThis.fetch;
-  globalThis.fetch = async (u, i) => { seen = { url: u, init: i }; return new Response("{}", { status: 200 }); };
+  globalThis.fetch = respond ?? (async (u, i) => { seen = { url: u, init: i }; return new Response("{}", { status: 200 }); });
   try {
-    await l.fetch(target, init);
+    const res = await l.fetch(target, init);
+    seen = { ...(seen ?? {}), res };
   } finally {
     globalThis.fetch = real;
   }
@@ -538,29 +560,47 @@ test("loader.fetch: 非对话路径不补 /api/v2（/v1/model/builtin 不属于 
   assert.equal(s.url, u);
 });
 
-test("clampChatBody: 超过 65536 的输出字段被收敛，其余原样", () => {
-  const big = JSON.stringify({ model: "m", max_tokens: 393216, messages: [] });
-  assert.equal(JSON.parse(clampChatBody(big)).max_tokens, MAX_OUTPUT_TOKENS);
-  const ok = JSON.stringify({ model: "m", max_tokens: 4096 });
-  assert.equal(clampChatBody(ok), null, "上限以内不该改写");
-  assert.equal(clampChatBody(JSON.stringify({ model: "m" })), null, "没这个字段不该改写");
-  assert.equal(clampChatBody("not json"), null, "不是 JSON 就交给上游");
-  assert.equal(clampChatBody(""), null);
+test("normalizeChatBody: 超过 65536 的输出字段被收敛", () => {
+  const big = JSON.stringify({ model: "m", max_tokens: 393216, messages: [], stream: false });
+  assert.equal(JSON.parse(normalizeChatBody(big)).max_tokens, MAX_OUTPUT_TOKENS);
+  const ok = JSON.stringify({ model: "m", max_tokens: 4096, stream: false });
+  assert.equal(normalizeChatBody(ok), null, "上限以内不该改写");
+  assert.equal(normalizeChatBody(JSON.stringify({ model: "m", stream: false })), null, "没这个字段不该改写");
+  assert.equal(normalizeChatBody("not json"), null, "不是 JSON 就交给上游");
+  assert.equal(normalizeChatBody(""), null);
+  assert.equal(normalizeChatBody("[1,2]"), null, "数组不是对话体");
   // 三个名字都认
-  const three = JSON.stringify({ max_completion_tokens: 999999, max_output_tokens: 70000 });
-  const got = JSON.parse(clampChatBody(three));
+  const three = JSON.stringify({ max_completion_tokens: 999999, max_output_tokens: 70000, stream: false });
+  const got = JSON.parse(normalizeChatBody(three));
   assert.equal(got.max_completion_tokens, MAX_OUTPUT_TOKENS);
   assert.equal(got.max_output_tokens, MAX_OUTPUT_TOKENS);
+});
+
+test("normalizeChatBody: 缺省 stream 补成 false（上游缺省按 SSE 应答，错误会被吞成 200 空回答）", () => {
+  // 实测：body 不带 stream 字段 → 上游 content-type text/event-stream，
+  // 错误事件是 {"error_code","error_msg"}，magpie 嗅探器只认 {"error"}，
+  // 于是 unknown model 变成 HTTP 200 + content:null + 0 tokens。
+  const got = JSON.parse(normalizeChatBody(JSON.stringify({ model: "m", messages: [] })));
+  assert.equal(got.stream, false);
+  assert.equal(got.model, "m", "其它字段不能丢");
+});
+
+test("normalizeChatBody: 已显式写出的 stream 一律不动（true/false 都不改）", () => {
+  for (const v of [true, false]) {
+    const body = JSON.stringify({ model: "m", stream: v });
+    assert.equal(normalizeChatBody(body), null, `stream:${v} 不该被改写`);
+  }
 });
 
 test("loader.fetch: 裸模型 max_tokens=393216 在签名前被降到 65536（签名与实际 body 一致）", async () => {
   const plugin = await mod.default({}, {});
   const s = await callLoader(plugin, {
-    init: { method: "POST", body: JSON.stringify({ model: "deepseek-v4.1-flash", max_tokens: 393216 }) },
+    init: { method: "POST", body: JSON.stringify({ model: "deepseek-v4.1-flash", max_tokens: 393216, stream: true }) },
   });
   const sent = JSON.parse(s.init.body);
   assert.equal(sent.max_tokens, MAX_OUTPUT_TOKENS, "发出去的就该是 65536");
   assert.equal(sent.model, "deepseek-v4.1-flash", "其它字段不能丢");
+  assert.equal(sent.stream, true, "调用方写了 stream:true 就必须保留");
   // 签名覆盖的是**改写后**的 body：用同样的 body 重算必须一致
   const expected = sdkSignedHeaders("POST", s.url, s.init.body, AK, SK, {
     ...sessionHeaders(AK), maas_type: "benefit", "model-id": "deepseek-v4.1-flash", "model-name": "deepseek-v4.1-flash",
@@ -568,11 +608,23 @@ test("loader.fetch: 裸模型 max_tokens=393216 在签名前被降到 65536（�
   assert.equal(s.init.headers.get("Authorization"), expected.Authorization, "签名必须对应实际发出的 body");
 });
 
-test("loader.fetch: 上限以内的 max_tokens 不被改写", async () => {
+test("loader.fetch: 非流式对话请求会被补上显式 stream:false", async () => {
   const plugin = await mod.default({}, {});
-  const body = JSON.stringify({ model: "deepseek-v4.1-flash", max_tokens: 4096 });
+  const s = await callLoader(plugin, {
+    init: { method: "POST", body: JSON.stringify({ model: "deepseek-v4.1-flash", messages: [{ role: "user", content: "hi" }] }) },
+  });
+  assert.equal(JSON.parse(s.init.body).stream, false);
+  const expected = sdkSignedHeaders("POST", s.url, s.init.body, AK, SK, {
+    ...sessionHeaders(AK), maas_type: "benefit", "model-id": "deepseek-v4.1-flash", "model-name": "deepseek-v4.1-flash",
+  });
+  assert.equal(s.init.headers.get("Authorization"), expected.Authorization, "签名必须对应补过 stream 的 body");
+});
+
+test("loader.fetch: 已经合规的 body 原样转发（连字节都不该变）", async () => {
+  const plugin = await mod.default({}, {});
+  const body = JSON.stringify({ model: "deepseek-v4.1-flash", max_tokens: 4096, stream: false });
   const s = await callLoader(plugin, { init: { method: "POST", body } });
-  assert.equal(s.init.body, body, "原样转发，连字节都不该变");
+  assert.equal(s.init.body, body, "上限以内且 stream 已写明 → 一个字节都不改");
 });
 
 test("loader.fetch: benefit 模型带三头，agent 模型不带", async () => {
@@ -726,6 +778,98 @@ test("loader.fetch: 乱 body 不会抛错（模型名解析失败保持空）", 
 });
 
 // ---------------------------------------------------------------------------
+// 响应侧：上游把错误藏在 HTTP 200 里（第四轮实测发现）
+// ---------------------------------------------------------------------------
+
+test("upstreamError: 认出 error_code / error_msg 形态", () => {
+  assert.deepEqual(upstreamError('{"error_code":"4005","error_msg":"unsupported model","result":null}'),
+    { code: "4005", message: "unsupported model" });
+  assert.equal(upstreamError('{"id":"x","choices":[{"index":0,"message":{"content":"hi"}}]}'), null);
+  assert.equal(upstreamError('{"error_code":"0000","error_msg":"","result":{}}'), null, "0000 是成功码");
+  assert.equal(upstreamError("not json"), null);
+  assert.deepEqual(upstreamError('{"error_msg":"only a message"}'), { code: "", message: "only a message" });
+});
+
+test("normalizeChatResponse: JSON 200 + error_code → 400 OpenAI 错误形态", async () => {
+  const res = new Response('{"error_code":"4005","error_msg":"unsupported model","result":null}', {
+    status: 200, headers: { "content-type": "application/json" },
+  });
+  const out = await normalizeChatResponse(res);
+  assert.equal(out.status, 400);
+  const body = JSON.parse(await out.text());
+  assert.equal(body.error.message, "unsupported model");
+  assert.equal(body.error.code, "4005");
+});
+
+test("normalizeChatResponse: 正常 JSON 200 原样返回", async () => {
+  const ok = '{"id":"x","choices":[{"index":0,"message":{"content":"hi"}}]}';
+  const out = await normalizeChatResponse(new Response(ok, { status: 200, headers: { "content-type": "application/json" } }));
+  assert.equal(out.status, 200);
+  assert.equal(await out.text(), ok);
+});
+
+test("normalizeChatResponse: 流式首事件就是错误 → 整条改成 400", async () => {
+  const res = new Response('data:{"error_code":"4005","error_msg":"unsupported model","result":null}\ndata:\n\n', {
+    status: 200, headers: { "content-type": "text/event-stream" },
+  });
+  const out = await normalizeChatResponse(res);
+  assert.equal(out.status, 400);
+  assert.equal(JSON.parse(await out.text()).error.message, "unsupported model");
+});
+
+test("normalizeChatResponse: 流式中途的错误事件改写成 {\"error\":…}，其余分片原样", async () => {
+  const mid = 'data:{"id":"a","choices":[{"delta":{"content":"hi"}}]}\n\ndata:{"error_code":"4005","error_msg":"boom","result":null}\n\ndata:[DONE]\n\n';
+  const out = await normalizeChatResponse(new Response(mid, { status: 200, headers: { "content-type": "text/event-stream" } }));
+  assert.equal(out.status, 200);
+  const text = await out.text();
+  assert.match(text, /"error":\{"message":"boom"/);
+  assert.ok(!text.includes("error_code"), "上游形态不能留在流里（客户端认不出）");
+  assert.ok(text.startsWith('data:{"id":"a"'), "前面的正常分片要原样保留");
+  assert.ok(text.endsWith("data:[DONE]\n\n"));
+});
+
+test("normalizeChatResponse: 正常流式一个字节都不改（含跨 chunk 断行与中文）", async () => {
+  const enc = new TextEncoder();
+  const parts = ['data:{"id":"a","choices":[{"delta":{"content":"你好', '世界"}}]}\n\ndata:[DONE]\n\n'];
+  const res = new Response(new ReadableStream({
+    start(c) { for (const p of parts) c.enqueue(enc.encode(p)); c.close(); },
+  }), { status: 200, headers: { "content-type": "text/event-stream" } });
+  assert.equal(await (await normalizeChatResponse(res)).text(), parts.join(""));
+});
+
+test("normalizeChatResponse: 非 200、非对话内容类型一律原样", async () => {
+  const bad = new Response("x", { status: 500, headers: { "content-type": "application/json" } });
+  const out = await normalizeChatResponse(bad);
+  assert.equal(out.status, 500);
+  assert.equal(await out.text(), "x");
+});
+
+test("loader.fetch: 对话端点返回 200+error_code 时，交给宿主的是 400", async () => {
+  const plugin = await mod.default({}, {});
+  const s = await callLoader(plugin, {
+    init: { method: "POST", body: JSON.stringify({ model: "nope", messages: [{ role: "user", content: "hi" }] }) },
+    respond: async () =>
+      new Response('{"error_code":"4005","error_msg":"unsupported model","result":null}', {
+        status: 200, headers: { "content-type": "application/json" },
+      }),
+  });
+  assert.equal(typeof s.res, "object");
+  assert.equal(s.res.status, 400);
+  assert.equal(JSON.parse(await s.res.text()).error.message, "unsupported model");
+});
+
+test("loader.fetch: 非对话路径不做响应改写", async () => {
+  const plugin = await mod.default({}, {});
+  const s = await callLoader(plugin, {
+    url: `${SNAP_HOST}/v1/model/builtin`, init: { method: "GET" },
+    respond: async () => new Response('{"error_code":"4005","error_msg":"x"}', {
+      status: 200, headers: { "content-type": "application/json" },
+    }),
+  });
+  assert.equal(s.res.status, 200, "别的路径不是我们的业务，别动");
+});
+
+// ---------------------------------------------------------------------------
 // usage（0.2.4：amount = 已用、unit = tokens）
 // ---------------------------------------------------------------------------
 
@@ -734,6 +878,22 @@ test("usage: 未登录时返回 error", async () => {
   const u = await plugin.auth.usage(async () => undefined);
   assert.match(u.error, /未登录/);
   assert.deepEqual(u.windows, []);
+});
+
+test("usage: 凭据不完整时返回 error 而不是抛 ReferenceError", async () => {
+  // 回归：catch 里用 ak/sk 做脱敏，若它们在 try 内声明，creds() 抛错后
+  // catch 会再抛 ReferenceError（宿主拿到异常而非 error 字段）。
+  const plugin = await mod.default({}, {});
+  const u = await plugin.auth.usage(async () => ({ type: "api", key: AK })); // 只有 AK，没有 SK
+  assert.equal(typeof u.error, "string");
+  assert.match(u.error, /额度查询失败/);
+  assert.deepEqual(u.windows, []);
+});
+
+test("usage: 凭据不完整时错误里也不会带出 AK", async () => {
+  const plugin = await mod.default({}, {});
+  const u = await plugin.auth.usage(async () => ({ type: "api", key: AK }));
+  assert.ok(!u.error.includes(AK));
 });
 
 test("usage: used 是百分比，amount 是**已用**、limit 是总量", async () => {

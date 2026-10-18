@@ -14,7 +14,7 @@
 
 ```sh
 magpie plugin add github:liuxigreen/magpie-codearts-auth   # 上游原版
-magpie plugin add github:xiyingruyi/magpie-codearts-auth   # 本 fork（含 0.2.9 修复）
+magpie plugin add github:xiyingruyi/magpie-codearts-auth   # 本 fork（含 0.2.10 修复）
 magpie plugin login codearts
 magpie quota
 ```
@@ -172,7 +172,7 @@ CODEARTS_AK=... CODEARTS_SK=... node scripts/probe-session.mjs <模式> [并发�
 
 此外补齐了 `ineligible` / `captcha` / `inactive` 三种签到 outcome（骨架版遇到会落到 `failed` 并每 30 分钟无意义重试）。
 
-## 0.2.4 – 0.2.9（本 fork）
+## 0.2.4 – 0.2.10（本 fork）
 
 在 0.2.3 基础上的改动，逐条都有单测覆盖：
 
@@ -197,9 +197,18 @@ CODEARTS_AK=... CODEARTS_SK=... node scripts/probe-session.mjs <模式> [并发�
 | ⑰ | 签到只看 POST 之后那次 GET：POST 自己带回的 `create_time` 被丢弃，GET 若返回 200 但没有 `result` 就判成**终局 `ineligible`**（宿主当天不再重试、UI 显示「不参与活动」，而积分其实已到账） | POST 的返回体作为第一手证据；GET 仅作回退；两者都拿不到时间戳时报 `failed`（可重试） |
 | ⑱ | 上游错误体会**回显 Access Key**（`the access key LTAI5t… is malformed`），而这条消息会进登录失败提示、提供商页 `listError` 与 magpie 日志 | 新增 `redact()`，所有错误路径出站前把 AK/SK 换成 `***`；原因（malformed / 业务码）保留 |
 | ⑲ | 宿主只在**路由组内**按成员上限收敛 `max_tokens`，组外只有用户手设「Max output」才下降。所以裸模型 `codearts/x` 收到 393216 时上游照旧 400 → 200 空流 | loader 在**签名前**把 `max_tokens` / `max_completion_tokens` / `max_output_tokens` 收敛到 65536，签名对应改写后的 body |
+| ⑳ | 请求体**不带 `stream` 字段**时，上游默认按 **SSE** 应答；而 SSE 里的错误是 `{"error_code","error_msg"}`，magpie 嗅探器只认 OpenAI 的 `{"error"}`，于是「模型不存在」「参数非法」全被吞成 **HTTP 200 + `content:null` + 0 tokens**，客户端看到的是「成功但没有回答」 | loader 在签名前补 `stream: false`（OpenAI 语义里缺省就是 false）；已经写了 `stream` 的请求一律不动，避免破坏 magpie 的流式翻译路径 |
+| ㉑ | 即使带了 `stream: false`，`unsupported model` 这类错误上游仍返回 **HTTP 200 + `error_code`**（实测），同样会被当成空回答 | loader 看响应：JSON 200 里认出 `error_code` → 改成 **400 + OpenAI 错误形态**；流式则窥探首事件，是错误就整条改 400，途中的错误事件改写成 `{"error":…}`（magpie 认这个）。正常流**逐字节透传**（有单测保证） |
+| ㉒ | 宿主 `save()` 的实现是 `md = { ...inputs, ...result.metadata }`，prompt 收集的原始 `AK:SK` 组合串会落到 `metadata.credential`，与 `key`、`metadata.sk` **重复三份**明文凭据 | `authorize` 返回 `metadata: { sk, credential: "" }` 覆盖掉它（同名键、result 优先合并） |
+| ㉓ | `usage()` 的 `catch` 引用了 `try` 块内的 `const ak/sk`：凭据不完整时 `creds()` 抛错 → catch 再抛 `ReferenceError`，宿主拿到异常而非「额度查询失败」 | `ak/sk` 提到 `try` 外声明，catch 照常脱敏并返回 error |
 
-测试从 45 条增到 103 条，覆盖上述每一条以及「`used` 永不为 NaN」「空响应不抛错」
+测试从 45 条增到 118 条，覆盖上述每一条以及「`used` 永不为 NaN」「空响应不抛错」
 「余额字段为 0 不被 `||` 吞掉」等边界。
+
+### 第四轮实测（2026-10-19）
+
+工具调用（流式 / 非流式）、5 万 token 长上下文、`max_tokens=1` 截断、错误分类、
+两个账号的额度换算、七个模型的通道判定全部通过；上面 ⑳㉑㉒㉓ 就是这轮挖出来的。
 
 > **为什么要改 `baseURL` 而不是在 fetch 里硬编码端点**：0.2.3 的 `fetch` 无视宿主给的
 > 地址、直接打 `SNAP_HOST + /api/v2/chat/completions`，看着能用，但它同时把宿主的
