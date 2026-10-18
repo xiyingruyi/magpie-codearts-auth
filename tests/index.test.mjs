@@ -5,7 +5,7 @@ import { createHash, createHmac } from "node:crypto";
 const mod = await import("../index.mjs");
 const {
   rfc3986, sdkSignedHeaders, creds, parseCredential, num, round1,
-  checkinOutcome, startOfTodayMs, isBenefitChannel, codeartsModels,
+  checkinOutcome, startOfTodayMs, isBenefitChannel, codeartsModels, redact,
   outputLimit, MAX_OUTPUT_TOKENS,
   upstreamSessionId, sessionHeaders, CN_OFFSET_MS,
   channelCache, channelTable, MODEL_META, BENEFIT_MODELS, AGENT_MODELS,
@@ -823,6 +823,40 @@ test("usage: 查询余额/签到不带会话头（opengw 不是对话会话，�
   for (const h of seen) {
     assert.equal(h["x-ot-session-id"], undefined, "opengw 接口不该带会话头");
     assert.match(h.Authorization, /SignedHeaders=content-type;host;x-sdk-date, Signature=/);
+  }
+});
+
+test("redact: 上游错误体里回显的 AK/SK 会被擦掉", async () => {
+  const AK2 = "LTAI5tFAKEKEY000000000";
+  const SK2 = "FAKESECRET0000000000000000000000000000";
+  assert.equal(
+    redact(`the access key ${AK2} is malformed`, AK2, SK2),
+    "the access key *** is malformed",
+  );
+  assert.equal(redact(`bad ${SK2} here`, AK2, SK2), "bad *** here");
+  // 太短的串不擦，免得把正常文本切碎
+  assert.equal(redact("abc is fine", "abc", ""), "abc is fine");
+  assert.equal(redact("", AK2, SK2), "");
+});
+
+test("authorize: 上游回显 Access Key 时，失败信息里不能带凭据", async () => {
+  const plugin = await mod.default({}, {});
+  const real = globalThis.fetch;
+  const AK2 = "LTAI5tFAKEKEY000000000";
+  const SK2 = "FAKESECRET0000000000000000000000000000";
+  globalThis.fetch = async () => new Response(
+    JSON.stringify({ error_msg: `Bad request: the access key ${AK2} is malformed`, error_code: "APIG.0602" }),
+    { status: 400 },
+  );
+  try {
+    const r = await plugin.auth.methods[0].authorize({ credential: `${AK2}:${SK2}` });
+    assert.equal(r.type, "failed");
+    const dump = JSON.stringify(r);
+    assert.ok(!dump.includes(AK2), "失败信息里不能有 AK");
+    assert.ok(!dump.includes(SK2), "失败信息里不能有 SK");
+    assert.match(r.error, /malformed/, "错误原因要保留，便于排查");
+  } finally {
+    globalThis.fetch = real;
   }
 });
 

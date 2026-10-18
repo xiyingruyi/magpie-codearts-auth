@@ -269,15 +269,15 @@ async function envelope(path, { method = "GET", body, ak, sk, timeout = 30_000 }
     });
     text = await res.text();
   } catch (cause) {
-    throw Object.assign(new Error(`CodeArts 请求失败: ${cause?.message ?? cause}`), { cause });
+    throw Object.assign(new Error(`CodeArts 请求失败: ${redact(cause?.message ?? String(cause), ak, sk)}`), { cause });
   }
   let data;
   try { data = text ? JSON.parse(text) : undefined; } catch { data = undefined; }
   if (res.status !== 200 || !data) {
-    throw new Error(`CodeArts ${path} HTTP ${res.status}: ${text.slice(0, 200)}`);
+    throw new Error(`CodeArts ${path} HTTP ${res.status}: ${redact(text.slice(0, 200), ak, sk)}`);
   }
   if (data.error_code !== undefined && !["0000", 0, null].includes(data.error_code)) {
-    throw Object.assign(new Error(`CodeArts ${path} 业务错误 ${data.error_code}: ${data.error_msg ?? ""}`), {
+    throw Object.assign(new Error(`CodeArts ${path} 业务错误 ${data.error_code}: ${redact(data.error_msg ?? "", ak, sk)}`), {
       errorCode: String(data.error_code),
     });
   }
@@ -315,6 +315,22 @@ async function fetchBenefitModels(ak, sk) {
 // ---------------------------------------------------------------------------
 // 工具
 // ---------------------------------------------------------------------------
+
+/**
+ * 把一段文本里可能出现的 AK/SK 换成 `***`。
+ *
+ * 上游的错误体会**回显请求里的 Access Key**（例如
+ * `the access key LTAI5t… is malformed`），而这条消息会进登录失败提示、
+ * 提供商页的 listError、以及 magpie 的日志。凭据不该出现在这些地方。
+ */
+function redact(text, ak, sk) {
+  let out = String(text ?? "");
+  for (const secret of [sk, ak]) {
+    const v = String(secret ?? "").trim();
+    if (v.length >= 8) out = out.split(v).join("***");
+  }
+  return out;
+}
 
 function bare(v) {
   let t = String(v ?? "").trim();
@@ -513,7 +529,7 @@ export default async function codeartsPlugin(_input, options) {
             try {
               await fetchBalance(ak, sk);
             } catch (e) {
-              return { type: "failed", error: `AK/SK 验证失败: ${e?.message ?? e}` };
+              return { type: "failed", error: `AK/SK 验证失败: ${redact(e?.message ?? String(e), ak, sk)}` };
             }
             return { type: "success", key: ak, metadata: { sk } };
           },
@@ -651,7 +667,7 @@ export default async function codeartsPlugin(_input, options) {
             ],
           };
         } catch (e) {
-          return { error: `额度查询失败: ${e?.message ?? e}`, windows: [] };
+          return { error: `额度查询失败: ${redact(e?.message ?? String(e), ak, sk)}`, windows: [] };
         }
       },
 
@@ -733,7 +749,7 @@ export default async function codeartsPlugin(_input, options) {
         } catch (e) {
           // 拉取失败：**不清缓存**（旧判定仍然是对这个账号最靠谱的信息），
           // 并把原因抛给宿主 —— 宿主会记 listError，在提供商页显示出来
-          throw new Error(`CodeArts 模型清单获取失败: ${e?.message ?? e}`);
+          throw new Error(`CodeArts 模型清单获取失败: ${redact(e?.message ?? String(e), ak, sk)}`);
         }
       },
     },
@@ -742,7 +758,7 @@ export default async function codeartsPlugin(_input, options) {
 
 /** 测试辅助（宿主不会把它当插件调用）。 */
 export const _internal = {
-  rfc3986, sdkSignedHeaders, envelope, creds, bare, parseCredential,
+  rfc3986, sdkSignedHeaders, envelope, creds, bare, parseCredential, redact,
   claimStatus, claimToday, fetchBalance, fetchBenefitModels,
   checkinOutcome, startOfTodayMs, isBenefitChannel, codeartsModels,
   upstreamSessionId, sessionHeaders, num, round1, optNumber, outputLimit, CN_OFFSET_MS,
