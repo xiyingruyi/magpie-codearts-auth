@@ -8,7 +8,7 @@ const {
   checkinOutcome, startOfTodayMs, isBenefitChannel, codeartsModels, redact,
   outputLimit, MAX_OUTPUT_TOKENS,
   upstreamSessionId, sessionHeaders, CN_OFFSET_MS,
-  channelCache, channelTable, MODEL_META, BENEFIT_MODELS, AGENT_MODELS,
+  channelCache, channelTable, MODEL_META, AGENT_MODELS,
   SNAP_HOST, CHAT_PATH, OPENGW_HOST,
 } = mod._internal;
 
@@ -165,9 +165,9 @@ test("isBenefitChannel: 空模型名 → false", () => {
   assert.equal(isBenefitChannel(undefined), false);
 });
 
-test("BENEFIT_MODELS 全部落在黑名单外（一致性自检）", () => {
-  for (const m of BENEFIT_MODELS) {
-    assert.equal(isBenefitChannel(m), true, `${m} 应为 benefit`);
+test("MODEL_META 里标了 benefit 的模型，判定也确实是 benefit（一致性自检）", () => {
+  for (const [id, meta] of Object.entries(MODEL_META)) {
+    assert.equal(isBenefitChannel(id), meta.benefit, `${id} 的 benefit 标记与黑名单判定不一致`);
   }
 });
 

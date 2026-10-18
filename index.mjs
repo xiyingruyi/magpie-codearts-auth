@@ -53,8 +53,6 @@ const CONFIG_PATH = "/api/v1/gateway/config";
  * 只是云端拿不到清单时的兜底，运行时会被 `provider.models` 拉回的 channel 覆盖。
  */
 const AGENT_MODELS = ["openpangu-2.0-pro", "openpangu-2.0-flash", "GLM-5.2"];
-/** 已知福利模型（仅用于静态兜底展示；判定走黑名单，不依赖此表）。 */
-const BENEFIT_MODELS = ["glm-5.3-flash", "deepseek-v4-pro-0813", "deepseek-v4-flash-0731", "deepseek-v4.1-flash"];
 
 /**
  * 上游 `max_tokens` **参数的硬上限**（实测出来的，不是猜的）。
@@ -697,7 +695,7 @@ export default async function codeartsPlugin(_input, options) {
             try {
               after = await claimStatus(ak, sk);
             } catch (e) {
-              return { outcome: "failed", message: `签到已提交，但状态回读失败，稍后重试确认: ${String(e?.message ?? e).slice(0, 100)}` };
+              return { outcome: "failed", message: `签到已提交，但状态回读失败，稍后重试确认: ${redact(String(e?.message ?? e), ak, sk).slice(0, 100)}` };
             }
             createMs = num(after?.create_time);
           }
@@ -762,6 +760,6 @@ export const _internal = {
   claimStatus, claimToday, fetchBalance, fetchBenefitModels,
   checkinOutcome, startOfTodayMs, isBenefitChannel, codeartsModels,
   upstreamSessionId, sessionHeaders, num, round1, optNumber, outputLimit, CN_OFFSET_MS,
-  channelCache, channelTable, MODEL_META, BENEFIT_MODELS, AGENT_MODELS, MAX_OUTPUT_TOKENS,
+  channelCache, channelTable, MODEL_META, AGENT_MODELS, MAX_OUTPUT_TOKENS,
   SNAP_HOST, CHAT_PATH, OPENGW_HOST,
 };
