@@ -14,7 +14,7 @@
 
 ```sh
 magpie plugin add github:liuxigreen/magpie-codearts-auth   # 上游原版
-magpie plugin add github:xiyingruyi/magpie-codearts-auth   # 本 fork（含 0.2.10 修复）
+magpie plugin add github:xiyingruyi/magpie-codearts-auth   # 本 fork（含 0.2.11 修复）
 magpie plugin login codearts
 magpie quota
 ```
@@ -172,7 +172,7 @@ CODEARTS_AK=... CODEARTS_SK=... node scripts/probe-session.mjs <模式> [并发�
 
 此外补齐了 `ineligible` / `captcha` / `inactive` 三种签到 outcome（骨架版遇到会落到 `failed` 并每 30 分钟无意义重试）。
 
-## 0.2.4 – 0.2.10（本 fork）
+## 0.2.4 – 0.2.11（本 fork）
 
 在 0.2.3 基础上的改动，逐条都有单测覆盖：
 
@@ -201,14 +201,22 @@ CODEARTS_AK=... CODEARTS_SK=... node scripts/probe-session.mjs <模式> [并发�
 | ㉑ | 即使带了 `stream: false`，`unsupported model` 这类错误上游仍返回 **HTTP 200 + `error_code`**（实测），同样会被当成空回答 | loader 看响应：JSON 200 里认出 `error_code` → 改成 **400 + OpenAI 错误形态**；流式则窥探首事件，是错误就整条改 400，途中的错误事件改写成 `{"error":…}`（magpie 认这个）。正常流**逐字节透传**（有单测保证） |
 | ㉒ | 宿主 `save()` 的实现是 `md = { ...inputs, ...result.metadata }`，prompt 收集的原始 `AK:SK` 组合串会落到 `metadata.credential`，与 `key`、`metadata.sk` **重复三份**明文凭据 | `authorize` 返回 `metadata: { sk, credential: "" }` 覆盖掉它（同名键、result 优先合并） |
 | ㉓ | `usage()` 的 `catch` 引用了 `try` 块内的 `const ak/sk`：凭据不完整时 `creds()` 抛错 → catch 再抛 `ReferenceError`，宿主拿到异常而非「额度查询失败」 | `ak/sk` 提到 `try` 外声明，catch 照常脱敏并返回 error |
+| ㉔ | 流式窥探若直接 `await reader.read()`：上游长思考时可能数秒不发一个字节，宿主就一直拿不到响应头（只判时间戳是拦不住的） | 窥探与 3 秒定时器竞速；超时放弃窥探，把那次**未完成**的 read 交给后续转发，一个字节都不丢 |
 
-测试从 45 条增到 118 条，覆盖上述每一条以及「`used` 永不为 NaN」「空响应不抛错」
+测试从 45 条增到 119 条，覆盖上述每一条以及「`used` 永不为 NaN」「空响应不抛错」
 「余额字段为 0 不被 `||` 吞掉」等边界。
 
 ### 第四轮实测（2026-10-19）
 
 工具调用（流式 / 非流式）、5 万 token 长上下文、`max_tokens=1` 截断、错误分类、
 两个账号的额度换算、七个模型的通道判定全部通过；上面 ⑳㉑㉒㉓ 就是这轮挖出来的。
+
+修完后又复测了一轮（0.2.11）：8 并发流式 / 8 并发非流式全 200、流式工具调用
+`{"city":"北京"}` 能正确拼回、未知模型与空 messages 在**非流式**下也如实返回 400、
+Anthropic 协议（`/v1/messages`，流式与非流式）翻译路径不受影响。⑳ 修好后，
+「思考型模型 + 小 `max_tokens` 时正文为空」仍然存在 —— 直连上游同样如此
+（`max_tokens=1500` 时 2817 reasoning / 34 content），是模型把预算花在思考上，
+不是插件缺陷；给足 `max_tokens`（实测 3000）即正常出正文。
 
 > **为什么要改 `baseURL` 而不是在 fetch 里硬编码端点**：0.2.3 的 `fetch` 无视宿主给的
 > 地址、直接打 `SNAP_HOST + /api/v2/chat/completions`，看着能用，但它同时把宿主的

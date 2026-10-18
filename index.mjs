@@ -470,6 +470,10 @@ function errorResponse({ code, message }) {
 /** 重写响应体时不能沿用的头（body 已不是原始字节）。 */
 const REWRITTEN_HEADERS = ["content-length", "content-encoding", "transfer-encoding"];
 
+/** 窥探流式首事件的时限与字节上限（只为认出「首个事件就是错误」这一种情况）。 */
+const PEEK_MS = 3000;
+const PEEK_BYTES = 64 * 1024;
+
 function cloneHeadersWithout(headers) {
   const out = new Headers(headers);
   for (const k of REWRITTEN_HEADERS) out.delete(k);
@@ -488,14 +492,35 @@ function cloneHeadersWithout(headers) {
  *      OpenAI 形态 `{"error":{…}}` —— magpie 的嗅探器认这个，会据此把流标成失败。
  * 转发逐行进行，未改写的行原样重编码（UTF-8 往返无损），不会破坏分片边界。
  */
-async function rewriteStreamError(res) {
-  const reader = res.body.getReader();
-  const dec = new TextDecoder();
+/**
+ * 窥探流的首个 data 事件，只为认出「一上来就是错误」这一种情况。
+ *
+ * 🔴 `reader.read()` 在**上游一个字节都不发**时会一直挂着 —— 只检查
+ *    `Date.now()` 是没用的，必须先和定时器竞速。超时后把那次**尚未完成**的
+ *    read 原样交给后续转发（`pending`），不能丢掉，否则那一块的读取就漏了。
+ */
+async function peekStream(reader, dec) {
   let text = "";
+  let pending = null;
   let err = null;
+  const deadline = Date.now() + PEEK_MS;
   try {
     while (true) {
-      const { value, done } = await reader.read();
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      const readP = pending ?? reader.read();
+      pending = null;
+      let timer;
+      const raced = await Promise.race([
+        readP.then((v) => ({ v })),
+        new Promise((r) => { timer = setTimeout(() => r({ timeout: true }), remaining); }),
+      ]);
+      clearTimeout(timer);
+      if (raced.timeout) {
+        pending = readP; // 还没回来，交给转发那一侧接着等
+        break;
+      }
+      const { value, done } = raced.v;
       if (done) break;
       text += dec.decode(value, { stream: true });
       const lines = text.split("\n");
@@ -505,32 +530,34 @@ async function rewriteStreamError(res) {
         return t && t !== "[DONE]";
       });
       if (line) { err = upstreamError(line.slice(5).trim()); break; }
-      if (text.length > 64 * 1024) break; // 不像错误流，别无限缓冲
+      if (text.length > PEEK_BYTES) break; // 不像错误流，别无限缓冲
     }
   } catch {
     // 读失败就按原样把已有分片交出去
   }
+  return { text, pending, err };
+}
+
+async function rewriteStreamError(res) {
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  const { text, pending, err } = await peekStream(reader, dec);
   if (err) {
     try { await reader.cancel(); } catch { /* 已经断了 */ }
     return errorResponse(err);
   }
-  return new Response(streamWithErrorEvents(text, dec, reader), {
+  return new Response(streamWithErrorEvents(text, dec, reader, pending), {
     status: res.status,
     statusText: res.statusText,
     headers: cloneHeadersWithout(res.headers),
   });
 }
 
-/**
- * 流式中途的错误事件 → OpenAI 的 `{"error": …}`，其余行原样。
- *
- * `prefix` 是窥探阶段已经读到的文本 —— 它可能**不止一行**（一次 read 通常拿到
- * 一大块），所以必须喂进同一个行处理器，不能当成原始字节直接透传，否则同一块
- * 里后续的错误事件就漏改了。
- */
-function streamWithErrorEvents(prefix, dec, reader) {
+/** 流式中途的错误事件 → OpenAI 的 `{"error": …}`，其余行原样。 */
+function streamWithErrorEvents(prefix, dec, reader, firstRead = null) {
   const enc = new TextEncoder();
   let buf = prefix;
+  let pending = firstRead;
   const rewrite = (line) => {
     const t = line.startsWith("data:") ? line.slice(5).trim() : "";
     if (!t || t === "[DONE]") return line;
@@ -538,16 +565,20 @@ function streamWithErrorEvents(prefix, dec, reader) {
     if (!err) return line;
     return `data:${JSON.stringify({ error: { message: err.message, type: "codearts_error", code: err.code } })}`;
   };
+  const drain = (controller) => {
+    const lines = buf.split("\n");
+    buf = lines.pop();
+    if (lines.length) controller.enqueue(enc.encode(lines.map(rewrite).join("\n") + "\n"));
+  };
   return new ReadableStream({
     start(controller) {
-      const lines = buf.split("\n");
-      buf = lines.pop();
-      if (lines.length) controller.enqueue(enc.encode(lines.map(rewrite).join("\n") + "\n"));
+      drain(controller);
     },
     async pull(controller) {
       let value, done;
       try {
-        ({ value, done } = await reader.read());
+        ({ value, done } = pending ? await pending : await reader.read());
+        pending = null;
       } catch (e) {
         controller.error(e);
         return;
@@ -561,9 +592,7 @@ function streamWithErrorEvents(prefix, dec, reader) {
         return;
       }
       buf += dec.decode(value, { stream: true });
-      const lines = buf.split("\n");
-      buf = lines.pop();
-      if (lines.length) controller.enqueue(enc.encode(lines.map(rewrite).join("\n") + "\n"));
+      drain(controller);
     },
     cancel(reason) {
       reader.cancel(reason).catch(() => {});
@@ -987,6 +1016,6 @@ export const _internal = {
   checkinOutcome, startOfTodayMs, isBenefitChannel, codeartsModels, clampChatBody,
   upstreamSessionId, sessionHeaders, num, round1, optNumber, outputLimit, CN_OFFSET_MS,
   channelCache, channelTable, MODEL_META, AGENT_MODELS, MAX_OUTPUT_TOKENS,
-  normalizeChatBody, upstreamError, normalizeChatResponse, rewriteStreamError,
+  normalizeChatBody, upstreamError, normalizeChatResponse, rewriteStreamError, PEEK_MS,
   SNAP_HOST, CHAT_PATH, OPENGW_HOST,
 };

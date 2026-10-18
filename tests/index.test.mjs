@@ -7,7 +7,7 @@ const {
   rfc3986, sdkSignedHeaders, creds, parseCredential, num, round1,
   checkinOutcome, startOfTodayMs, isBenefitChannel, codeartsModels, redact, clampChatBody,
   outputLimit, MAX_OUTPUT_TOKENS, normalizeChatBody,
-  upstreamError, normalizeChatResponse,
+  upstreamError, normalizeChatResponse, PEEK_MS,
   upstreamSessionId, sessionHeaders, CN_OFFSET_MS,
   channelCache, channelTable, MODEL_META, AGENT_MODELS,
   SNAP_HOST, CHAT_PATH, OPENGW_HOST,
@@ -835,6 +835,25 @@ test("normalizeChatResponse: 正常流式一个字节都不改（含跨 chunk �
     start(c) { for (const p of parts) c.enqueue(enc.encode(p)); c.close(); },
   }), { status: 200, headers: { "content-type": "text/event-stream" } });
   assert.equal(await (await normalizeChatResponse(res)).text(), parts.join(""));
+});
+
+test("normalizeChatResponse: 上游迟迟不发首个事件时，超时后按时交出头且数据不丢", async () => {
+  // 窥探必须有硬时限：上游长思考时可能几秒不发一个字节，而 reader.read()
+  // 会在没有数据时一直挂着 —— 只判 Date.now() 是拦不住的。
+  const enc = new TextEncoder();
+  const t0 = Date.now();
+  const res = new Response(new ReadableStream({
+    start(c) {
+      setTimeout(() => c.enqueue(enc.encode('data:{"id":"a","choices":[{"delta":{"content":"late"}}]}\n\ndata:[DONE]\n\n')), PEEK_MS + 400);
+      setTimeout(() => c.close(), PEEK_MS + 800);
+    },
+  }), { status: 200, headers: { "content-type": "text/event-stream" } });
+  const out = await normalizeChatResponse(res);
+  const headMs = Date.now() - t0;
+  assert.ok(headMs < PEEK_MS + 1000, `应在上限附近交出响应头，实际 ${headMs}ms`);
+  const text = await out.text();
+  assert.ok(text.includes("late"), "超时放弃窥探后，之后的正常分片必须照常转发");
+  assert.ok(text.includes("[DONE]"));
 });
 
 test("normalizeChatResponse: 非 200、非对话内容类型一律原样", async () => {
