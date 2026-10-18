@@ -14,7 +14,7 @@
 
 ```sh
 magpie plugin add github:liuxigreen/magpie-codearts-auth   # 上游原版
-magpie plugin add github:xiyingruyi/magpie-codearts-auth   # 本 fork（含 0.2.5 修复）
+magpie plugin add github:xiyingruyi/magpie-codearts-auth   # 本 fork（含 0.2.6 修复）
 magpie plugin login codearts
 magpie quota
 ```
@@ -172,7 +172,7 @@ CODEARTS_AK=... CODEARTS_SK=... node scripts/probe-session.mjs <模式> [并发�
 
 此外补齐了 `ineligible` / `captcha` / `inactive` 三种签到 outcome（骨架版遇到会落到 `failed` 并每 30 分钟无意义重试）。
 
-## 0.2.4 / 0.2.5（本 fork）
+## 0.2.4 – 0.2.6（本 fork）
 
 在 0.2.3 基础上的改动，逐条都有单测覆盖：
 
@@ -185,13 +185,16 @@ CODEARTS_AK=... CODEARTS_SK=... node scripts/probe-session.mjs <模式> [并发�
 | ⑤ | 签到窗口未签到时 `used: 1 / limit: 1` = 恰好 100%，满格红条像「用尽」 | 改成不带 `limit` 的纯状态行 |
 | ⑥ | 天界按**机器本地时区**算，机器不在东八区时「今日已签」判定差一天 | 固定按 UTC+8（上游 24:00 清零） |
 | ⑦ | loader 里 `init.body` 非字符串时被 `String()` 成 `"[object Object]"`，签名与实际 body 不一致；`Request` 对象的 method/body 被忽略；调用方的 `accept: text/event-stream` 等头被丢弃 | 按实际 URL/方法/body 签名，保留调用方其它头，非本 provider 地址原样转发 |
-| ⑧ | 云端 `channel` 缓存跨账号串用 | 每次拉到清单先清空再重填 |
+| ⑧ | 云端 `channel` 缓存跨账号串用 | 改为**按账号**分层缓存（`AK → modelId → channel`），只替换本账号那一层，键统一小写 |
 | ⑨ | **对话端点少一段 `/api/v2`**：宿主 `pluginFetch` 用 `baseURL + TrimPrefix("/v1/chat/completions","/v1")` 拼地址，`baseURL` 只写主机名就会打到 `…/chat/completions`，上游返回 `APIG.0101 The API does not exist or has not been published` | `baseURL` / `config.api` 都改为 **base** `…/api/v2`；loader 另加 `resolveTarget()` 兜底，来地址只有 `…/chat/completions` 时补回 `/api/v2` |
 | ⑩ | 同主机判断用 `startsWith`：`https://…myhuaweicloud.com.evil.example/` 会被当成自家地址，**AK/SK 签名外泄** | 改用 `new URL().origin` 精确比较 |
 | ⑪ | 宿主给插件读的 `x-magpie-work-dir` / `x-magpie-work-git`（工作目录、仓库地址）被原样转给上游厂商 | loader 转发前显式删除；不依赖宿主自己擦 |
 | ⑫ | 探针脚本打印 AK 首尾各 4 位（仍是凭据片段） | 改用不可逆指纹 |
+| ⑬ | 模型清单拉取失败被 `catch` 吞成空数组 → 缓存被清空、静默退回静态清单，提供商页也不报错 | 拉取失败**不清缓存、向上抛**，由宿主记 `listError` 显示出来 |
+| ⑭ | 上游 `models[]` 里有 `null` / 非对象元素时读 `.model_id` 抛错，**整份清单作废** | 逐项过滤非对象元素 |
+| ⑮ | 签到 POST 成功后回读状态失败 → 被判成 `ineligible`；宿主把非 `failed` 的 outcome 当作「今天已结算」，**当天再也不重试** | 回读失败报 `failed`（30 分钟后由宿主重试确认）；只有「回读成功且时间戳确实没推进」才判 `ineligible` |
 
-测试从 45 条增到 89 条，覆盖上述每一条以及「`used` 永不为 NaN」「空响应不抛错」
+测试从 45 条增到 94 条，覆盖上述每一条以及「`used` 永不为 NaN」「空响应不抛错」
 「余额字段为 0 不被 `||` 吞掉」等边界。
 
 > **为什么要改 `baseURL` 而不是在 fetch 里硬编码端点**：0.2.3 的 `fetch` 无视宿主给的

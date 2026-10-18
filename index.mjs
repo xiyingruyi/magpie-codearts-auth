@@ -124,22 +124,34 @@ function sameHost(a, b) {
 }
 
 /**
- * 云端 channel 缓存：modelId → "agent" | "benefit" | ""（未知）。
+ * 云端 channel 缓存：**按账号**存 modelId → "agent" | "benefit"。
  * 由 provider.models 写入，供 loader 判定通道。跨请求存活（模块级）。
  *
- * 每次成功拉到云端清单时**先整体清空再重填**：channel 是跟着账号走的
- * （不同订阅可能不同），不清就会把上一个账号的判定留给下一个账号用。
+ * 两点必须按账号隔离：
+ *   ① channel 跟着账号的订阅走，不同账号可能把同一个模型放在不同通道；
+ *   ② 同一模型名在不同账号下可能属于不同套餐，串用会走错通道报
+ *      `unsupported model`。
+ * 所以缓存键是 `AK → (modelId → channel)`，每个账号拉到清单时只替换自己那一层。
  */
 const channelCache = new Map();
 
+/** 该账号的 channel 表（测试里也能用空账号名直接灌数据）。 */
+function channelTable(ak = "") {
+  const key = String(ak ?? "");
+  let t = channelCache.get(key);
+  if (!t) channelCache.set(key, (t = new Map()));
+  return t;
+}
+
 /**
  * 通道判定：返回 true 表示走 benefit（免费额度）通道。
- * 优先用云端 channel；否则按上游黑名单语义 —— 不在 AGENT_MODELS 里的一律 benefit。
+ * 优先用云端 channel（先按账号查，再看传进来的显式值）；否则按上游黑名单语义
+ * —— 不在 AGENT_MODELS 里的一律 benefit。
  */
-function isBenefitChannel(modelId, knownChannel = "") {
+function isBenefitChannel(modelId, knownChannel = "", ak = "") {
   const id = String(modelId ?? "").trim();
   if (!id) return false;
-  const ch = String(knownChannel || channelCache.get(id) || "").toLowerCase();
+  const ch = String(knownChannel || channelTable(ak).get(id.toLowerCase()) || "").toLowerCase();
   if (ch === "benefit") return true;
   if (ch === "agent") return false;
   // 无 channel 信息 → 黑名单：命中 AgentCenter 名单才算老套餐，其余按 benefit
@@ -272,10 +284,17 @@ function fetchBalance(ak, sk) {
   return envelope(BALANCE_PATH, { ak, sk });
 }
 
-/** 福利模型列表：result.models = [{model_id, context_window, max_tokens, channel, …}]。 */
+/**
+ * 福利模型列表：result.models = [{model_id, context_window, max_tokens, channel, …}]。
+ *
+ * 🔴 失败**不吞**：吞成空数组会让调用方分不清「真的没有模型」和「这次没拉到」，
+ * 进而把缓存清空、拿静态兜底清单去判定通道。网络/业务错误一律往上抛。
+ */
 async function fetchBenefitModels(ak, sk) {
-  const r = await envelope(CONFIG_PATH, { ak, sk }).catch(() => ({}));
-  return Array.isArray(r.models) ? r.models : [];
+  const r = await envelope(CONFIG_PATH, { ak, sk });
+  if (!Array.isArray(r.models)) return [];
+  // 上游数组里偶尔有 null / 非对象元素，不能让它打断整份清单
+  return r.models.filter((m) => m && typeof m === "object");
 }
 
 // ---------------------------------------------------------------------------
@@ -516,7 +535,7 @@ export default async function codeartsPlugin(_input, options) {
             if (isChat && bodyStr) {
               try { model = String(JSON.parse(bodyStr).model ?? ""); } catch { /* 保持空 */ }
             }
-            const extra = isChat && isBenefitChannel(model)
+            const extra = isChat && isBenefitChannel(model, "", ak)
               ? { ...session, maas_type: "benefit", "model-id": model, "model-name": model }
               : session;
             const headers = sdkSignedHeaders(method, target, bodyStr, ak, sk, extra);
@@ -620,7 +639,15 @@ export default async function codeartsPlugin(_input, options) {
           } catch (e) {
             return checkinOutcome(false, undefined, e);
           }
-          const after = await claimStatus(ak, sk).catch(() => ({}));
+          // 回读状态只为确认「今天签到生效了」。读失败（网络抖动）**不能**当成
+          // 「上游没推进」—— 那会被判成 ineligible，宿主就再也不重试了，
+          // 而积分其实已经到账。读不到就报 failed，让宿主 30 分钟后再确认。
+          let after;
+          try {
+            after = await claimStatus(ak, sk);
+          } catch (e) {
+            return { outcome: "failed", message: `签到已提交，但状态回读失败，稍后重试确认: ${String(e?.message ?? e).slice(0, 100)}` };
+          }
           return checkinOutcome(true, after?.create_time, undefined, beforeMs);
         } catch (e) {
           return checkinOutcome(false, undefined, e);
@@ -631,21 +658,28 @@ export default async function codeartsPlugin(_input, options) {
     provider: {
       id: "codearts",
       async models(provider, { auth }) {
-        // 尽力拉云端模型清单；失败保留 config 静态列表
+        let ak, sk;
         try {
-          const { ak, sk } = creds(auth ?? {});
-            const rows = await fetchBenefitModels(ak, sk);
-            // 先清空再重填：channel 跟账号走，留着上一个账号的判定会串通道。
-            // 空清单也要清 —— 否则上一个账号的记录会一直生效。
-            channelCache.clear();
-            if (!rows.length) return provider.models;
-            const out = { ...provider.models };
+          ({ ak, sk } = creds(auth ?? {}));
+        } catch {
+          // 没登录：给静态清单，不算错误
+          return provider.models;
+        }
+        try {
+          const rows = await fetchBenefitModels(ak, sk);
+          // 只替换**本账号**那一层：channel 跟账号走，留着别的账号的判定会串通道；
+          // 但也不能整体清空，否则另一个账号的缓存会被这次拉取抹掉。
+          // 空清单同样要替换 —— 否则本账号的旧记录会一直生效。
+          const table = channelTable(ak);
+          table.clear();
+          if (!rows.length) return provider.models;
+          const out = { ...provider.models };
           for (const m of rows) {
             const id = String(m.model_id ?? m.modelId ?? m.id ?? "").trim();
             if (!id) continue;
-            // 🔴 保留云端 channel：既用于本次判定，也写进 channelCache 供 loader 用
+            // 🔴 保留云端 channel：既用于本次判定，也写进本账号的 channel 表供 loader 用
             const channel = String(m.channel ?? "").trim().toLowerCase();
-            if (channel === "agent" || channel === "benefit") channelCache.set(id, channel);
+            if (channel === "agent" || channel === "benefit") table.set(id.toLowerCase(), channel);
             out[id] = {
               name: String(m.model_name ?? m.modelName ?? m.name ?? id),
               id,
@@ -658,8 +692,10 @@ export default async function codeartsPlugin(_input, options) {
             };
           }
           return out;
-        } catch {
-          return provider.models;
+        } catch (e) {
+          // 拉取失败：**不清缓存**（旧判定仍然是对这个账号最靠谱的信息），
+          // 并把原因抛给宿主 —— 宿主会记 listError，在提供商页显示出来
+          throw new Error(`CodeArts 模型清单获取失败: ${e?.message ?? e}`);
         }
       },
     },
@@ -672,6 +708,6 @@ export const _internal = {
   claimStatus, claimToday, fetchBalance, fetchBenefitModels,
   checkinOutcome, startOfTodayMs, isBenefitChannel, codeartsModels,
   upstreamSessionId, sessionHeaders, num, round1, CN_OFFSET_MS,
-  channelCache, MODEL_META, BENEFIT_MODELS, AGENT_MODELS,
+  channelCache, channelTable, MODEL_META, BENEFIT_MODELS, AGENT_MODELS,
   SNAP_HOST, CHAT_PATH, OPENGW_HOST,
 };

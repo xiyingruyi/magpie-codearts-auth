@@ -7,7 +7,7 @@ const {
   rfc3986, sdkSignedHeaders, creds, parseCredential, num, round1,
   checkinOutcome, startOfTodayMs, isBenefitChannel, codeartsModels,
   upstreamSessionId, sessionHeaders, CN_OFFSET_MS,
-  channelCache, MODEL_META, BENEFIT_MODELS, AGENT_MODELS,
+  channelCache, channelTable, MODEL_META, BENEFIT_MODELS, AGENT_MODELS,
   SNAP_HOST, CHAT_PATH, OPENGW_HOST,
 } = mod._internal;
 
@@ -138,16 +138,16 @@ test("isBenefitChannel: 未知模型按黑名单语义 → benefit", () => {
 
 test("isBenefitChannel: 云端 channel 优先于黑名单", () => {
   channelCache.clear();
-  channelCache.set("some-new-agent-model", "agent");
+  channelTable().set("some-new-agent-model", "agent");
   assert.equal(isBenefitChannel("some-new-agent-model"), false);
-  channelCache.set("openpangu-2.0-pro", "benefit");
+  channelTable().set("openpangu-2.0-pro", "benefit");
   assert.equal(isBenefitChannel("openpangu-2.0-pro"), true);
   channelCache.clear();
 });
 
 test("isBenefitChannel: 显式传入 channel 参数优先于 cache", () => {
   channelCache.clear();
-  channelCache.set("m1", "benefit");
+  channelTable().set("m1", "benefit");
   assert.equal(isBenefitChannel("m1", "agent"), false);
   assert.equal(isBenefitChannel("m1"), true);
   channelCache.clear();
@@ -821,6 +821,45 @@ test("checkin: 未登录 → inactive", async () => {
   assert.equal((await plugin.auth.checkin(async () => undefined)).outcome, "inactive");
 });
 
+/**
+ * 签到 POST 成功后，回读状态失败**不能**判成 ineligible。
+ * 宿主把 ineligible 当成「今天已结算」，当天不再重试；而 failed 会 30 分钟后重试。
+ * 用 .catch(() => ({})) 吞掉回读错误，就会把一次成功的签到永久标成「不参与活动」。
+ */
+test("checkin: 签到成功但回读状态失败 → failed（可重试），不是 ineligible", async () => {
+  const plugin = await mod.default({}, {});
+  const real = globalThis.fetch;
+  const yesterday = Date.now() - 86400_000;
+  let call = 0;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (!u.includes("/benefit/claim")) throw new Error("unexpected " + u);
+    call += 1;
+    if (call === 1) return new Response(JSON.stringify({ result: { create_time: yesterday } }), { status: 200 }); // 读旧状态
+    if (call === 2) return new Response(JSON.stringify({ result: {} }), { status: 200 });                        // POST 成功
+    throw new Error("network blip");                                                                            // 回读失败
+  };
+  try {
+    const got = await plugin.auth.checkin(async () => ({ type: "api", key: AK, metadata: { sk: SK } }));
+    assert.equal(got.outcome, "failed", `回读失败必须可重试，实际 ${got.outcome}`);
+  } finally {
+    globalThis.fetch = real;
+  }
+});
+
+test("checkin: 回读时间戳未推进 → ineligible（账号确实不在活动期）", async () => {
+  const plugin = await mod.default({}, {});
+  const real = globalThis.fetch;
+  const yesterday = Date.now() - 86400_000;
+  globalThis.fetch = async () => new Response(JSON.stringify({ result: { create_time: yesterday } }), { status: 200 });
+  try {
+    const got = await plugin.auth.checkin(async () => ({ type: "api", key: AK, metadata: { sk: SK } }));
+    assert.equal(got.outcome, "ineligible");
+  } finally {
+    globalThis.fetch = real;
+  }
+});
+
 // ---------------------------------------------------------------------------
 // provider.models
 // ---------------------------------------------------------------------------
@@ -848,8 +887,10 @@ test("provider.models: 云端清单覆盖并保留真实 context/output", async 
     assert.equal(r["deepseek-v4-pro-0813"].limit.context, 1000000);
     assert.equal(r["deepseek-v4-pro-0813"].limit.output, 393216);
     assert.equal(r["GLM-5.2"].limit.context, 200000);
-    assert.equal(channelCache.get("deepseek-v4-pro-0813"), "benefit");
-    assert.equal(channelCache.get("GLM-5.2"), "agent");
+    // 缓存按账号隔离：AK 那一层里能查到本账号的判定
+    const mine = channelCache.get(AK);
+    assert.equal(mine.get("deepseek-v4-pro-0813"), "benefit");
+    assert.equal(mine.get("glm-5.2"), "agent", "键统一小写");
   } finally {
     globalThis.fetch = real;
     channelCache.clear();
@@ -859,14 +900,75 @@ test("provider.models: 云端清单覆盖并保留真实 context/output", async 
 test("provider.models: 换账号时清掉上一个账号的 channel 判定", async () => {
   const plugin = await mod.default({}, {});
   const real = globalThis.fetch;
-  channelCache.set("stale-model", "agent");
+  // 上一个账号留下的判定
+  channelTable(AK).set("stale-model", "agent");
   globalThis.fetch = async () => new Response(JSON.stringify({
     result: { models: [{ model_id: "another-model", context_window: 1000, max_tokens: 100, channel: "benefit" }] },
   }), { status: 200 });
   try {
     await plugin.provider.models({ models: {} }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
-    assert.equal(channelCache.has("stale-model"), false, "上一个账号的判定必须被清掉");
-    assert.equal(channelCache.get("another-model"), "benefit");
+    const mine = channelCache.get(AK);
+    assert.equal(mine.has("stale-model"), false, "本账号的旧判定必须被清掉");
+    assert.equal(mine.get("another-model"), "benefit");
+  } finally {
+    globalThis.fetch = real;
+    channelCache.clear();
+  }
+});
+
+test("provider.models: 拉取失败不清缓存，并把原因抛给宿主（宿主显示 listError）", async () => {
+  const plugin = await mod.default({}, {});
+  const real = globalThis.fetch;
+  channelTable(AK).set("keep-me", "agent");
+  globalThis.fetch = async () => new Response(JSON.stringify({ error_code: "TM.00002001", error_msg: "boom" }), { status: 200 });
+  try {
+    await assert.rejects(
+      () => plugin.provider.models({ models: {} }, { auth: { type: "api", key: AK, metadata: { sk: SK } } }),
+      /模型清单获取失败/,
+    );
+    assert.equal(channelTable(AK).get("keep-me"), "agent", "拉不到清单时旧判定必须保留");
+  } finally {
+    globalThis.fetch = real;
+    channelCache.clear();
+  }
+});
+
+test("provider.models: 清单里有 null 元素不会打断整份列表", async () => {
+  const plugin = await mod.default({}, {});
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    result: { models: [null, 42, { model_id: "good-model", context_window: 1000, max_tokens: 100, channel: "benefit" }] },
+  }), { status: 200 });
+  try {
+    const r = await plugin.provider.models({ models: {} }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
+    assert.ok(r["good-model"], "正常元素要留下来");
+    assert.equal(r["good-model"].limit.context, 1000);
+  } finally {
+    globalThis.fetch = real;
+    channelCache.clear();
+  }
+});
+
+test("channelCache: 两个账号的通道判定互不影响", async () => {
+  const plugin = await mod.default({}, {});
+  const real = globalThis.fetch;
+  const OTHER = "LTAI5tOTHERACCOUNT";
+  try {
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      result: { models: [{ model_id: "m-agent", channel: "agent" }] },
+    }), { status: 200 });
+    await plugin.provider.models({ models: {} }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
+
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      result: { models: [{ model_id: "m-benefit", channel: "benefit" }] },
+    }), { status: 200 });
+    await plugin.provider.models({ models: {} }, { auth: { type: "api", key: OTHER, metadata: { sk: SK } } });
+
+    assert.equal(channelTable(AK).get("m-agent"), "agent", "账号 A 的判定不能被账号 B 抹掉");
+    assert.equal(channelTable(OTHER).get("m-benefit"), "benefit");
+    assert.equal(channelTable(AK).has("m-benefit"), false);
+    assert.equal(isBenefitChannel("m-agent", "", AK), false);
+    assert.equal(isBenefitChannel("m-agent", "", OTHER), true, "B 账号没有这条判定 → 按黑名单回退");
   } finally {
     globalThis.fetch = real;
     channelCache.clear();
