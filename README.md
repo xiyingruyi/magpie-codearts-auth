@@ -14,7 +14,7 @@
 
 ```sh
 magpie plugin add github:liuxigreen/magpie-codearts-auth   # 上游原版
-magpie plugin add github:xiyingruyi/magpie-codearts-auth   # 本 fork（含 0.2.4 修复）
+magpie plugin add github:xiyingruyi/magpie-codearts-auth   # 本 fork（含 0.2.5 修复）
 magpie plugin login codearts
 magpie quota
 ```
@@ -172,7 +172,7 @@ CODEARTS_AK=... CODEARTS_SK=... node scripts/probe-session.mjs <模式> [并发�
 
 此外补齐了 `ineligible` / `captcha` / `inactive` 三种签到 outcome（骨架版遇到会落到 `failed` 并每 30 分钟无意义重试）。
 
-## 0.2.4（本 fork）
+## 0.2.4 / 0.2.5（本 fork）
 
 在 0.2.3 基础上的改动，逐条都有单测覆盖：
 
@@ -186,9 +186,20 @@ CODEARTS_AK=... CODEARTS_SK=... node scripts/probe-session.mjs <模式> [并发�
 | ⑥ | 天界按**机器本地时区**算，机器不在东八区时「今日已签」判定差一天 | 固定按 UTC+8（上游 24:00 清零） |
 | ⑦ | loader 里 `init.body` 非字符串时被 `String()` 成 `"[object Object]"`，签名与实际 body 不一致；`Request` 对象的 method/body 被忽略；调用方的 `accept: text/event-stream` 等头被丢弃 | 按实际 URL/方法/body 签名，保留调用方其它头，非本 provider 地址原样转发 |
 | ⑧ | 云端 `channel` 缓存跨账号串用 | 每次拉到清单先清空再重填 |
+| ⑨ | **对话端点少一段 `/api/v2`**：宿主 `pluginFetch` 用 `baseURL + TrimPrefix("/v1/chat/completions","/v1")` 拼地址，`baseURL` 只写主机名就会打到 `…/chat/completions`，上游返回 `APIG.0101 The API does not exist or has not been published` | `baseURL` / `config.api` 都改为 **base** `…/api/v2`；loader 另加 `resolveTarget()` 兜底，来地址只有 `…/chat/completions` 时补回 `/api/v2` |
+| ⑩ | 同主机判断用 `startsWith`：`https://…myhuaweicloud.com.evil.example/` 会被当成自家地址，**AK/SK 签名外泄** | 改用 `new URL().origin` 精确比较 |
+| ⑪ | 宿主给插件读的 `x-magpie-work-dir` / `x-magpie-work-git`（工作目录、仓库地址）被原样转给上游厂商 | loader 转发前显式删除；不依赖宿主自己擦 |
+| ⑫ | 探针脚本打印 AK 首尾各 4 位（仍是凭据片段） | 改用不可逆指纹 |
 
-测试从 45 条增到 84 条，覆盖上述每一条以及「`used` 永不为 NaN」「空响应不抛错」
+测试从 45 条增到 89 条，覆盖上述每一条以及「`used` 永不为 NaN」「空响应不抛错」
 「余额字段为 0 不被 `||` 吞掉」等边界。
+
+> **为什么要改 `baseURL` 而不是在 fetch 里硬编码端点**：0.2.3 的 `fetch` 无视宿主给的
+> 地址、直接打 `SNAP_HOST + /api/v2/chat/completions`，看着能用，但它同时把宿主的
+> 路由语义（`plugin://<id>/v1`)绕开了：任何非对话路径、任何宿主拼法变更都会出错，
+> 而且 `config.api` 里那条完整端点一旦被宿主当基址用，就会拼成
+> `…/chat/completions/chat/completions`。现在的写法是「base 交给宿主拼、插件只做
+> 签名与兜底补正」，两条路径都对。
 
 ## 致谢与免责声明
 
