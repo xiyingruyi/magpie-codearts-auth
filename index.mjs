@@ -79,6 +79,29 @@ const MODEL_META = {
 const CHAT_ABS = `${SNAP_HOST}${CHAT_PATH}`;
 
 /**
+ * 把宿主给的地址解析成真正要打的地址；不是本 provider 的主机则返回 null。
+ *
+ * 宿主（plugins.go 的 pluginFetch）用 `baseURL + strings.TrimPrefix(rest, "/v1")`
+ * 拼地址：baseURL 已经是 `SNAP_HOST/api/v2` 时拼出来正好是对话端点。但如果宿主
+ * 哪天换了拼法、只给出 `…/chat/completions`，请求会静默 404（APIG.0101）。
+ * 这里补第二道保险：只对**对话路径**把缺掉的 `/api/v2` 补回来，其它路径一律
+ * 按原样签名转发（例如 `/v1/model/builtin` 不属于 `/api/v2`）。
+ */
+function resolveTarget(asked) {
+  if (!sameHost(asked, SNAP_HOST)) return null;
+  try {
+    const u = new URL(asked);
+    if (u.pathname === "/chat/completions" || u.pathname === "/v1/chat/completions") {
+      u.pathname = CHAT_PATH;
+      return u.toString();
+    }
+  } catch {
+    return null;
+  }
+  return asked;
+}
+
+/**
  * magpie 宿主塞进插件 fetch 的「仅供插件阅读」的交接头（host.js 的 MAGPIE_ONLY）：
  * 它们告诉插件调用方的工作目录/仓库，**不是给上游厂商看的**。
  * 宿主通常会自己擦掉，但那是宿主的实现细节 —— 插件自己再擦一遍。
@@ -394,7 +417,11 @@ export default async function codeartsPlugin(_input, options) {
       cfg.provider.codearts ??= {
         name: "CodeArts 码道 (Huawei)",
         npm: "@ai-sdk/openai-compatible",
-        api: `${SNAP_HOST}${CHAT_PATH}`,
+        // 这里是 **base**，不是完整端点：宿主会把它当作 `baseURL + "/chat/completions"`
+        // 的兜底基址（plugins.go 的 `firstOf(o.BaseURL, m.URL, pp.API, …)`）。
+        // 写完整端点会让兜底路径拼出 `…/api/v2/chat/completions/chat/completions`。
+        // 主机名部分对 `Provider.Origin()` 仍然正确。
+        api: `${SNAP_HOST}/api/v2`,
         models: codeartsModels(),
       };
     },
@@ -462,8 +489,8 @@ export default async function codeartsPlugin(_input, options) {
             // 只接手本 provider 自己的主机。别的地址原样转发 —— 绝不能改写目标、
             // 也绝不能把我们的签名套到别的 URL 上。
             const asked = typeof input === "string" ? input : String(input?.url ?? "");
-            if (!sameHost(asked, SNAP_HOST)) return fetch(input, init);
-            const target = asked;
+            const target = resolveTarget(asked);
+            if (target === null) return fetch(input, init);
 
             // Request 对象作 input 时，方法和 body 在它身上而不是 init 里
             const req = typeof input === "string" ? null : input;

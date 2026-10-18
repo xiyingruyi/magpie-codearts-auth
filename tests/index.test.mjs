@@ -395,7 +395,10 @@ test("config: 注册 codearts provider", async () => {
   const cfg = {};
   await plugin.config(cfg);
   assert.ok(cfg.provider.codearts);
-  assert.equal(cfg.provider.codearts.api, `${SNAP_HOST}${CHAT_PATH}`);
+  // api 是 **base**：宿主会用它兜底拼 `base + "/chat/completions"`，
+  // 写完整端点会拼出 `…/api/v2/chat/completions/chat/completions`
+  assert.equal(cfg.provider.codearts.api, `${SNAP_HOST}/api/v2`);
+  assert.ok(!cfg.provider.codearts.api.endsWith("/chat/completions"));
 });
 
 // ---------------------------------------------------------------------------
@@ -499,6 +502,27 @@ async function callLoader(plugin, { key = AK, sk = SK, url, init = {} } = {}) {
   }
   return seen;
 }
+
+test("loader.fetch: 宿主若只给 …/chat/completions（漏了 /api/v2），补回来再签名", async () => {
+  const plugin = await mod.default({}, {});
+  // 兜底路径：万一宿主换了拼法，请求也不能静默 404（APIG.0101）
+  for (const wrong of [`${SNAP_HOST}/chat/completions`, `${SNAP_HOST}/v1/chat/completions`]) {
+    const s = await callLoader(plugin, {
+      url: wrong,
+      init: { method: "POST", body: JSON.stringify({ model: "deepseek-v4.1-flash" }) },
+    });
+    assert.equal(s.url, `${SNAP_HOST}${CHAT_PATH}`, `${wrong} 应被补成真实端点`);
+    assert.equal(s.init.headers.get("maas_type"), "benefit", "补正后仍然认得出是对话请求");
+    assert.equal(s.init.headers.get("x-ot-session-id"), upstreamSessionId(AK));
+  }
+});
+
+test("loader.fetch: 非对话路径不补 /api/v2（/v1/model/builtin 不属于 /api/v2）", async () => {
+  const plugin = await mod.default({}, {});
+  const u = `${SNAP_HOST}/v1/model/builtin`;
+  const s = await callLoader(plugin, { url: u, init: { method: "GET" } });
+  assert.equal(s.url, u);
+});
 
 test("loader.fetch: benefit 模型带三头，agent 模型不带", async () => {
   const plugin = await mod.default({}, {});
