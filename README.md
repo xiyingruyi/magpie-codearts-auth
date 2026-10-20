@@ -246,6 +246,19 @@ CODEARTS_AK=... CODEARTS_SK=... node scripts/probe-session.mjs <模式> [并发�
 
 此外补齐了 `ineligible` / `captcha` / `inactive` 三种签到 outcome（骨架版遇到会落到 `failed` 并每 30 分钟无意义重试）。
 
+## 0.2.21（2026-10-21：补上两个上游已显示的内置文本模型）
+
+用户发现插件只列出 4 个模型。直连 `/v1/model/builtin` 后确认上游实际有 8 个：
+
+- **6 个文本模型**里插件只列了 4 个，漏了 `glm-5.3`（GLM-5.3）和
+  `glm-5.2-sft-harmony`（GLM-5.2-ArkTS-SPARK）—— 它们都是 `channel_source=codearts`
+  的内置 agent 模型，不带 benefit 头直接 200，带反而 4004。
+- 另 2 个是 VL 多模态（`Qwen3-VL-235B` / `kimi-k2.6-vl`），上游自己标了
+  `display_enabled=false`，**不该放出来**（本插件也不支持发图）。
+
+修法：把两个文本模型加进 `AGENT_MODELS` + `MODEL_META`（`benefit: false`），
+插件清单从 4 → 6 个。补一条回归测试并做了变异验证。测试 206 → 207 条。
+
 ## 0.2.20（2026-10-21：四路审查后的修复）
 
 对 0.2.18 做了一轮四维度审查（运行时正确性 / 健壮性 / 文档一致性 / 测试有效性），

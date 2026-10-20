@@ -169,6 +169,15 @@ test("isBenefitChannel: 大小写不敏感", () => {
   assert.equal(isBenefitChannel("GlM-5.2"), false);
 });
 
+test("isBenefitChannel: 2026-10-21 上游补出的两个内置模型走 agent 通道（不带 benefit 头）", () => {
+  // 直连实测：`glm-5.3` / `glm-5.2-sft-harmony` 不带 benefit 头 200，带反而 4004。
+  // 漏进 AGENT_MODELS 的话它们会被判成 benefit、塞上福利头 → 上游回 benefit not found。
+  for (const m of ["glm-5.3", "glm-5.2-sft-harmony"]) {
+    assert.equal(isBenefitChannel(m), false, `${m} 是内置 agent 模型`);
+    assert.ok(codeartsModels()[m], `${m} 应该出现在模型清单里`);
+  }
+});
+
 test("isBenefitChannel: 空模型名 → false", () => {
   assert.equal(isBenefitChannel(""), false);
   assert.equal(isBenefitChannel(undefined), false);

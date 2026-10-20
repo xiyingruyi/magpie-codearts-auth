@@ -131,7 +131,7 @@ const CHECKIN_BUDGET_MS = 17_000;
  * 上游 `benefit = model not in AGENT_MODELS`，即不在这个名单里的一律按 benefit 处理。
  * 只是云端拿不到清单时的兜底，运行时会被 `provider.models` 拉回的 channel 覆盖。
  */
-const AGENT_MODELS = ["openpangu-2.0-pro", "openpangu-2.0-flash", "GLM-5.2"];
+const AGENT_MODELS = ["openpangu-2.0-pro", "openpangu-2.0-flash", "GLM-5.2", "glm-5.3", "glm-5.2-sft-harmony"];
 
 /**
  * 上游**已确认不可用**的模型 —— 不再出现在清单里。
@@ -218,6 +218,10 @@ const MODEL_META = {
   "openpangu-2.0-pro": { name: "OpenPangu 2.0 Pro", context: 0, output: MAX_OUTPUT_TOKENS, benefit: false },
   "openpangu-2.0-flash": { name: "OpenPangu 2.0 Flash", context: 0, output: MAX_OUTPUT_TOKENS, benefit: false },
   "GLM-5.2": { name: "GLM-5.2", context: 0, output: MAX_OUTPUT_TOKENS, benefit: false },
+  // 2026-10-21 上游 `/v1/model/builtin` 新增/补出的两个内置文本模型（channel_source=codearts，
+  // 不带 benefit 头直接 200，带反而 4004 —— 是 agent 通道，不是福利）。
+  "glm-5.3": { name: "GLM-5.3", context: 0, output: MAX_OUTPUT_TOKENS, benefit: false },
+  "glm-5.2-sft-harmony": { name: "GLM-5.2-ArkTS-SPARK", context: 0, output: MAX_OUTPUT_TOKENS, benefit: false },
 };
 
 /**
