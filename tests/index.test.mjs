@@ -31,7 +31,9 @@ async function usageWith(respond, ak = AK, sk = SK) {
   const real = globalThis.fetch;
   globalThis.fetch = respond;
   try {
-    return await plugin.auth.usage(async () => ({ type: "api", key: ak, metadata: { sk: SK } }));
+    // 🔴 用传入的 sk，不要写死模块常量：写死时 `usageWith(r, "AK2", "SK2")` 会拿
+    //    AK2 配第一账号的 SK，签名自然错，而测试看起来「过了」。
+    return await plugin.auth.usage(async () => ({ type: "api", key: ak, metadata: { sk } }));
   } finally {
     globalThis.fetch = real;
   }
@@ -477,6 +479,11 @@ test("checkinErrorOutcome: 只有枚举里的 outcome（宿主会归一非枚举
     checkinErrorOutcome(undefined),
   ];
   for (const c of cases) assert.ok(allowed.includes(c.outcome), c.outcome);
+  // checkinErrorOutcome 只在写请求失败时被调用，永远不该返回 claimed
+  // （claimed 只来自 checkinFlow 的成功路径）—— 这条把「映射跑偏」钉住。
+  for (const c of cases) assert.notEqual(c.outcome, "claimed");
+  assert.equal(checkinErrorOutcome({ errorCode: "4006", message: "名额领完" }).outcome, "ineligible");
+  assert.equal(checkinErrorOutcome({ errorCode: "50000", message: "系统繁忙" }).outcome, "failed");
 });
 
 test("checkinErrorOutcome: 40001「尚未到达权益刷新时间」按已签处理（不是错误）", () => {
@@ -640,6 +647,46 @@ test("checkinFlow: ELIGIBLE → claim + confirm，body 带 channel 与 idempoten
   assert.match(claim.body.idempotentKey, /^claim_1_\d+$/);
   // confirm 不带 channel / idempotentKey（带了 channel 上游会 HTTP 400）
   assert.deepEqual(f.calls[2].body, { campaignId: 1 });
+});
+
+test("checkinFlow: claim 成功但每日活动的 confirm 失败 → 仍然报 claimed（积分已到账）", async () => {
+  // confirm 只是收尾：它失败不能把「已经领到积分」说成签到失败。
+  // 变异：把 claim 分支里那次 confirm 的 try/catch 去掉 → 异常穿透到钩子外层
+  // catch → 返回 failed，本条会红。
+  const f = opsResponder({
+    delivery: deliveryOf([dailyCampaign()]),
+    claim: { code: 0, message: "ok", data: { id: 42, benefitAmount: 1000 } },
+    confirm: { code: 50000, message: "系统繁忙" },
+  });
+  const r = await checkinWith(f);
+  assert.equal(r.outcome, "claimed");
+  assert.equal(r.credit, 1000);
+});
+
+test("checkinFlow: 第一步（活动清单）就失败也要映射成契约，而不是把异常抛给宿主", async () => {
+  // delivery 业务码（HTTP 200 + code!=0）
+  const business = opsResponder({ delivery: { code: 40401, message: "运营事件不存在: 1" } });
+  assert.equal((await checkinWith(business)).outcome, "ineligible");
+
+  // delivery 的 APIG 层错误（HTTP 500）
+  const apig = opsResponder({
+    delivery: () => jsonResponse({ error_code: "APIG.0502", error_msg: "service unavailable" }, 500),
+  });
+  const r = await checkinWith(apig);
+  assert.equal(r.outcome, "failed");
+  assert.ok(["claimed", "done", "ineligible", "inactive", "captcha", "failed"].includes(r.outcome));
+});
+
+test("checkinFlow: 活动清单里多条每日活动时取第一条（顺序确定，不随机）", async () => {
+  const f = opsResponder({
+    delivery: deliveryOf([
+      { campaignId: 1, type: "USER_LOGIN", benefitAmount: 1000, status: "ELIGIBLE", claimable: true },
+      { campaignId: 99, type: "USER_LOGIN", benefitAmount: 9999, status: "ELIGIBLE", claimable: true },
+    ]),
+  });
+  const r = await checkinWith(f);
+  assert.equal(r.credit, 1000, "取第一条（上游下发的顺序即优先级）");
+  assert.equal(f.calls.find((c) => c.method === "POST").body.campaignId, 1);
 });
 
 test("checkinFlow: 活动清单必须按 channel=IDE 查（网页端才是 WEB）", async () => {
@@ -924,6 +971,24 @@ test("fetchCredits: 只认总数，不累加分项（500 + 0 + 12000 = 12500 是
   // 分项只用于展示，amount=0 的不进列表
   assert.deepEqual(c.packages.map((p) => p.name), ["基础积分", "福利积分"]);
   assert.equal(f.calls[0].path, STATS_PATH, "必须带 snap-manager 前缀");
+});
+
+test("fetchCredits: 读的是总数指标本身，不是三个分项的累加", async () => {
+  // 🔴 上面那个夹具里「总数 == 分项之和」在数值上完全一致，无法区分「读总数」与
+  //    「累加分项」。这里故意让两者不等（上游统计滞后/分项被裁剪时就会出现），
+  //    只有真去读 usageTotalPackageCredit 才拿得到 12162.78。
+  const payload = statsPayload({
+    metrics: [
+      { name: "usageBasicPackageCredit", package_credit_amount: 100, package_credit_used: 0, package_credit_remain: 100 },
+      { name: "usageBonusPackageCredit", package_credit_amount: 200, package_credit_used: 0, package_credit_remain: 200 },
+      // 总数故意不放在第一位，顺序也不该影响结果
+      { name: "usageTotalPackageCredit", package_credit_amount: 12500, package_credit_used: 337.22, package_credit_remain: 12162.78 },
+    ],
+  });
+  const c = await withFetch(opsResponder({ stats: payload }), () => fetchCredits(AK, SK));
+  assert.equal(c.remain, 12162.78);
+  assert.equal(c.amount, 12500);
+  assert.equal(c.used, 337.22);
 });
 
 test("fetchCredits: 数值就是积分，不做 token 折算（套 1 积分=10000 token 会算成 1.2 亿）", () => {
@@ -1924,7 +1989,27 @@ test("usage: 两本账都在时各画一个窗口，互不折算", async () => {
 test("usage: 积分窗口 amount / limit 与 used 百分比自洽（宿主按 amount/limit 渲染）", async () => {
   const u = await usageWith(accountsResponder(statsPayload(), undefined));
   const w = u.windows[0];
+  // 🔴 先钉死绝对值，再验自洽 —— 只验 `round1(amount/limit*100) === used` 是重言式，
+  //    「把剩余当已用」这类同改两处的变异能蒙过去。
+  assert.equal(w.amount, 337.2);
+  assert.equal(w.limit, 12500);
+  assert.equal(w.used, 2.7);
   assert.equal(round1((w.amount / w.limit) * 100), w.used);
+});
+
+test("usage: 第二个账号（不同套餐/额度/到期日）也各画各的", async () => {
+  const second = statsPayload({
+    end_date: "2026-11-17",
+    package: { package_name_cn: "体验版", is_credit_package: true, is_token_package: false },
+    metrics: [
+      { name: "usageTotalPackageCredit", package_credit_amount: 7500, package_credit_used: 24.3, package_credit_remain: 7475.7 },
+    ],
+  });
+  // 用第二个账号的凭据跑，签名必须是拿这组 AK/SK 算的
+  const u = await usageWith(accountsResponder(second, undefined), "LTAI5tSECONDACCOUNT000", "SKsecond000000000000000000000000000000000");
+  assert.equal(u.balance, "7475.7 积分");
+  assert.equal(u.windows[0].limit, 7500);
+  assert.match(u.windows[0].aside, /2026-11-17/);
 });
 
 test("usage: 积分用不完会作废 —— 套餐到期日写进 aside", async () => {
