@@ -9,7 +9,7 @@
 | **积分余额** | `auth.usage` 显示**积分**（控制台上那个 12000+ 就是它）：已用/总量 + 套餐到期日 |
 | ~~免费 Token 池~~ | **2026-10-20 官方已结束**（论坛公告 + 活动 PDF 目录移除 + 实测 `4000 invalid channel, group not found`），只剩积分一本账 |
 | 对话 | `POST snap-access /api/v2/chat/completions`（OpenAI 形态），按模型自动选通道 |
-| 模型 | 登录后自动同步云端模型清单（含 `channel` 字段），失败时回退内置列表；**逐模型实测声明收不收图**（见 [图片能力](#图片能力0213-实测)） |
+| 模型 | 登录后自动同步云端模型清单（含 `channel` 字段），失败时回退内置列表；**逐模型实测声明收不收图**（见 [图片能力](#图片能力0215-定论codearts-全线不收图)） |
 
 ## 安装
 
@@ -170,8 +170,9 @@ magpie 的 `usage()` window 字段，本插件按宿主源码逐条对齐：
 
 **修法**：所有对话请求带上稳定的 `x-ot-session-id` / `user-session-id`（由 AK 派生，
 同一账号恒定），上游就会把它们算作同一个会话，从源头避免这条错误。
-会话 ID 只发给对话端点，余额/签到等 opengw 接口不带——登录正是靠余额接口做的，
-不给它加额外的头。
+会话 ID 只发给对话端点，额度/签到等接口不带。⚠️ 0.2.19 起**登录探针已换成积分账**
+（`/snap-manager/v1/statistics/plugin`），不再是 opengw 的余额接口 —— 后者 2026-10-20
+起固定回 `4000 invalid channel, group not found`，拿它当探针会让任何 AK/SK 都登录失败。
 
 ### 实测（2026-10-18，单账号流式并发）
 
@@ -195,7 +196,9 @@ magpie 的 `usage()` window 字段，本插件按宿主源码逐条对齐：
 
 - **静态兜底清单不再猜 context/output**：magpie 的 `limit` 是**硬上限**，
   写死 200000/32000 会真的把长上下文请求截断（上游实测 1M 上下文 / 384k 输出）。
-  兜底一律留 0（= 不设限），真实值由云端 `context_window` / `max_tokens` 填回。
+  兜底的 `context` 留 0（= 不设限），**`output` 统一用 `MAX_OUTPUT_TOKENS`（65536）**
+  —— 那是上游 `max_tokens` 的硬上限，写更大会被拒、写更小会白白截断。
+  两者的真实值都由云端 `context_window` / `max_tokens` 填回（输出仍收敛到 65536）。
 - **签到状态行不再刷满**：未签到时原来的 `used: 1, limit: 1` 是恰好 100%，
   虽然 `aside` 已让它不参与路由，但满格红条仍会被误读成「额度用尽」。
   现在它是纯状态行，不带 `limit`、`used` 恒为 0。
@@ -220,7 +223,7 @@ magpie 的 `usage()` window 字段，本插件按宿主源码逐条对齐：
 
 ```sh
 node --check index.mjs            # 语法检查
-node --test tests/index.test.mjs  # 纯函数 + loader 单测（无网络，Node ≥ 18）
+node --test tests/index.test.mjs  # 纯函数 + 钩子单测（除 authorize 会真发一次请求外不走网络，Node ≥ 18）
 ```
 
 可测辅助函数经 `_internal` 导出。涉及真实上游的并发验证可跑（凭据只从环境变量读）：
@@ -242,6 +245,30 @@ CODEARTS_AK=... CODEARTS_SK=... node scripts/probe-session.mjs <模式> [并发�
 3. **丢弃云端 `channel` 字段** —— 该字段正是上游构建 `AGENT_MODELS` 的依据；本版保留并写入运行期缓存。
 
 此外补齐了 `ineligible` / `captcha` / `inactive` 三种签到 outcome（骨架版遇到会落到 `failed` 并每 30 分钟无意义重试）。
+
+## 0.2.20（2026-10-21：四路审查后的修复）
+
+对 0.2.18 做了一轮四维度审查（运行时正确性 / 健壮性 / 文档一致性 / 测试有效性），
+28 条候选、对抗性核验后 21 条成立。下面是**改了代码**的那些：
+
+| 问题 | 影响 | 修法 |
+|---|---|---|
+| `loader.fetch` 把调用方的 `content-length` 原样转发 | body 被 `normalizeChatBody` 改写过，长度对不上时 undici 挂到超时（实测可复现） | 发请求前删掉 `content-length` / `transfer-encoding` / `content-encoding`，按实际 body 重算 |
+| 签到链每个请求各拿一份 6s，401 还要再发一次 | 最坏 3 × 12s = 36s，越过宿主 20s → 用户看到「签到失败」而积分已到账 | `snapEnvelope` 支持 `deadline`，重发按**剩余**时间算；`checkinFlow` 全链共用一条 17s deadline |
+| 积分窗口把「套餐名 · 到期日」写进 `aside` | 宿主的 `aside` 是布尔（`aside: !!w.aside`）：文案丢失，且把这个**唯一**额度窗口标成「不参与用尽判定」 | 并进 `display`，`aside` 不再出现 |
+| 积分 `remain` 没夹取 | `display` / `balance` 会画出「12510 / 12500」「倒欠」 | 新增 `clampRemain`，display 与 balance 都用它 |
+| `delivery` 缺 `items` 被当成「没有活动」 | 后端抖一次 → `ineligible`（终局）→ 当天不再重试 | `items` 不是数组时抛错 → `failed`（可重试）；只有空数组才是 `ineligible` |
+| 先 `slice` 再 `redact` | AK 若跨在截断处，半截漏进日志 | 改成先脱敏再 `shorten` |
+| 对话端点把上游 `error_msg` 原样写进 400 | 上游会回显 Access Key | `errorResponse` 接受 `prepare` 脱敏器，四条出口统一过 `redact` |
+
+**补的回归测试**（193 → 206）：预算见底不再补确认、delivery 缺 items 判 failed、
+`content-length` 必须删、福利流式首帧必须原样交回、云端 `channel:"agent"` 经
+provider.models → loader 的端到端链路、签到金额取自 claim 响应、provider.models
+是叠加不是替换、`snapEnvelope` 的 deadline 重发、积分 remain 夹取。
+其中 6 条都做了**变异验证**（把实现改坏 → 测试确实会红）。
+
+**文档对齐**：三处与代码相反的表述已改（未知模型是显式 `image:false` 而非「没说」、
+静态兜底 `output` 是 65536 而非 0、登录探针已换成积分账），并修正一个失效锚点。
 
 ## 0.2.19（2026-10-21：修掉「老凭据无法重新登录」）
 
@@ -492,8 +519,10 @@ imageSaid: typeof m.capabilities?.input?.image === "boolean",  // 厂商有没�
 只改有没有图，且**纯文本对照必须是 200**（否则你连端点选错了都不知道 —— ㉗ 就是这么翻车的）。
 
 **维护提示**：`image` 和 `context: 0`、`MAX_OUTPUT_TOKENS` 一样是**实测值不是猜的** ——
-上游模型能力变了（或新模型进清单）要跟着改；表里查不到的模型宁可保持「没说」
-（行为退回 0.2.12），也不编一个可能错的 `false` 把模型从带图请求里踢掉。
+上游模型能力变了（或新模型进清单）要跟着改。表里查不到的模型按 **`image: false`**
+处理 —— 这是 0.2.15 的定论：magpie 把「没说」当成「能收图」照发，上游回 406，
+所以这里宁可显式声明不收图（用户想发图时能在模型列表里一眼看出来），
+也不留空让对方猜。要放开某个模型，把它加进 `VISION_MODELS`。
 
 ### 第四轮实测（2026-10-19）
 

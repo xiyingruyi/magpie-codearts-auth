@@ -107,6 +107,17 @@ const AGENT_TYPE_HEADER = { "agent-type": "PromptCenter" };
 const SNAP_TIMEOUT_MS = 6_000;
 
 /**
+ * 单次 snap 请求的最小可用时间。
+ *
+ * 🔴 6 秒是**单个请求**的余量，不是**整条链**的余量：`snapEnvelope` 撞到
+ *    APIG.0301 会去掉可选头重发一次，最坏就是 12 秒。签到串 3 步（delivery →
+ *    claim → confirm）再加补确认，最坏能到 36 秒 —— 宿主 20 秒就放弃了。
+ *    所以签到链改成**共用一条 deadline**：每次发请求前按剩余时间重新算超时，
+ *    剩余不够就干脆不发（报预算错误，由上层决定是否还要动作）。
+ */
+const SNAP_MIN_TIMEOUT_MS = 1_000;
+
+/**
  * 签到这一次调用的内部预算。
  *
  * 宿主给 20 秒，这里只用到 17 秒：留 3 秒给宿主自己的序列化/落库。
@@ -550,7 +561,7 @@ async function envelope(path, { method = "GET", body, ak, sk, timeout = 12_000 }
   let data;
   try { data = text ? JSON.parse(text) : undefined; } catch { data = undefined; }
   if (res.status !== 200 || !data) {
-    throw new Error(`CodeArts ${path} HTTP ${res.status}: ${redact(text.slice(0, 200), ak, sk)}`);
+    throw new Error(`CodeArts ${path} HTTP ${res.status}: ${shorten(redact(text, ak, sk), 200)}`);
   }
   if (data.error_code !== undefined && !["0000", 0, null].includes(data.error_code)) {
     throw Object.assign(new Error(`CodeArts ${path} 业务错误 ${data.error_code}: ${redact(data.error_msg ?? "", ak, sk)}`), {
@@ -574,36 +585,50 @@ async function envelope(path, { method = "GET", body, ak, sk, timeout = 12_000 }
  *    万一上游改成「小写也不许签」，我们去掉这个可选头再发一次就能自愈 ——
  *    它是可选头，去掉不影响语义。
  */
-async function snapEnvelope(path, { method = "GET", body, ak, sk, query, timeout = SNAP_TIMEOUT_MS } = {}) {
+async function snapEnvelope(path, { method = "GET", body, ak, sk, query, timeout = SNAP_TIMEOUT_MS, deadline } = {}) {
   const url = new URL(`${SNAP_HOST}${path}`);
   for (const [k, v] of Object.entries(query ?? {})) url.searchParams.set(k, String(v));
   const href = url.toString();
   const bodyStr = body !== undefined ? JSON.stringify(body) : "";
+  // 剩余预算：传了 deadline 就按它算，没传就是单请求模式（整段 timeout 都归它）。
+  const budgetLeft = () => (deadline === undefined ? timeout : Math.min(timeout, deadline - Date.now()));
   const send = (extra) => {
+    const left = budgetLeft();
+    // 🔴 预算见底就别发了：发出去也是被宿主先掐断，还会让上层误以为「网络错误」。
+    if (left < SNAP_MIN_TIMEOUT_MS) {
+      throw Object.assign(new Error(`CodeArts ${path} 超出本次调用预算，已跳过`), { errorCode: "BUDGET" });
+    }
     const target = extra ? sdkSignedHeaders(method, href, bodyStr, ak, sk, extra) : sdkSignedHeaders(method, href, bodyStr, ak, sk);
     return fetch(href, {
       method,
       headers: target,
       ...(bodyStr ? { body: bodyStr } : {}),
-      signal: AbortSignal.timeout(timeout),
+      signal: AbortSignal.timeout(left),
     });
   };
   let res, text;
   try {
     res = await send(AGENT_TYPE_HEADER);
     text = await res.text();
-    if (res.status === 401 && text.includes("APIG.0301")) {
+    // 重发也要按**剩余**预算算，不能各自再拿一份完整的 timeout —— 否则一次逻辑
+    // 请求最坏就是 2 × timeout，签到三步下来直接冲破宿主的 20 秒。
+    if (res.status === 401 && text.includes("APIG.0301") && budgetLeft() >= SNAP_MIN_TIMEOUT_MS) {
       res = await send(null);
       text = await res.text();
     }
   } catch (cause) {
-    throw Object.assign(new Error(`CodeArts 请求失败: ${redact(cause?.message ?? String(cause), ak, sk)}`), { cause });
+    throw Object.assign(new Error(`CodeArts 请求失败: ${redact(cause?.message ?? String(cause), ak, sk)}`), {
+      cause,
+      // 预算耗尽是**我们自己**判的（errorCode "BUDGET"），不是网络故障：
+      // 上层要能区分 —— 这种情况重试没意义，但也不该记成「上游挂了」。
+      errorCode: cause?.errorCode,
+    });
   }
   let data;
   try { data = text ? JSON.parse(text) : undefined; } catch { data = undefined; }
   if (res.status !== 200 || !data) {
     throw Object.assign(
-      new Error(`CodeArts ${path} HTTP ${res.status}: ${redact(text.slice(0, 200), ak, sk)}`),
+      new Error(`CodeArts ${path} HTTP ${res.status}: ${shorten(redact(text, ak, sk), 200)}`),
       { errorCode: data?.error_code },
     );
   }
@@ -667,9 +692,16 @@ async function fetchCredits(ak, sk) {
 }
 
 /** 活动清单（含每日签到的 claimable / status，是幂等预检的唯一真相源）。 */
-async function fetchCampaigns(ak, sk) {
-  const d = await snapEnvelope(OPS_DELIVERY_PATH, { ak, sk, query: { channel: OPS_CHANNEL } });
-  if (!Array.isArray(d.items)) return [];
+async function fetchCampaigns(ak, sk, opts = {}) {
+  const d = await snapEnvelope(OPS_DELIVERY_PATH, { ak, sk, query: { channel: OPS_CHANNEL }, ...opts });
+  // 🔴 「这次没拿到」与「确实没有活动」必须分开：
+  //    items 是数组（哪怕空数组）= 上游明确告诉我们活动清单，按内容判；
+  //    items 缺失 / null / 不是数组 = 上游降级或改了字段名，**这次是没查到**。
+  //    后者若当成空清单，checkinPlan 会给出终局 ineligible，宿主当天就不再重试 ——
+  //    一次后端抖动就白丢一天积分。抛错让它落到 failed（30 分钟后可重试）。
+  if (!Array.isArray(d?.items)) {
+    throw Object.assign(new Error("CodeArts 活动清单格式异常（缺 items），本次签到未判定"), { errorCode: "BAD_ITEMS" });
+  }
   return d.items.filter((i) => i && typeof i === "object");
 }
 
@@ -701,7 +733,7 @@ function pickDailyCampaign(items) {
 }
 
 /** 领取（积分在 claim 这一步就到账，confirm 只推进状态）。 */
-function opsClaim(ak, sk, campaignId, now = Date.now()) {
+function opsClaim(ak, sk, campaignId, now = Date.now(), opts = {}) {
   const id = usableCampaignId(campaignId);
   if (id === undefined) throw new Error("CodeArts 活动号缺失或非法，无法领取");
   return snapEnvelope(OPS_CLAIM_PATH, {
@@ -709,14 +741,15 @@ function opsClaim(ak, sk, campaignId, now = Date.now()) {
     ak,
     sk,
     body: { campaignId: id, channel: OPS_CHANNEL, idempotentKey: `claim_${id}_${now}` },
+    ...opts,
   });
 }
 
 /** 确认 —— 不带 channel、不带 idempotentKey（带了 channel 会 HTTP 400）。 */
-function opsConfirm(ak, sk, campaignId) {
+function opsConfirm(ak, sk, campaignId, opts = {}) {
   const id = usableCampaignId(campaignId);
   if (id === undefined) throw new Error("CodeArts 活动号缺失或非法，无法确认");
-  return snapEnvelope(OPS_CONFIRM_PATH, { method: "POST", ak, sk, body: { campaignId: id } });
+  return snapEnvelope(OPS_CONFIRM_PATH, { method: "POST", ak, sk, body: { campaignId: id }, ...opts });
 }
 
 /**
@@ -729,14 +762,18 @@ function opsConfirm(ak, sk, campaignId) {
  */
 async function checkinFlow(ak, sk) {
   const startedAt = Date.now();
-  const items = await fetchCampaigns(ak, sk);
+  // 🔴 整条链共用一条 deadline，而不是每个请求各自拿一份 6 秒。
+  //    snapEnvelope 的 401 重发也会按**剩余**时间算，所以最坏耗时不会超过它。
+  const deadline = startedAt + CHECKIN_BUDGET_MS;
+  const left = () => deadline - Date.now();
+  const opts = { deadline };
+  const items = await fetchCampaigns(ak, sk, opts);
   const daily = pickDailyCampaign(items);
   const plan = checkinPlan(daily);
   const confirmed = [];
-  // 补确认是「顺手做的好事」，不能拖垮签到本身：宿主只给 20 秒，走到那一步时
-  // delivery + claim + confirm 已经花掉一部分。留 SNAP_TIMEOUT_MS 的余量，
+  // 补确认是「顺手做的好事」，不能拖垮签到本身：只留够**一次** confirm 的余量，
   // 装不下就这轮不补，下一轮签到会再试（状态仍是 CLAIMED）。
-  const canSpendOneMore = () => Date.now() - startedAt + SNAP_TIMEOUT_MS <= CHECKIN_BUDGET_MS;
+  const canSpendOneMore = () => left() >= SNAP_MIN_TIMEOUT_MS;
 
   // 把结果按 magpie 契约裁齐（只留 outcome / credit / message）：
   // 宿主不认的字段不进契约，给用户看的信息一律并进 message。
@@ -762,7 +799,7 @@ async function checkinFlow(ak, sk) {
     for (const c of strays) {
       if (!canSpendOneMore()) break; // 预算用完就不补了，下一轮再试
       try {
-        await opsConfirm(ak, sk, c.campaignId);
+        await opsConfirm(ak, sk, c.campaignId, opts);
         confirmed.push(c.campaignId);
       } catch {
         // 拿不到就不拿：这本来是客户端的收尾动作，失败了下次签到再补
@@ -773,7 +810,7 @@ async function checkinFlow(ak, sk) {
   if (plan.action === "claim") {
     let claimed;
     try {
-      claimed = await opsClaim(ak, sk, daily.campaignId);
+      claimed = await opsClaim(ak, sk, daily.campaignId, Date.now(), opts);
     } catch (e) {
       return checkinErrorOutcome(e, plan, "claim");
     }
@@ -782,7 +819,7 @@ async function checkinFlow(ak, sk) {
     // 活动就卡在 CLAIMED（积分已到账但状态不是终态）。没有待确认记录时
     // confirm 回 40001「该活动没有可确认的权益记录」，属于正常，忽略即可。
     try {
-      await opsConfirm(ak, sk, daily.campaignId);
+      await opsConfirm(ak, sk, daily.campaignId, opts);
     } catch {
       // 积分在 claim 时已到账；确认失败下一轮签到会按 CLAIMED 再补
     }
@@ -796,7 +833,7 @@ async function checkinFlow(ak, sk) {
 
   if (plan.action === "confirm") {
     try {
-      await opsConfirm(ak, sk, daily.campaignId);
+      await opsConfirm(ak, sk, daily.campaignId, opts);
     } catch (e) {
       return checkinErrorOutcome(e, plan, "confirm");
     }
@@ -840,6 +877,17 @@ function redact(text, ak, sk) {
     if (v.length >= 8) out = out.split(v).join("***");
   }
   return out;
+}
+
+/**
+ * 截断到 n 个字符（配 redact 使用，**顺序不能反**）。
+ *
+ * 🔴 先 slice 再 redact 会漏：上游常把 AK 打在报错体里，若 AK 正好跨在截断位置，
+ *    剩下的半截就匹配不上、原样漏进日志和登录提示。所以先脱敏、后截断。
+ */
+function shorten(text, n) {
+  const s = String(text ?? "");
+  return s.length > n ? `${s.slice(0, n)}…` : s;
 }
 
 function bare(v) {
@@ -969,9 +1017,15 @@ function upstreamError(text) {
   return { code: String(code ?? obj.error?.code ?? ""), message };
 }
 
-/** 错误响应：400 + OpenAI 错误形态（magpie 的 APIError 从中取出 message）。 */
-function errorResponse({ code, message }) {
-  const body = JSON.stringify({ error: { message, type: "codearts_error", code } });
+/**
+ * 错误响应：400 + OpenAI 错误形态（magpie 的 APIError 从中取出 message）。
+ *
+ * 🔴 这里必须脱敏：上游的报错体会**回显 Access Key**（`the access key … is
+ *    malformed` 之类），而这个 400 的 body 会一路进客户端、magpie 日志和会话
+ *    记录。`prepare` 是本次请求的 `(text) => text` 脱敏器（见 loader）。
+ */
+function errorResponse({ code, message }, prepare = (t) => t) {
+  const body = JSON.stringify({ error: { message: prepare(message), type: "codearts_error", code } });
   return new Response(body, {
     status: 400,
     statusText: "Bad Request",
@@ -1050,13 +1104,13 @@ async function peekStream(reader, dec) {
   return { text, pending, err };
 }
 
-async function rewriteStreamError(res) {
+async function rewriteStreamError(res, prepare = (t) => t) {
   const reader = res.body.getReader();
   const dec = new TextDecoder();
   const { text, pending, err } = await peekStream(reader, dec);
   if (err) {
     try { await reader.cancel(); } catch { /* 已经断了 */ }
-    return errorResponse(err);
+    return errorResponse(err, prepare);
   }
   return new Response(streamWithErrorEvents(text, dec, reader, pending), {
     status: res.status,
@@ -1129,15 +1183,15 @@ function streamWithErrorEvents(prefix, dec, reader, firstRead = null) {
  * 把「HTTP 200 里藏着的错误」翻成真正的错误响应，其余原样返回。
  * 只对对话端点调用（其它路径由宿主自己处理）。
  */
-async function normalizeChatResponse(res) {
+async function normalizeChatResponse(res, prepare = (t) => t) {
   if (!res || res.status !== 200 || !res.body) return res;
   const ct = String(res.headers.get("content-type") ?? "").toLowerCase();
-  if (ct.includes("text/event-stream")) return rewriteStreamError(res);
+  if (ct.includes("text/event-stream")) return rewriteStreamError(res, prepare);
   if (!ct.includes("application/json")) return res;
   let text;
   try { text = await res.text(); } catch { return res; }
   const err = upstreamError(text);
-  if (err) return errorResponse(err);
+  if (err) return errorResponse(err, prepare);
   return new Response(text, {
     status: res.status,
     statusText: res.statusText,
@@ -1171,7 +1225,7 @@ function round1(n) {
  * 返回 `{gone:true, err}` 或 `{gone:false, res}`（res 已是规范化后的成品，
  * 调用方**直接**交出去，不要再包 normalizeChatResponse）。
  */
-async function sniffBenefitGone(res) {
+async function sniffBenefitGone(res, prepare = (t) => t) {
   if (!res || res.status !== 200 || !res.body) return { gone: false, res };
   const ct = String(res.headers.get("content-type") ?? "").toLowerCase();
   // 只有对话的两种应答形态值得看；别的一律不碰
@@ -1186,7 +1240,7 @@ async function sniffBenefitGone(res) {
     }
     // 与 normalizeChatResponse 的非流式分支同一套处理：藏起来的错误翻成 400
     const err = upstreamError(text);
-    if (err) return { gone: false, res: errorResponse(err) };
+    if (err) return { gone: false, res: errorResponse(err, prepare) };
     return {
       gone: false,
       res: new Response(text, {
@@ -1482,6 +1536,11 @@ export default async function codeartsPlugin(_input, options) {
               // 不能转给上游厂商（别指望宿主替我们擦，新版本可能不再擦）
               merged.delete("host");
               for (const k of MAGPIE_ONLY_HEADERS) merged.delete(k);
+              // 🔴 body 在我们手上被改写过（normalizeChatBody 可能补 stream 或裁
+              //    max_tokens），调用方带来的长度/编码头已经对不上实际字节：
+              //    留着 content-length 会让 undici 按旧长度读或直接 fetch failed，
+              //    表现为「请求挂死到超时」。删掉，让它按实际 body 重算。
+              for (const k of ["content-length", "transfer-encoding", "content-encoding"]) merged.delete(k);
 
               const forwarded = bodyStr === "" ? undefined : bodyStr;
               return fetch(target, {
@@ -1497,19 +1556,22 @@ export default async function codeartsPlugin(_input, options) {
             // 并把这条模型记进熔断表，TTL 内不再先撞一次。详见 benefitDown 的注释。
             // 🔴 sniffBenefitGone 返回的 res 已经是成品（窥探 + 改写一次做完），
             //    **不能再包一层 normalizeChatResponse**（见它的注释）。
+            // 上游报错会回显 Access Key，而这里产出的 400 body 会进客户端与日志：
+            // 所有出口统一过一个脱敏器（见 errorResponse 的注释）。
+            const prepare = (t) => redact(t, ak, sk);
             if (benefit && !benefitBroken(ak, model)) {
-              const probe = await sniffBenefitGone(await send(true));
+              const probe = await sniffBenefitGone(await send(true), prepare);
               if (!probe.gone) return probe.res;
               markBenefitBroken(ak, model);
               // 去掉签名头重发。普通通道若是**真的**能跑就用它；跑不了（`model is
               // not registered`）说明这条模型只有福利通道认，那就把「福利没了」
               // 这条更可执行的错误交给调用方。
-              const plain = await normalizeChatResponse(await send(false));
-              return plain.status === 400 ? errorResponse(probe.err) : plain;
+              const plain = await normalizeChatResponse(await send(false), prepare);
+              return plain.status === 400 ? errorResponse(probe.err, prepare) : plain;
             }
             const res = await send(false);
             // 上游会把「模型不存在」这类错误藏在 HTTP 200 里（见 normalizeChatResponse）
-            return isChat ? normalizeChatResponse(res) : res;
+            return isChat ? normalizeChatResponse(res, prepare) : res;
           },
         };
       },
@@ -1542,6 +1604,14 @@ export default async function codeartsPlugin(_input, options) {
           ]);
           if (creditsRes.c) credits = creditsRes.c;
           else creditsError = redact(creditsRes.e?.message ?? String(creditsRes.e), ak, sk);
+          // remain 单独夹一次：display 与 balance 用的都是它，而 used 那套夹取
+          // 只保证 used/amount 自洽。上游给「剩余 > 总量」或负数时会画出
+          // 「12510 / 12500」「-3 / 12500」这种自相矛盾的卡片。
+          const clampRemain = (c) => {
+            if (!c || c.remain === undefined) return undefined;
+            if (c.amount === undefined || c.amount <= 0) return Math.max(0, c.remain);
+            return Math.min(Math.max(0, c.remain), c.amount);
+          };
           if (credits && credits.remain !== undefined) {
             // magpie 的 window 语义（对照宿主源码与社区插件约定，勿改）：
             //   used   = **已用百分比**（0~100+），宿主直接渲染成 "N%"
@@ -1560,12 +1630,17 @@ export default async function codeartsPlugin(_input, options) {
               w.used = round1((usedC / credits.amount) * 100);
               w.amount = round1(usedC);
               w.limit = credits.amount;
-              w.display = `${round1(credits.remain ?? credits.amount - usedC)} / ${credits.amount}`;
+              const remainShown = clampRemain(credits) ?? credits.amount - usedC;
+              w.display = `${round1(remainShown)} / ${credits.amount}`;
             } else {
-              w.display = `${round1(credits.remain)} 积分`;
+              w.display = `${round1(clampRemain(credits) ?? credits.remain)} 积分`;
             }
-            // 套餐到期日：积分用不完同样作废（实测每账号不同），值得写在卡片上
-            if (credits.endDate) w.aside = `${credits.packageName ?? "套餐"} · 到期 ${credits.endDate}`;
+            // 套餐到期日：积分用不完同样作废（实测每账号不同）。
+            // 🔴 不能写进 `aside`：宿主的 window.aside 是**布尔**标记（`aside: !!w.aside`），
+            //    字符串会被归一成 true、文案直接丢失，而且 true 的语义是「只展示、
+            //    不参与用尽判定」—— 这恰恰是这里**唯一**的额度窗口，标成只展示
+            //    会让积分耗尽也不触发账号用尽。所以并进 display。
+            if (credits.endDate) w.display += ` · ${credits.packageName ?? "套餐"} 到期 ${credits.endDate}`;
             windows.push(w);
           } else if (credits && credits.isCreditPackage === false) {
             creditsError = "该账号是 Token 计费账户，没有积分余额";
@@ -1607,8 +1682,10 @@ export default async function codeartsPlugin(_input, options) {
           return {
             // magpie 会在 balance 后面自动追加 "left"，这里只写「数量 + 单位」
             balance:
+              // 🔴 这里同样用夹过的 remain：balance 是列表页那行大字，
+              //    「12510 积分 left / 12500 总额」比 window 里的数字更显眼。
               credits?.remain !== undefined
-                ? `${round1(credits.remain)} 积分`
+                ? `${round1(clampRemain(credits) ?? credits.remain)} 积分`
                 : poolLeft !== undefined
                   ? `${Math.round(poolLeft)} tokens`
                   : "已登录",

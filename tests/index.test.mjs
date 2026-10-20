@@ -649,6 +649,27 @@ test("checkinFlow: ELIGIBLE → claim + confirm，body 带 channel 与 idempoten
   assert.deepEqual(f.calls[2].body, { campaignId: 1 });
 });
 
+test("checkinFlow: 签到金额取自 claim 响应，不是照抄活动清单", async () => {
+  // 🔴 夹具陷阱：若 delivery 与 claim 都写 1000，从哪边取都看不出来。
+  //    这里让两边不同（上游偶尔会按档位/活动版本返回不同金额）。
+  const f = opsResponder({
+    delivery: deliveryOf([dailyCampaign({ benefitAmount: 1000 })]),
+    claim: { code: 0, message: "ok", data: { id: 42, benefitAmount: 1500 } },
+  });
+  const r = await checkinWith(f);
+  assert.equal(r.outcome, "claimed");
+  assert.equal(r.credit, 1500, "以 claim 实际发放的金额为准");
+});
+
+test("checkinFlow: claim 响应不带金额时回退到活动清单的额度", async () => {
+  const f = opsResponder({
+    delivery: deliveryOf([dailyCampaign({ benefitAmount: 1000 })]),
+    claim: { code: 0, message: "ok", data: {} },
+  });
+  const r = await checkinWith(f);
+  assert.equal(r.credit, 1000);
+});
+
 test("checkinFlow: claim 成功但每日活动的 confirm 失败 → 仍然报 claimed（积分已到账）", async () => {
   // confirm 只是收尾：它失败不能把「已经领到积分」说成签到失败。
   // 变异：把 claim 分支里那次 confirm 的 try/catch 去掉 → 异常穿透到钩子外层
@@ -735,6 +756,49 @@ test("checkinFlow: 活动号缺失/为 null 时不发畸形写请求", async () 
   assert.deepEqual(f.calls.map((c) => c.method), ["GET"], "一个写请求都不该发");
 });
 
+test("checkinFlow: delivery 缺 items（后端降级/字段改名）判 failed 而不是 ineligible", async () => {
+  // 🔴 ineligible 是宿主的**终局**：一旦给出，当天不再重试。
+  //    把「这次没拿到」误判成「确实没有活动」，一次后端抖动就白丢一天积分。
+  for (const data of [{}, { items: null }, { items: "nope" }, null]) {
+    const f = opsResponder({ delivery: { code: 0, message: "ok", data } });
+    const r = await checkinWith(f);
+    assert.equal(r.outcome, "failed", `data=${JSON.stringify(data)} 必须可重试`);
+    assert.deepEqual(f.calls.map((c) => c.method), ["GET"], "没拿到清单时不该发写请求");
+  }
+});
+
+test("checkinFlow: items 是空数组才是真的「没有活动」→ ineligible", async () => {
+  const r = await checkinWith(opsResponder({ delivery: deliveryOf([]) }));
+  assert.equal(r.outcome, "ineligible");
+});
+
+test("checkinFlow: 整条链共用一条 deadline，401 重发也按剩余预算算", async () => {
+  // 🔴 回归：以前每个请求各自拿一份 6s timeout，401 还要再发一次 = 单请求最坏 12s，
+  //    签到串三步能到 36s，宿主 20s 就先放弃了 —— 用户看到「签到失败」，积分其实领到了。
+  const seen = [];
+  const slow = async (url, init = {}) => {
+    const u = new URL(String(url));
+    seen.push({ path: u.pathname, signal: init.signal });
+    // 全部回 401 + APIG.0301：逼出「重发」这条最坏路径
+    return jsonResponse({ error_code: "APIG.0301", error_msg: "verify ak sk signature fail" }, 401);
+  };
+  const started = Date.now();
+  const plugin = await pluginWith();
+  const real = globalThis.fetch;
+  globalThis.fetch = slow;
+  let r;
+  try {
+    r = await plugin.auth.checkin(async () => ({ type: "api", key: AK, metadata: { sk: SK } }));
+  } finally {
+    globalThis.fetch = real;
+  }
+  const elapsed = Date.now() - started;
+  assert.equal(r.outcome, "failed");
+  assert.ok(elapsed < 20_000, `整条链不能越过宿主的 20s，实际 ${elapsed}ms`);
+  // 全部失败后不该再往下发写请求
+  assert.equal(seen.filter((s) => s.path.endsWith("/claim")).length, 0);
+});
+
 test("checkinFlow: 补确认时跳过活动号非法的条目（null / 0 / 字符串垃圾）", async () => {
   const f = opsResponder({
     delivery: deliveryOf([
@@ -747,6 +811,40 @@ test("checkinFlow: 补确认时跳过活动号非法的条目（null / 0 / 字�
   assert.equal(r.outcome, "done");
   assert.deepEqual(f.calls.map((c) => c.method), ["GET"], "非法活动号不该触发 confirm");
   assert.doesNotMatch(r.message, /4000/, "没确认成功就不能把它写进结果");
+});
+
+test("checkinFlow: 预算见底时不再补确认（补确认是可选项，不能拖垮签到结论）", async () => {
+  // 行为断言：预算见底时**没有任何 confirm 真的发出去**。
+  // 注意这道闸门与 snapEnvelope 里的 deadline 是双重保险 —— 单把 canSpendOneMore
+  // 改成恒 true 并不会让请求发出去（deadline 会先抛 BUDGET），这属于等价变异，
+  // 所以本条守的是行为、不是某一行实现。
+  const f = opsResponder({
+    delivery: deliveryOf([
+      dailyCampaign({ status: "CONFIRMED", claimable: false }),
+      { campaignId: 7, type: "NEW_USER_REGISTER", benefitAmount: 4000, status: "CLAIMED" },
+      { campaignId: 8, type: "INVITE_USER", benefitAmount: 1000, status: "CLAIMED" },
+    ]),
+  });
+  // 把「现在」拨到预算快耗尽的位置：只剩不到 SNAP_MIN_TIMEOUT_MS
+  const realNow = Date.now;
+  let t = 1_000_000;
+  Date.now = () => t;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (u, i = {}) => {
+    t += 16_999; // 第一个请求几乎吃掉整个 17s 预算
+    return f(u, i);
+  };
+  const plugin = await pluginWith();
+  let r;
+  try {
+    r = await plugin.auth.checkin(async () => ({ type: "api", key: AK, metadata: { sk: SK } }));
+  } finally {
+    Date.now = realNow;
+    globalThis.fetch = realFetch;
+  }
+  assert.equal(r.outcome, "done");
+  assert.equal(f.calls.filter((c) => c.path.endsWith("/confirm")).length, 0, "预算没了就一个 confirm 都不发");
+  assert.doesNotMatch(r.message, /补确认/);
 });
 
 test("checkinFlow: CLAIMED → 只补 confirm（不发 claim，绝不重复领取）", async () => {
@@ -1557,6 +1655,85 @@ test("loader.fetch: 已经合规的 body 原样转发（连字节都不该变）
   assert.equal(s.init.body, body, "上限以内且 stream 已写明 → 一个字节都不改");
 });
 
+test("loader.fetch: content-length 等长度头不能原样转发（body 已被改写）", async () => {
+  // 🔴 回归：normalizeChatBody 会补 stream / 裁 max_tokens，此时调用方自带的
+  //    content-length 与实际字节已经对不上。留着它，undici 会按旧长度读或直接
+  //    fetch failed，表现是「请求挂死到超时」。
+  const plugin = await mod.default({}, {});
+  const body = JSON.stringify({ model: "deepseek-v4.1-flash", max_tokens: 393216, messages: [{ role: "user", content: "hi" }] });
+  const s = await callLoader(plugin, {
+    init: { method: "POST", headers: { "content-length": "3", "transfer-encoding": "chunked" }, body },
+  });
+  assert.notEqual(s.init.body, body, "前提：这个 body 确实被改写过");
+  assert.equal(s.init.headers.get("content-length"), null, "必须删掉，让 fetch 按实际 body 重算");
+  assert.equal(s.init.headers.get("transfer-encoding"), null);
+});
+
+test("loader.fetch: 福利通道正常流式时窥探到的首帧必须原样交回", async () => {
+  // 🔴 回归：sniffBenefitGone 会先读一段再决定走哪条路。若它把读到的 text 丢掉，
+  //    单个 chunk 的正常 SSE 会变成「成功但空回答」。
+  benefitDown.clear();
+  const plugin = await mod.default({}, {});
+  const l = await plugin.auth.loader(async () => ({ type: "api", key: AK, metadata: { sk: SK } }));
+  const sse = 'data:{"id":"1","choices":[{"delta":{"content":"hello"}}]}\n\ndata:[DONE]\n\n';
+  const real = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+  let out;
+  try {
+    const res = await l.fetch(hostUrl(l.baseURL), {
+      method: "POST",
+      headers: { accept: "text/event-stream" },
+      body: JSON.stringify({ model: "deepseek-v4.1-flash", messages: [{ role: "user", content: "hi" }], stream: true }),
+    });
+    assert.equal(res.status, 200);
+    out = await res.text();
+  } finally {
+    globalThis.fetch = real;
+  }
+  assert.equal(out, sse, "窥探过的首帧必须一个字节不差地转发出去");
+  benefitDown.clear();
+});
+
+test("loader.fetch: 云端把某个模型标成 agent 时，它不再带福利三头（按账号的 channel 缓存）", async () => {
+  // 🔴 回归：channelTable 是按 ak 存的。loader 里若把 ak 漏掉，云端判定就失效，
+  //    本该走老套餐通道的模型会被塞上福利三头 → 上游回 unsupported model。
+  benefitDown.clear();
+  const plugin = await mod.default({}, {});
+  const fetchResponder = async (url) => {
+    if (String(url).includes("/gateway/config")) {
+      return jsonResponse({
+        result: { models: [{ model_id: "deepseek-v4.1-flash", model_name: "DeepSeek", channel: "agent" }] },
+      });
+    }
+    return new Response("{}", { status: 200 });
+  };
+  const real = globalThis.fetch;
+  globalThis.fetch = fetchResponder;
+  try {
+    // 先让 provider.models 把云端 channel 写进本账号的缓存
+    await plugin.provider.models({ models: {} }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
+    const l = await plugin.auth.loader(async () => ({ type: "api", key: AK, metadata: { sk: SK } }));
+    let seen;
+    globalThis.fetch = async (u, i) => {
+      seen = { headers: new Headers(i.headers) };
+      return new Response(JSON.stringify({ id: "ok", choices: [] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    await l.fetch(hostUrl(l.baseURL), {
+      method: "POST",
+      body: JSON.stringify({ model: "deepseek-v4.1-flash", messages: [{ role: "user", content: "hi" }], stream: false }),
+    });
+    assert.equal(seen.headers.get("maas_type"), null, "云端说走 agent 通道，就不能带福利头");
+    assert.doesNotMatch(seen.headers.get("Authorization"), /maas_type/);
+  } finally {
+    globalThis.fetch = real;
+    channelCache.clear?.();
+  }
+});
+
 test("loader.fetch: benefit 模型带三头，agent 模型不带", async () => {
   const plugin = await mod.default({}, {});
   const a = await callLoader(plugin, { init: { method: "POST", body: JSON.stringify({ model: "glm-5.3-flash" }) } });
@@ -2018,7 +2195,10 @@ test("usage: 积分账是主窗口（token 池下线后仍能显示 12000+ 积�
   assert.equal(w.limit, 12500);
   assert.equal(w.amount, 337.2, "amount 是已用");
   assert.equal(w.used, 2.7, "337.22/12500 = 2.7%");
-  assert.equal(w.display, "12162.8 / 12500");
+  // 到期日并进 display：宿主的 window.aside 是布尔（`aside: !!w.aside`），
+  // 字符串会被归一成 true、文案丢失，而且 true = 不参与「用尽」判定。
+  assert.equal(w.display, "12162.8 / 12500 · 体验版 到期 2026-11-12");
+  assert.equal(w.aside, undefined, "aside 不能承载文案，也不能把这个唯一窗口标成只展示");
   assert.match(u.balance, /12162\.8 积分/);
 });
 
@@ -2053,13 +2233,18 @@ test("usage: 第二个账号（不同套餐/额度/到期日）也各画各的",
   const u = await usageWith(accountsResponder(second, undefined), "LTAI5tSECONDACCOUNT000", "SKsecond000000000000000000000000000000000");
   assert.equal(u.balance, "7475.7 积分");
   assert.equal(u.windows[0].limit, 7500);
-  assert.match(u.windows[0].aside, /2026-11-17/);
+  assert.match(u.windows[0].display, /2026-11-17/);
+  assert.equal(u.windows[0].aside, undefined);
 });
 
-test("usage: 积分用不完会作废 —— 套餐到期日写进 aside", async () => {
+test("usage: 积分用不完会作废 —— 套餐到期日写进 display，而不是 aside", async () => {
+  // 🔴 回归：aside 在宿主里是**布尔**（`aside: !!w.aside`），写字符串会变成 true：
+  //    文案永久丢失，且 true 的语义是「只展示、不参与用尽判定」—— 这个窗口是
+  //    账号唯一的额度窗口，标成只展示会让积分耗尽也不触发账号用尽。
   const u = await usageWith(accountsResponder(statsPayload(), undefined));
-  assert.match(u.windows[0].aside, /体验版/);
-  assert.match(u.windows[0].aside, /2026-11-12/);
+  assert.match(u.windows[0].display, /体验版/);
+  assert.match(u.windows[0].display, /2026-11-12/);
+  assert.ok(!("aside" in u.windows[0]), "不该出现 aside");
 });
 
 test("usage: 没有总额度字段时不产生 NaN（只报剩余）", async () => {
@@ -2127,6 +2312,9 @@ test("usage: 积分出现负已用 / 剩余超总额时夹住，不画负百分�
   );
   assert.equal(negative.windows[0].used, 0);
   assert.equal(negative.windows[0].amount, 0);
+  // display / balance 用的是 remain，也必须夹住 —— 否则画成「12510 / 12500」
+  assert.match(negative.windows[0].display, /^12500 \/ 12500/);
+  assert.doesNotMatch(negative.balance, /12510/);
 
   // 已用 > 总额（统计滞后）→ 夹到 100%，amount 不超过 limit
   const over = await usageWith(
@@ -2279,6 +2467,26 @@ test("provider.models: 云端清单覆盖并保留真实 context/output", async 
   }
 });
 
+test("provider.models: 云端清单是**叠加**在静态兜底之上，不是整体替换", async () => {
+  // 🔴 回归：若实现从空对象起 `out = {}` 再填云端，静态里那些云端没返回的模型
+  //    （例如老套餐的 GLM-5.2）会从列表里消失 —— 用户可选模型凭空少一半。
+  const plugin = await mod.default({}, {});
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    result: { models: [{ model_id: "deepseek-v4.1-flash", context_window: 1000000, max_tokens: 393216, channel: "benefit" }] },
+  }), { status: 200 });
+  try {
+    const base = { "GLM-5.2": { id: "GLM-5.2", name: "GLM-5.2", limit: { context: 0, output: 0 } } };
+    const r = await plugin.provider.models({ models: base }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
+    assert.ok(r["GLM-5.2"], "云端没返回的静态模型必须保留");
+    assert.equal(r["GLM-5.2"], base["GLM-5.2"], "静态条目原样保留");
+    assert.ok(r["deepseek-v4.1-flash"], "云端条目要加进来");
+  } finally {
+    globalThis.fetch = real;
+    channelCache.clear();
+  }
+});
+
 test("provider.models: 云端模型带 capabilities.input.image（钩子路径不走 modalities）", async () => {
   const plugin = await mod.default({}, {});
   const real = globalThis.fetch;
@@ -2418,8 +2626,41 @@ test("envelope 的默认超时必须在 magpie 的 20 秒钩子期限内留足�
   assert.ok(20_000 - t >= 4_000, `要给宿主留足余量，实际只剩 ${20_000 - t}ms`);
 });
 
-test("签到链上的每次调用都走 envelope 的默认预算（不另设更长的）", () => {
+test("签到链上没有任何一处另设更长的超时，且共用同一条 deadline", () => {
   const src = readFileSync(new URL("../index.mjs", import.meta.url), "utf8");
-  const fn = src.slice(src.indexOf("async checkin(getAuth)"), src.indexOf("provider: {"));
-  assert.ok(!/timeout\s*:/.test(fn), "checkin 里不该再给单个请求设更长的超时");
+  // 扫描范围必须覆盖真正发请求的那些函数，而不只是钩子这一小段：
+  // opsClaim / opsConfirm / checkinFlow 里塞个 30s 以前是扫不到的。
+  const from = src.indexOf("function opsClaim(");
+  const to = src.indexOf("async function fetchBenefitModels(");
+  assert.ok(from > 0 && to > from, "扫描范围没找到，检查函数名是否改了");
+  const chain = src.slice(from, to);
+  assert.ok(!/timeout\s*:/.test(chain), "签到链上不该给单个请求另设超时（会越过宿主 20s）");
+  // 三步必须都拿到同一个 deadline
+  assert.match(chain, /const opts = \{ deadline \}/, "checkinFlow 应把 deadline 收成一个 opts");
+  const passOpts = (chain.match(/, opts\)/g) ?? []).length;
+  assert.ok(passOpts >= 3, `delivery/claim/confirm 都应带上 opts，实际 ${passOpts} 处`);
+});
+
+test("snapEnvelope: 有 deadline 时重发按剩余时间算，见底就不再发", async () => {
+  // 直接钉行为：两次都 401，第一次几乎吃光预算 → 不该再发第二次
+  let calls = 0;
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => {
+    calls += 1;
+    if (calls === 1) {
+      // 模拟第一次请求耗时逼近预算
+      const until = Date.now() + 5_900;
+      while (Date.now() < until) { /* 忙等：只在测试里，5.9s */ }
+    }
+    return jsonResponse({ error_code: "APIG.0301", error_msg: "verify ak sk signature fail" }, 401);
+  };
+  try {
+    await assert.rejects(
+      () => snapEnvelope(STATS_PATH, { ak: AK, sk: SK, deadline: Date.now() + 6_000 }),
+      (e) => e.errorCode === "APIG.0301",
+    );
+  } finally {
+    globalThis.fetch = real;
+  }
+  assert.equal(calls, 1, "预算见底时不该再发重发请求");
 });
