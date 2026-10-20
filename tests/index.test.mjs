@@ -1313,6 +1313,42 @@ test("config: 注册 codearts provider", async () => {
 // 🔴 关键回归：authorize 必须只靠 inputs 拿到 AK/SK
 // ---------------------------------------------------------------------------
 
+test("authorize: 探针打积分账 —— 老凭据不再因为 token 池下线而被判失败", async () => {
+  // 🔴 回归：以前探针是 opengw 的 /user/tokens/balance，该通道 2026-10-20 起固定回
+  //    「4000 invalid channel, group not found」，任何 AK/SK 都会被判验证失败。
+  const plugin = await mod.default({}, {});
+  let hit = "";
+  await withFetch(
+    async (url) => {
+      hit = String(url);
+      return jsonResponse({ metrics: [{ name: "usageTotalPackageCredit", package_credit_amount: 12500, package_credit_remain: 12100 }] });
+    },
+    async () => {
+      const r = await plugin.auth.methods[0].authorize({ credential: `${AK}:${SK}` });
+      assert.equal(r.type, "success", `真实凭据必须能登录，实际: ${r.error}`);
+    },
+  );
+  assert.match(hit, /snap-manager\/v1\/statistics\/plugin/, "探针应打积分账");
+  assert.ok(!/opengw/.test(hit), "不该再打已下线的 opengw");
+});
+
+test("authorize: 签名错（401）直接报验证失败，不换探针瞎试", async () => {
+  const plugin = await mod.default({}, {});
+  const seen = [];
+  const r = await withFetch(
+    async (url) => {
+      seen.push(String(url));
+      return jsonResponse({ error_code: "APIG.0301", error_msg: "verify ak sk signature fail" }, 401);
+    },
+    () => plugin.auth.methods[0].authorize({ credential: `${AK}:${SK}` }),
+  );
+  assert.equal(r.type, "failed");
+  assert.match(r.error, /验证失败/);
+  // snapEnvelope 撞到 401 APIG.0301 会**去掉可选头重发一次**，所以这里可能是 2 次；
+  // 关键是**同一个接口**，不能因为 401 就换到 opengw 去试。
+  assert.ok(seen.every((u) => u.includes("snap-manager/v1/statistics/plugin")), `不该换接口: ${seen.join(" ")}`);
+});
+
 test("authorize: 只靠 inputs.credential 就能拿到 AK/SK（宿主不传 key）", async () => {
   const plugin = await mod.default({}, {});
   const r = await plugin.auth.methods[0].authorize({ credential: `${AK}:${SK}` });
@@ -1341,7 +1377,8 @@ test("authorize: 成功时返回的 metadata 把宿主会合并进来的 credent
   // prompt 收集的原始 "AK:SK" 组合串，不盖就会原样落到 plugin-auth.json。
   const plugin = await mod.default({}, {});
   const real = globalThis.fetch;
-  globalThis.fetch = async () => new Response(JSON.stringify({ result: { total_quota: 1, total_balance: 1 } }), { status: 200 });
+  // 探针打的是积分账（snap），不是已下线的 opengw 余额接口
+  globalThis.fetch = async () => new Response(JSON.stringify({ metrics: [] }), { status: 200 });
   let r;
   try {
     r = await plugin.auth.methods[0].authorize({ credential: `${AK}:${SK}` });

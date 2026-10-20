@@ -1383,11 +1383,26 @@ export default async function codeartsPlugin(_input, options) {
                 error: "Secret Access Key 不能为空。请按「Access Key Id:Secret Access Key」的格式粘贴（中间要有冒号）",
               };
             }
-            // 用余额接口验证 AK/SK 有效性（签到接口幂等，不在此处触发）
+            // 验证 AK/SK：先打积分账（snap），**只在通道本身已知下线时**才回退到
+            // opengw 余额接口。
+            // 🔴 以前只打 opengw 的 /user/tokens/balance。该通道 2026-10-20 起固定回
+            //    `4000 invalid channel, group not found`，于是**任何** AK/SK 都会被判
+            //    成「验证失败」—— 老用户重新登录会看到一条与凭据无关的报错。
+            //    积分账那条接口一直活着，而且正是签到攒积分的那本账，更适合当探针。
+            //    （签到接口本身幂等，不在这里触发。）
             try {
-              await fetchBalance(ak, sk);
+              await fetchCredits(ak, sk);
             } catch (e) {
-              return { type: "failed", error: `AK/SK 验证失败: ${redact(e?.message ?? String(e), ak, sk)}` };
+              // 老套餐 token 账户在积分账上可能没有指标，但**调用本身**是通的；
+              // 只有「整条通道没了」才值得换一个探针再确认，否则 401 就该直接报。
+              if (!gatewayRetired(e)) {
+                return { type: "failed", error: `AK/SK 验证失败: ${redact(e?.message ?? String(e), ak, sk)}` };
+              }
+              try {
+                await fetchBalance(ak, sk);
+              } catch (e2) {
+                return { type: "failed", error: `AK/SK 验证失败: ${redact(e2?.message ?? String(e2), ak, sk)}` };
+              }
             }
             // 🔴 metadata 里必须把 `credential` 显式盖成空串。
             //    宿主 `save()` 的实现是 `md = { ...inputs, ...result.metadata }`
