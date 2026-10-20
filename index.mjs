@@ -77,16 +77,91 @@ const MAX_OUTPUT_TOKENS = 65536;
  *    `context_window` 填回来。
  *    `output` 则用**实测的参数上限** `MAX_OUTPUT_TOKENS` —— 它是真的，不是猜的，
  *    而且不设限会让客户端去要一个上游必然拒绝的数（见上）。
+ *
+ * 🔴 `image`（0.2.13）＝**这个模型收不收图**，逐模型实测，不按名字猜。
+ *
+ *    宿主 `internal/plugin/host.js` 最终读的是模型条目的 `capabilities.input.image`，
+ *    再摊成 `image` / `imageSaid` 两个字段，而 `imageSaid` 只在它是**布尔值**时才为真：
+ *    能力不写 ＝ 「没说」，写了 = 「厂商说过了」。这两种「不收」在路由里待遇**完全不同**：
+ *      · 「明确说不收」的模型，宿主不把带图请求发给它 —— 实测同一个
+ *        raccoon 纯文本模型，纯文本请求被试 160 次、带图请求被试 **0** 次；
+ *      · 「没说」的照发不误 —— 撞上游
+ *        `400 InferHub.001001020.406 The request model is not multimodal`，
+ *        还让账号白挨一次 60 秒 backoff（2026-10-20 18:47 的两次就是这样来的）。
+ *    所以纯文本模型必须**明确**写 `image: false`，留空就是留了个坑。
+ *
+ *    这里的能力是实测的（2026-10-20，发 64×64 纯色 PNG 要求答颜色）：
+ *      · `deepseek-v4-pro-0813` 绿/红/黄三色 **3/3 全对** → 真能看图；
+ *        当天 production 里它也确实成功服务了 18 次带图请求。
+ *      · `glm-5.3-flash`、`deepseek-v4.1-flash` 一律 400 not multimodal。
+ *      · `deepseek-v4-flash-0731` / 两个 openpangu / GLM-5.2 未逐一带图实测，
+ *        按同族纯文本模型保守声明 —— 与 `MAX_OUTPUT_TOKENS` 同性质：**实测值，
+ *        模型能力变了要跟着改**。
+ *      · `kimi-k2.6-vl`（名字带 vl）云端清单里有但账号调不通（`unsupported model`，
+ *        两种大小写都试过），也不在注册清单里，故不列。
  */
 const MODEL_META = {
-  "glm-5.3-flash": { name: "GLM-5.3 Flash", context: 0, output: MAX_OUTPUT_TOKENS, benefit: true },
-  "deepseek-v4-pro-0813": { name: "DeepSeek V4 Pro", context: 0, output: MAX_OUTPUT_TOKENS, benefit: true },
-  "deepseek-v4-flash-0731": { name: "DeepSeek V4 Flash", context: 0, output: MAX_OUTPUT_TOKENS, benefit: true },
-  "deepseek-v4.1-flash": { name: "DeepSeek V4.1 Flash", context: 0, output: MAX_OUTPUT_TOKENS, benefit: true },
-  "openpangu-2.0-pro": { name: "OpenPangu 2.0 Pro", context: 0, output: MAX_OUTPUT_TOKENS, benefit: false },
-  "openpangu-2.0-flash": { name: "OpenPangu 2.0 Flash", context: 0, output: MAX_OUTPUT_TOKENS, benefit: false },
-  "GLM-5.2": { name: "GLM-5.2", context: 0, output: MAX_OUTPUT_TOKENS, benefit: false },
+  "glm-5.3-flash": { name: "GLM-5.3 Flash", context: 0, output: MAX_OUTPUT_TOKENS, image: false, benefit: true },
+  "deepseek-v4-pro-0813": { name: "DeepSeek V4 Pro", context: 0, output: MAX_OUTPUT_TOKENS, image: true, benefit: true },
+  "deepseek-v4-flash-0731": { name: "DeepSeek V4 Flash", context: 0, output: MAX_OUTPUT_TOKENS, image: false, benefit: true },
+  "deepseek-v4.1-flash": { name: "DeepSeek V4.1 Flash", context: 0, output: MAX_OUTPUT_TOKENS, image: false, benefit: true },
+  "openpangu-2.0-pro": { name: "OpenPangu 2.0 Pro", context: 0, output: MAX_OUTPUT_TOKENS, image: false, benefit: false },
+  "openpangu-2.0-flash": { name: "OpenPangu 2.0 Flash", context: 0, output: MAX_OUTPUT_TOKENS, image: false, benefit: false },
+  "GLM-5.2": { name: "GLM-5.2", context: 0, output: MAX_OUTPUT_TOKENS, image: false, benefit: false },
 };
+
+/**
+ * 模型条目里要合并的 `modalities` 字段 —— **只给配置钩子（`codeartsModels()`）用**。
+ *
+ * 宿主把 `modalities.input` 转成 `capabilities.input` 只发生在一个地方：
+ * `internal/plugin/host.js` 的**配置钩子模型**合并循环里
+ * （`...(m.modalities?.input ? { input: modalities(m.modalities.input) } : {})`）。
+ * 而 `provider.models` 钩子的返回值是**原样采用**的（同一文件
+ * `out.models = Object.fromEntries(...{ ...m, id: k, providerID: id })`），
+ * 那条路上写 `modalities` 会被静默丢掉 —— 那边要用下面的 `capabilitiesField()`。
+ *
+ * **未知就一个键都不写** —— 写 `image: false` 会被宿主当成「明确说不收」而把带图
+ * 请求整个跳过，写 `true` 又是撒谎。宁可退回「没说」（行为与 0.2.12 一致），
+ * 也不编一个可能错的值。与 `context: 0`、`MAX_OUTPUT_TOKENS` 同一条原则。
+ *
+ * @param {unknown} image `MODEL_META[id].image`：布尔值才算说了
+ * @returns {{ modalities?: { input: string[], output: string[] } }}
+ */
+function modalitiesField(image) {
+  if (typeof image !== "boolean") return {};
+  return { modalities: { input: image ? ["text", "image"] : ["text"], output: ["text"] } };
+}
+
+/**
+ * 模型条目里要合并的 `capabilities` 字段 —— **只给 `provider.models` 钩子用**。
+ *
+ * 与 `modalitiesField()` 是同一件事的两条路（原因见上面那段）。宿主最终读的是
+ * `m.capabilities?.input?.image`，所以：
+ *
+ *   · `input: { text: true, image: true }`  → `image:true,  imageSaid:true`（会看图）
+ *   · `input: { text: true }`               → `image:false, imageSaid:true`（明确不看）
+ *   · 整个键不写                            → `image:false, imageSaid:false`（没说）
+ *
+ * `text: true` **必须自己写**：配置路径那份默认值（`input: { text: true }`）在
+ * 钩子路径上不存在，只给 `{ image: true }` 会让 `kinds()` 只认领 `["image"]`，
+ * 界面可能当成「这模型只收图」。
+ *
+ * @param {unknown} image `MODEL_META[id].image`：布尔值才算说了
+ * @returns {{ capabilities?: { input: { text: true, image?: true } } }}
+ */
+function capabilitiesField(image) {
+  if (typeof image !== "boolean") return {};
+  return { capabilities: { input: image ? { text: true, image: true } : { text: true } } };
+}
+
+/**
+ * `MODEL_META` 按小写 id 索引。
+ *
+ * 云端 `gateway/config` 回的 `model_id` 大小写不保证和静态表一致（表里是
+ * `GLM-5.2`，云端可能回别的写法），所以查表统一走小写，与 `channelTable`
+ * 存 channel 时的做法一致（那边也是 `id.toLowerCase()`）。
+ */
+const MODEL_META_LOWER = Object.fromEntries(Object.entries(MODEL_META).map(([id, m]) => [id.toLowerCase(), m]));
 
 /** 对话端点的绝对地址（loader 里判断「这是不是对话请求」用）。 */
 const CHAT_ABS = `${SNAP_HOST}${CHAT_PATH}`;
@@ -707,6 +782,8 @@ function codeartsModels() {
       limit: { context: meta.context, output: meta.output },
       reasoning: false,
       tool_call: true,
+      // 让宿主知道这个模型收不收图（见 MODEL_META 上方的说明）
+      ...modalitiesField(meta.image),
     };
   }
   return out;
@@ -986,6 +1063,10 @@ export default async function codeartsPlugin(_input, options) {
               },
               reasoning: false,
               tool_call: true,
+              // 图片能力查静态表（云端 id 大小写不保证一致）；查不到就是「没说」，
+              // 一个键都不写。这里必须用 capabilities 而不是 modalities ——
+              // 这条钩子的返回值宿主原样采用，不走 modalities 转换（见上方说明）
+              ...capabilitiesField(MODEL_META_LOWER[id.toLowerCase()]?.image),
             };
           }
           return out;
@@ -1005,7 +1086,8 @@ export const _internal = {
   claimStatus, claimToday, fetchBalance, fetchBenefitModels,
   checkinOutcome, startOfTodayMs, isBenefitChannel, codeartsModels, clampChatBody,
   upstreamSessionId, sessionHeaders, num, round1, optNumber, outputLimit, CN_OFFSET_MS,
-  channelCache, channelTable, MODEL_META, AGENT_MODELS, MAX_OUTPUT_TOKENS,
+  channelCache, channelTable, MODEL_META, MODEL_META_LOWER, AGENT_MODELS, MAX_OUTPUT_TOKENS,
+  modalitiesField, capabilitiesField,
   normalizeChatBody, upstreamError, normalizeChatResponse, rewriteStreamError, PEEK_MS,
   SNAP_HOST, CHAT_PATH, OPENGW_HOST,
 };

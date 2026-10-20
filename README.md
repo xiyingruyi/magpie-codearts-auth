@@ -8,13 +8,13 @@
 | **每日签到** ⭐ | 实现 magpie 原生 `auth.checkin` 钩子（magpie ≥ v0.1.1083）——Settings → Usage → Plugins 打开 **Daily check-in**，每天每账号自动签到；签到结果由 magpie 显示在卡片与 `magpie accounts checkin` 里 |
 | 免费额度 | `auth.usage` 显示**每日免费 Token** 的已用/总量 |
 | 对话 | `POST snap-access /api/v2/chat/completions`（OpenAI 形态），按模型自动选通道 |
-| 模型 | 登录后自动同步云端模型清单（含 `channel` 字段），失败时回退内置列表 |
+| 模型 | 登录后自动同步云端模型清单（含 `channel` 字段），失败时回退内置列表；**逐模型实测声明收不收图**（见 [图片能力](#图片能力0213-实测)） |
 
 ## 安装
 
 ```sh
 magpie plugin add github:liuxigreen/magpie-codearts-auth   # 上游原版
-magpie plugin add github:xiyingruyi/magpie-codearts-auth   # 本 fork（含 0.2.12 修复）
+magpie plugin add github:xiyingruyi/magpie-codearts-auth   # 本 fork（含 0.2.13 修复）
 magpie plugin login codearts
 magpie quota
 ```
@@ -183,7 +183,7 @@ CODEARTS_AK=... CODEARTS_SK=... node scripts/probe-session.mjs <模式> [并发�
 
 此外补齐了 `ineligible` / `captcha` / `inactive` 三种签到 outcome（骨架版遇到会落到 `failed` 并每 30 分钟无意义重试）。
 
-## 0.2.4 – 0.2.11（本 fork）
+## 0.2.4 – 0.2.13（本 fork）
 
 在 0.2.3 基础上的改动，逐条都有单测覆盖：
 
@@ -214,8 +214,51 @@ CODEARTS_AK=... CODEARTS_SK=... node scripts/probe-session.mjs <模式> [并发�
 | ㉓ | `usage()` 的 `catch` 引用了 `try` 块内的 `const ak/sk`：凭据不完整时 `creds()` 抛错 → catch 再抛 `ReferenceError`，宿主拿到异常而非「额度查询失败」 | `ak/sk` 提到 `try` 外声明，catch 照常脱敏并返回 error |
 | ㉔ | 流式窥探若直接 `await reader.read()`：上游长思考时可能数秒不发一个字节，宿主就一直拿不到响应头（只判时间戳是拦不住的） | 窥探与 3 秒定时器竞速；超时放弃窥探，把那次**未完成**的 read 交给后续转发，一个字节都不丢 |
 
-测试从 45 条增到 119 条，覆盖上述每一条以及「`used` 永不为 NaN」「空响应不抛错」
+| ㉕ | 插件从不声明模型收不收图，magpie 只能记成**「没说」**（`imageSaid:false`）→ 带图请求照样被发给纯文本成员，上游 400 `The request model is not multimodal`、账号被 backoff 60 秒（额度一个 token 没动，所以卡片照旧满格）；而**唯一真会看图**的 `deepseek-v4-pro-0813` 也被记成不能看图 | 新增 `MODEL_META[].image`，逐模型实测声明（见下节）。配置钩子路径写 `modalities`、`provider.models` 钩子路径写 `capabilities.input` —— 宿主对这两条路的处理**不同**，写错会被静默丢掉；固化表里查不到的模型**一个键都不写**，保持「没说」 |
+
+测试从 45 条增到 127 条，覆盖上述每一条以及「`used` 永不为 NaN」「空响应不抛错」
 「余额字段为 0 不被 `||` 吞掉」等边界。
+
+### 图片能力（0.2.13 实测）
+
+**识图能力是按模型分的，不是按平台分的。** 实测方法：直接调
+`codearts/<model>`，发一张 64×64 纯色 PNG，要求答颜色。
+
+| 模型 | 收不收图 | 依据 |
+|---|---|---|
+| `deepseek-v4-pro-0813` | ✅ **收** | 绿/红/黄三色 **3/3 全答对**；线上带图请求它成功服务 18 次 |
+| `glm-5.3-flash` | ❌ 不收 | 400 `InferHub.001001020.406 The request model is not multimodal` |
+| `deepseek-v4.1-flash` | ❌ 不收 | 同上 |
+| `deepseek-v4-flash-0731` | ❌ 不收 | 未单独实测，同族纯文本，保守声明 |
+| `openpangu-2.0-pro` / `openpangu-2.0-flash` / `GLM-5.2` | ❌ 不收 | 老套餐纯文本 |
+| `kimi-k2.6-vl` | — | 云端清单里有，但账号调不通（`unsupported model`，两种大小写都试过），**不列** |
+
+**为什么要声明**：宿主 `internal/plugin/host.js` 把模型能力读成三态 ——
+
+```js
+image:     !!m.capabilities?.input?.image,                     // 会不会看图
+imageSaid: typeof m.capabilities?.input?.image === "boolean",  // 厂商有没有说
+```
+
+不写 = 「没说」；写 `image: false` = **明确说不收**。magpie 只对**明确声明不收图**
+的模型过滤带图请求 —— 同一个 `raccoon/sn-deepseek-v4-1-flash`（`image:false, imageSaid:true`）
+一天里纯文本请求被尝试 160 次、**带图请求 0 次**；而「没说」的 codearts 被尝试了 20 次，
+里面就有那两次 400。所以补上声明后，带图请求不会再发给两个纯文本成员，
+同时 magpie 知道 `deepseek-v4-pro-0813` 能看图、会正常派给它。
+
+⚠️ **两条路径写的字段不一样，这是最容易踩的坑**（都有单测盯着）：
+
+| 产出模型的地方 | 走宿主的哪条路 | 要写的字段 |
+|---|---|---|
+| `codeartsModels()`（配置钩子） | 配置模型合并循环 —— 宿主**自己**用 `modalities` 重建 `capabilities`，模型对象里原生的 `capabilities` 键反而不被采纳 | `modalities: { input: [...], output: [...] }` |
+| `provider.models` 钩子的云端清单 | 返回值被**原样采用**（`{ ...m, id, providerID }`），**不做**任何 `modalities` 转换 | `capabilities: { input: { text: true, image?: true } }` |
+
+`text: true` 必须自己带上：配置路径那份 `input: { text: true }` 默认值在钩子路径上不存在，
+只给 `{ image: true }` 会让界面把模型当成「只收图」。
+
+**维护提示**：`image` 和 `context: 0`、`MAX_OUTPUT_TOKENS` 一样是**实测值不是猜的** ——
+上游模型能力变了（或新模型进清单）要跟着改；表里查不到的模型宁可保持「没说」
+（行为退回 0.2.12），也不编一个可能错的 `false` 把模型从带图请求里踢掉。
 
 ### 第四轮实测（2026-10-19）
 

@@ -11,6 +11,7 @@ const {
   upstreamError, normalizeChatResponse, PEEK_MS,
   upstreamSessionId, sessionHeaders, CN_OFFSET_MS,
   channelCache, channelTable, MODEL_META, AGENT_MODELS,
+  modalitiesField, capabilitiesField,
   SNAP_HOST, CHAT_PATH, OPENGW_HOST,
 } = mod._internal;
 
@@ -384,6 +385,48 @@ test("codeartsModels: context 不猜；output 用实测参数上限（不是猜�
     // output 不能是 0（= 不设限）：客户端会去要 393216，上游 400 → magpie 包成 200 空流
     assert.equal(v.limit.output, MAX_OUTPUT_TOKENS, `${id} 的 output 应为实测上限`);
     assert.ok(v.limit.output > 0);
+  }
+});
+
+// --- 图片能力声明（0.2.13）------------------------------------------------
+// 三态：没写 = 「没说」；`image:false` = 「明确说不收」；`image:true` = 「会看图」。
+// magpie 只对**明确声明**不收图的模型硬过滤带图请求，所以「没说」和
+// 「明确说不收」的行为完全不同 —— 这几个测试就是钉死这条区别。
+
+test("MODEL_META: 每个模型都实测声明了 image，且只有 pro-0813 会看图", () => {
+  for (const [id, meta] of Object.entries(MODEL_META)) {
+    assert.equal(typeof meta.image, "boolean", `${id} 必须带布尔 image —— 漏了会退回「没说」`);
+  }
+  // 实测（2026-10-20，发 64×64 纯色 PNG 要求答颜色）：绿/红/黄 3/3 全对
+  assert.equal(MODEL_META["deepseek-v4-pro-0813"].image, true);
+  const seeing = Object.entries(MODEL_META).filter(([, m]) => m.image).map(([id]) => id);
+  assert.deepEqual(seeing, ["deepseek-v4-pro-0813"], "当前只有这一个能看图，多出来就是没实测就标了");
+});
+
+test("modalitiesField: 未知就不写键；只认布尔值", () => {
+  assert.deepEqual(modalitiesField(undefined), {}, "未知 = 一个键都不写（保持 0.2.12 行为）");
+  assert.deepEqual(modalitiesField(null), {});
+  assert.deepEqual(modalitiesField("true"), {}, "字符串不算说了");
+  assert.deepEqual(modalitiesField(false), { modalities: { input: ["text"], output: ["text"] } });
+  assert.deepEqual(modalitiesField(true), { modalities: { input: ["text", "image"], output: ["text"] } });
+});
+
+test("capabilitiesField: text 必须自己带上，不能只剩 image", () => {
+  assert.deepEqual(capabilitiesField(undefined), {}, "未知 = 一个键都不写");
+  assert.deepEqual(capabilitiesField(false), { capabilities: { input: { text: true } } });
+  // 只写 { image: true } 的话 kinds() 只认领 ["image"]，界面会当成只收图
+  assert.deepEqual(capabilitiesField(true), { capabilities: { input: { text: true, image: true } } });
+});
+
+test("codeartsModels（配置钩子路径）: 每个模型都带 modalities，text 打头", () => {
+  for (const [id, v] of Object.entries(codeartsModels())) {
+    assert.deepEqual(v.modalities.output, ["text"], `${id} 的输出只有文本`);
+    assert.equal(v.modalities.input[0], "text", `${id} 必须先收文本`);
+    assert.equal(
+      v.modalities.input.includes("image"),
+      MODEL_META[id].image,
+      `${id} 的 modalities 必须和 MODEL_META.image 一致`,
+    );
   }
 });
 
@@ -1200,6 +1243,34 @@ test("provider.models: 云端清单覆盖并保留真实 context/output", async 
     const mine = channelCache.get(AK);
     assert.equal(mine.get("deepseek-v4-pro-0813"), "benefit");
     assert.equal(mine.get("glm-5.2"), "agent", "键统一小写");
+  } finally {
+    globalThis.fetch = real;
+    channelCache.clear();
+  }
+});
+
+test("provider.models: 云端模型带 capabilities.input.image（钩子路径不走 modalities）", async () => {
+  const plugin = await mod.default({}, {});
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    result: {
+      models: [
+        { model_id: "deepseek-v4-pro-0813", context_window: 1000000, max_tokens: 393216, channel: "benefit" },
+        { model_id: "deepseek-v4.1-flash", context_window: 1000000, max_tokens: 393216, channel: "benefit" },
+        { model_id: "brand-new-model", context_window: 1000, max_tokens: 100, channel: "benefit" },
+      ],
+    },
+  }), { status: 200 });
+  try {
+    const r = await plugin.provider.models({ models: {} }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
+    // 🔴 宿主对 provider.models 的返回值是**原样采用**的，不走 modalities 转换 ——
+    // 这里写 modalities 会被静默丢掉，imageSaid 永远是 false
+    assert.equal(r["deepseek-v4-pro-0813"].capabilities.input.image, true, "能看图的模型要 image:true");
+    assert.equal(r["deepseek-v4-pro-0813"].capabilities.input.text, true, "text 不能被 image 挤掉");
+    assert.deepEqual(r["deepseek-v4.1-flash"].capabilities.input, { text: true }, "纯文本模型要明确说不收图");
+    assert.equal(r["deepseek-v4.1-flash"].modalities, undefined, "这条路上 modalities 是死字段");
+    // 表里没有的模型：保持「没说」，宁可退回 0.2.12 行为也不编一个可能错的 false
+    assert.equal(r["brand-new-model"].capabilities, undefined, "查不到就不写，保持「没说」");
   } finally {
     globalThis.fetch = real;
     channelCache.clear();
