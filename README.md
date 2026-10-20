@@ -9,7 +9,7 @@
 | **积分余额** | `auth.usage` 显示**积分**（控制台上那个 12000+ 就是它）：已用/总量 + 套餐到期日 |
 | ~~免费 Token 池~~ | **2026-10-20 官方已结束**（论坛公告 + 活动 PDF 目录移除 + 实测 `4000 invalid channel, group not found`），只剩积分一本账 |
 | 对话 | `POST snap-access /api/v2/chat/completions`（OpenAI 形态），按模型自动选通道 |
-| 模型 | 登录后自动同步云端模型清单（含 `channel` 字段），失败时回退内置列表；**逐模型实测声明收不收图**（见 [图片能力](#图片能力0215-定论codearts-全线不收图)） |
+| 模型 | 点「重新获取模型」实时拉 `snap-access /v1/model/builtin`（与 IDE 模型下拉同源），华为上新/下架**无需改插件**；失败才回退内置列表。**逐模型实测声明收不收图**（见 [图片能力](#图片能力0215-定论codearts-全线不收图)） |
 
 ## 安装
 
@@ -55,7 +55,7 @@ AccessKeyId:SecretAccessKey
 | 华为云开发者论坛活动帖底部「温馨提醒」 | **「华为云码道每日领千万 token 限时活动已于 2026 年 10 月 20 日结束，本活动页面已同步下线相关福利部分。」** |
 | 官方《活动》PDF（**文档版本 01，发布日期 2026-10-20**） | 目录只剩 4 篇：Skill 创新大赛、每日签到得积分、完成学生认证得积分、邀请新用户得积分 —— **全文 0 次出现 Token** |
 | 帮助中心 `llms.txt` 的「活动」索引 | 同上 4 篇；原 `codeartsagent_offers_0001.html`《限时领取Tokens》**已从索引里删除**，直接访问返回站点 404 |
-| 实测（本机两账号） | `GET opengw /api/v1/user/tokens/balance` 与 `/api/v1/gateway/config` 一律 `200 {"error_code":"4000","error_msg":"invalid channel, group not found"}`；不带鉴权则是 `401 APIG.0301`（说明**路由还在、鉴权也还在，是后端那个 channel 分组没了**） |
+| 实测（本机两账号） | `GET opengw /api/v1/user/tokens/balance` 与 `/api/v1/gateway/config` 一律 `200 {"error_code":"4000","error_msg":"invalid channel, group not found"}`（**这正是 0.2.22 换掉模型清单来源的原因**）；不带鉴权则是 `401 APIG.0301`（说明**路由还在、鉴权也还在，是后端那个 channel 分组没了**） |
 
 ⚠️ 不要被 `activity.huaweicloud.com/codearts_agent.html` 误导：它仍在线、仍写「每日 1,000 万免费
 Token、0 点清零」，但那是 **2026-09-02 的缓存版本**，页面从未写结束日期（只有一句「保留随时终止或
@@ -215,7 +215,7 @@ magpie 的 `usage()` window 字段，本插件按宿主源码逐条对齐：
 | 福利（benefit） | **不在** AgentCenter 名单里的一律按此处理 | `maas_type: benefit`、`model-id`、`model-name` |
 | 老套餐（AgentCenter） | 命中 `openpangu-2.0-pro` / `openpangu-2.0-flash` / `GLM-5.2` | 无（带了反而报 unsupported model） |
 
-> **上游是黑名单，不是白名单。** 上游 `server.py` 的判定是 `benefit = model not in AGENT_MODELS`，且 `AGENT_MODELS` 由模型缓存里 `channel == "agent"` 的项动态构建。因此**新上线的免费模型默认走 benefit 通道**。本插件的 `isBenefitChannel()` 优先采用云端返回的 `channel` 字段，无该字段时按黑名单语义回退，不会因为硬编码白名单而把新模型判错通道。
+> **上游是黑名单，不是白名单。** 上游 `server.py` 的判定是 `benefit = model not in AGENT_MODELS`，且 `AGENT_MODELS` 由模型缓存里 `channel == "agent"` 的项动态构建。因此**新上线的免费模型默认走 benefit 通道**。本插件的 `isBenefitChannel()` 优先采用云端判定（0.2.22 起是 `/v1/model/builtin` 的 `channel_source`，之前是 opengw 的 `channel`），无该字段时按黑名单语义回退，不会因为硬编码白名单而把新模型判错通道。
 
 请求体为标准 OpenAI chat completions 形态（`model` / `messages` / `stream` 等），原样转发，支持流式与工具调用。
 
@@ -245,6 +245,44 @@ CODEARTS_AK=... CODEARTS_SK=... node scripts/probe-session.mjs <模式> [并发�
 3. **丢弃云端 `channel` 字段** —— 该字段正是上游构建 `AGENT_MODELS` 的依据；本版保留并写入运行期缓存。
 
 此外补齐了 `ineligible` / `captcha` / `inactive` 三种签到 outcome（骨架版遇到会落到 `failed` 并每 30 分钟无意义重试）。
+
+## 0.2.22（2026-10-21：修好「重新获取模型」—— 它此前根本拿不到新模型）
+
+用户问：以后华为更新模型，插件的「重新获取模型」能不能拿到最新列表？
+
+**答案此前是「不能」，而且不会报错。** `provider.models` 拉的是
+`opengw /api/v1/gateway/config`，而那个接口 2026-10-20 起固定回
+`4000 invalid channel, group not found`；`catch` 里对这条错误**静默退回硬编码清单**。
+结果就是：点一辈子刷新，看到的永远是当初写死的那几个 —— 0.2.21 补的
+`glm-5.3` / `glm-5.2-sft-harmony` 正是这么被漏掉、要靠人工探测才发现。
+
+改用 **`GET snap-access /v1/model/builtin`**（与 IDE 模型下拉同一份数据，实测 427ms、
+两账号结果一致）。字段映射：
+
+| 上游字段 | 用途 |
+|---|---|
+| `model_id` / `model_name` | 模型 id 与显示名 |
+| `display_enabled` | **必须为 true 才发布**。两个 VL 模型是 `false` —— IDE 下拉里根本不显示，放出来只会让用户选中一个上游不认的 id |
+| `enable` | `false`（停用）同样跳过 |
+| `channel_source` | `codearts` → agent 通道（**不能**带福利三头，带了回 4004）；`benefit` → 福利通道 |
+| `supports_images` | **不采信**。它说的是「模型本身多模态」，不是「这条通道收 magpie 的图」——0.2.13/0.2.15 实测走 magpie 的图片格式一律 406。图片能力仍只由 `VISION_MODELS`（实测过才加）决定 |
+
+两个语义变化，都是有意的：
+
+1. **云端清单从「叠加」改成「权威」。** 上游下架的模型必须从选择器里消失，否则
+   宿主会继续轮询一个 404，而 magpie 对不带额度关键词的错误**不 failover**（整组直接失败）
+   —— `RETIRED_MODELS` 就是手工补这个洞的产物，现在让云端自己说了算。用户自己加进
+   配置、不归本插件管的条目仍原样保留。
+2. **失败不再静默。** 缺 `builtinModels` 字段（与 `fetchCampaigns` 的 `BAD_ITEMS` 同一个坑：
+   「这次没拿到」≠「确实没有」）、业务错误、网络错误，全部上抛给宿主记 `listError`，
+   在提供商页显示出来。静态清单仍由配置钩子给出，所以刷新失败不会让选择器变空。
+
+内置清单**不带** `context_window` / `max_tokens`，所以 `limit` 沿用静态兜底
+（`context: 0` 不设限、`output: 65536` 参数上限），绝不拿云端数字去猜一个会截断上下文的硬上限。
+
+测试 207 → 216 条。8 个突变（换回旧接口 / 不过滤 `display_enabled` / 改回叠加 /
+采信 `supports_images` / 缺字段当空清单 / 忽略 `channel_source` / 不沿用静态 limit ×2 /
+错误静默吞掉）逐个验证都能让测试变红。
 
 ## 0.2.21（2026-10-21：补上两个上游已显示的内置文本模型）
 
@@ -490,9 +528,10 @@ provider.models → loader 的端到端链路、签到金额取自 claim 响应�
 2. **AgentCenter**（`/v1/agent-center/agents/detail`，老套餐通道）**确实提供
    `supports_images` 字段** —— 该账号下 5 个模型（`GLM-5.2` / `glm-5.2-sft-harmony` /
    `openpangu-2.0-pro` / `openpangu-2.0-flash` / `glm-5.3`）**全是 `false`**。
-3. **免费额度网关**（`/api/v1/gateway/config`，本插件用的那条）**不含任何能力信息** ——
+3. **免费额度网关**（`/api/v1/gateway/config`，0.2.22 之前本插件用的那条）**不含任何能力信息** ——
    只有 `model_id` / `model_name` / `context_window` / `max_tokens` / `sort` 五个字段；
    社区参考实现 codearts2api 对这条通道同样硬编码 `supports_images: False`。
+   现在改用的 `/v1/model/builtin` **有** `supports_images`，但**不采信**（理由见 0.2.22 节）。
 
 ⚠️ **凌晨日志里 `deepseek-v4-pro-0813`「成功服务 18 次带图请求」是假象**：那是第 30 轮的
 长对话，图片出现在早前轮次，宿主已用「识图模型转文字描述」把原图换成了文字，模型收到

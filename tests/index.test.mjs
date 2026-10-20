@@ -16,7 +16,7 @@ const {
   benefitBroken, markBenefitBroken, benefitGone, gatewayRetired, benefitDown, BENEFIT_DOWN_MS,
   modalitiesField, capabilitiesField, imageCapable,
   SNAP_HOST, CHAT_PATH, OPENGW_HOST,
-  STATS_PATH, OPS_DELIVERY_PATH, OPS_CHANNEL, AGENT_TYPE_HEADER,
+  STATS_PATH, OPS_DELIVERY_PATH, OPS_CHANNEL, AGENT_TYPE_HEADER, BUILTIN_MODELS_PATH,
 } = mod._internal;
 
 const AK = "LTAI5tABCDEFGHIJKLMN";
@@ -536,14 +536,10 @@ test("modelRetired: 福利下线后两条通道都不通的模型被摘掉，能
 test("provider.models: 云端清单里的退役模型同样被过滤掉", async () => {
   const plugin = await mod.default({}, {});
   const real = globalThis.fetch;
-  globalThis.fetch = async () => new Response(JSON.stringify({
-    result: {
-      models: [
-        { model_id: "deepseek-v4-pro-0813", context_window: 1000000, max_tokens: 393216, channel: "benefit" },
-        { model_id: "deepseek-v4.1-flash", context_window: 1000000, max_tokens: 393216, channel: "benefit" },
-      ],
-    },
-  }), { status: 200 });
+  globalThis.fetch = async () => new Response(JSON.stringify({ count: 2, builtinModels: [
+    { model_id: "deepseek-v4-pro-0813", enable: true, display_enabled: true, channel_source: "codearts" },
+    { model_id: "deepseek-v4.1-flash", enable: true, display_enabled: true, channel_source: "codearts" },
+  ] }), { status: 200 });
   try {
     const r = await plugin.provider.models({ models: {} }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
     assert.equal(r["deepseek-v4-pro-0813"], undefined, "退役模型不该被发布（否则宿主轮询到就是不带 failover 的 400）");
@@ -568,28 +564,46 @@ test("gatewayRetired: 只认「网关下线」这一句，临时错误照旧可�
   assert.equal(gatewayRetired(new Error("CodeArts 请求失败: fetch failed")), false);
 });
 
-test("provider.models: 权益网关永久下线时静默退回静态清单（不再每次刷一条 listError）", async () => {
+test("provider.models: 清单接口出错时如实上抛（宿主显示 listError），不再静默吞成静态清单", async () => {
+  // 🔴 0.2.21 之前的实现读的是 opengw 的 `/api/v1/gateway/config`，那个接口
+  //    2026-10-20 起永久回 4000，于是每次刷新都静默退回硬编码清单 —— 表现就是
+  //    「点了重新获取模型，华为新上的模型永远不出现」。改成 snap 的
+  //    `/v1/model/builtin` 之后，任何失败都必须让用户看见，否则同样的坑会重演。
   const plugin = await mod.default({}, {});
   const real = globalThis.fetch;
-  globalThis.fetch = async () =>
-    new Response(JSON.stringify({ error_code: "4000", error_msg: "invalid channel, group not found", result: null }), {
-      status: 200, headers: { "content-type": "application/json" },
-    });
-  let got;
   try {
-    got = await plugin.provider.models({ models: codeartsModels() }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
-  } finally {
-    globalThis.fetch = real;
-  }
-  assert.deepEqual(got, codeartsModels(), "应原样退回静态清单");
+    // 业务错误
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify({ error_code: "4000", error_msg: "invalid channel, group not found", result: null }), {
+        status: 200, headers: { "content-type": "application/json" },
+      });
+    await assert.rejects(
+      () => plugin.provider.models({ models: codeartsModels() }, { auth: { type: "api", key: AK, metadata: { sk: SK } } }),
+      /模型清单获取失败/,
+      "接口报错必须上抛，不能假装成「清单没变」",
+    );
 
-  // 网络类错误仍要抛（宿主据此显示 listError）
-  globalThis.fetch = async () => { throw new Error("fetch failed"); };
-  let threw = false;
+    // 网络错误
+    globalThis.fetch = async () => { throw new Error("fetch failed"); };
+    await assert.rejects(
+      () => plugin.provider.models({ models: codeartsModels() }, { auth: { type: "api", key: AK, metadata: { sk: SK } } }),
+      /模型清单获取失败/,
+    );
+  } finally { globalThis.fetch = real; }
+});
+
+test("provider.models: 缺 builtinModels 字段当「没拉到」，不能当成「清单是空的」", async () => {
+  // 🔴 与 fetchCampaigns 的 BAD_ITEMS 同一个坑：`[]` 是「确实一个模型都没有」，
+  //    字段缺失是「这次没拿到」。混为一谈时后者会把用户的模型选择器清空。
+  const plugin = await mod.default({}, {});
+  const real = globalThis.fetch;
   try {
-    await plugin.provider.models({ models: codeartsModels() }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
-  } catch { threw = true; } finally { globalThis.fetch = real; }
-  assert.equal(threw, true, "临时错误必须上抛");
+    globalThis.fetch = async () => new Response(JSON.stringify({ count: 0 }), { status: 200 });
+    await assert.rejects(
+      () => plugin.provider.models({ models: codeartsModels() }, { auth: { type: "api", key: AK, metadata: { sk: SK } } }),
+      /格式异常/,
+    );
+  } finally { globalThis.fetch = real; }
 });
 
 // ---------------------------------------------------------------------------
@@ -1710,9 +1724,10 @@ test("loader.fetch: 云端把某个模型标成 agent 时，它不再带福利�
   benefitDown.clear();
   const plugin = await mod.default({}, {});
   const fetchResponder = async (url) => {
-    if (String(url).includes("/gateway/config")) {
+    if (String(url).includes(BUILTIN_MODELS_PATH)) {
       return jsonResponse({
-        result: { models: [{ model_id: "deepseek-v4.1-flash", model_name: "DeepSeek", channel: "agent" }] },
+        count: 1,
+        builtinModels: [{ model_id: "deepseek-v4.1-flash", model_name: "DeepSeek", channel_source: "codearts" }],
       });
     }
     return new Response("{}", { status: 200 });
@@ -2448,86 +2463,187 @@ test("provider.models: 无凭据时回退静态列表", async () => {
   assert.deepEqual(await plugin.provider.models({ models: base }, { auth: undefined }), base);
 });
 
-test("provider.models: 云端清单覆盖并保留真实 context/output", async () => {
+/** 造一份 `/v1/model/builtin` 应答（字段照抄 2026-10-21 实测）。 */
+const builtin = (rows, extra = {}) => new Response(JSON.stringify({ count: rows.length, builtinModels: rows, ...extra }), { status: 200 });
+const bm = (model_id, o = {}) => ({ model_id, model_name: o.name ?? model_id, model_category: "文本生成", enable: true, display_enabled: true, channel_source: "codearts", supports_images: false, ...o });
+
+test("provider.models: 读的是 snap 的 /v1/model/builtin，不是已下线的 opengw /gateway/config", async () => {
+  // 🔴 这是本次改动的核心：opengw 的清单接口 2026-10-20 起永久回 4000，
+  //    「重新获取模型」从此永远拿不到新模型。必须钉死打的是 snap 那条。
   const plugin = await mod.default({}, {});
   const real = globalThis.fetch;
-  globalThis.fetch = async () => new Response(JSON.stringify({
-    result: {
-      models: [
-        { model_id: "deepseek-v4.1-flash", context_window: 1000000, max_tokens: 393216, channel: "benefit" },
-        { model_id: "GLM-5.2", context_window: 200000, max_tokens: 128000, channel: "agent" },
-      ],
-    },
-  }), { status: 200 });
+  let seenUrl;
+  globalThis.fetch = async (u) => { seenUrl = String(u); return builtin([bm("GLM-5.2")]); };
   try {
-    const base = { "GLM-5.2": { id: "GLM-5.2", name: "GLM-5.2", limit: { context: 0, output: 0 } } };
-    const r = await plugin.provider.models({ models: base }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
-    assert.equal(r["deepseek-v4.1-flash"].limit.context, 1000000);
-    // 云端 393216 是模型能力，上游 max_tokens 参数上限 65536 —— 发布前收敛
-    assert.equal(r["deepseek-v4.1-flash"].limit.output, MAX_OUTPUT_TOKENS);
-    assert.equal(r["GLM-5.2"].limit.context, 200000);
-    // 缓存按账号隔离：AK 那一层里能查到本账号的判定
+    await plugin.provider.models({ models: {} }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
+  } finally { globalThis.fetch = real; channelCache.clear(); }
+  assert.equal(seenUrl, `${SNAP_HOST}${BUILTIN_MODELS_PATH}`);
+  assert.doesNotMatch(seenUrl, /gateway\/config|opengw/);
+});
+
+test("provider.models: 云端清单里的退役模型同样被过滤掉", async () => {
+  const plugin = await mod.default({}, {});
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => builtin([
+    bm("deepseek-v4-pro-0813"),
+    bm("deepseek-v4.1-flash"),
+  ]);
+  try {
+    const r = await plugin.provider.models({ models: {} }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
+    assert.equal(r["deepseek-v4-pro-0813"], undefined, "退役模型不该被发布（否则宿主轮询到就是不带 failover 的 400）");
+    assert.ok(r["deepseek-v4.1-flash"]);
+  } finally {
+    globalThis.fetch = real;
+    channelCache.clear();
+  }
+});
+
+test("provider.models: 华为新上的模型刷新就能出现（这就是「重新获取模型」的意义）", async () => {
+  const plugin = await mod.default({}, {});
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => builtin([
+    bm("brand-new-2027", { name: "Brand New 2027" }),
+    bm("glm-5.3"),
+  ]);
+  try {
+    const r = await plugin.provider.models({ models: {} }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
+    assert.ok(r["brand-new-2027"], "上游新模型必须出现在返回里");
+    assert.equal(r["brand-new-2027"].name, "Brand New 2027", "名字取上游的 model_name");
+  } finally { globalThis.fetch = real; channelCache.clear(); }
+});
+
+test("provider.models: enable=false / display_enabled=false 的模型不发布", async () => {
+  // 实测：两个 VL 模型 display_enabled=false —— IDE 的下拉里根本不显示它们。
+  // 发布一个 IDE 都不给的模型 = 诱惑用户选中一个上游不认的 id。
+  const plugin = await mod.default({}, {});
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => builtin([
+    bm("GLM-5.2"),
+    bm("Qwen3-VL-235B", { display_enabled: false, supports_images: true }),
+    bm("kimi-k2.6-vl", { display_enabled: false, supports_images: true }),
+    bm("disabled-model", { enable: false }),
+  ]);
+  try {
+    const r = await plugin.provider.models({ models: {} }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
+    assert.ok(r["GLM-5.2"]);
+    for (const id of ["Qwen3-VL-235B", "kimi-k2.6-vl", "disabled-model"]) {
+      assert.equal(r[id], undefined, `${id} 上游说不显示/停用，就不该出现在清单里`);
+    }
+  } finally { globalThis.fetch = real; channelCache.clear(); }
+});
+
+test("provider.models: supports_images=true 也不发布成 image:true（只有 VISION_MODELS 才算）", async () => {
+  // 0.2.13/0.2.15 实测：走 magpie 的图片格式一律 406 not multimodal。
+  // 上游那个字段说的是「模型本身是多模态」，不是「这条通道收 magpie 的图」。
+  const plugin = await mod.default({}, {});
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => builtin([bm("some-vl", { supports_images: true })]);
+  try {
+    const r = await plugin.provider.models({ models: {} }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
+    const seen = hostView(r["some-vl"]);
+    assert.equal(seen.image, false, "没实测过的模型一律按不收图");
+    assert.equal(seen.imageSaid, true, "但必须**明确**说不收，不能退回「没说」");
+  } finally { globalThis.fetch = real; channelCache.clear(); }
+});
+
+test("provider.models: channel_source=codearts 写进本账号的 channel 表（走 agent 通道）", async () => {
+  const plugin = await mod.default({}, {});
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => builtin([
+    bm("glm-5.3", { channel_source: "codearts" }),
+    bm("legacy-benefit-model", { channel_source: "benefit" }),
+    bm("mystery-channel", { channel_source: "" }),
+  ]);
+  try {
+    await plugin.provider.models({ models: {} }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
     const mine = channelCache.get(AK);
-    assert.equal(mine.get("deepseek-v4.1-flash"), "benefit");
-    assert.equal(mine.get("glm-5.2"), "agent", "键统一小写");
-  } finally {
-    globalThis.fetch = real;
-    channelCache.clear();
-  }
+    assert.equal(mine.get("glm-5.3"), "agent", "channel_source=codearts → 不带福利三头");
+    assert.equal(mine.get("legacy-benefit-model"), "benefit");
+    assert.equal(mine.has("mystery-channel"), false, "空 channel_source 不记判定，留给黑名单兜底");
+  } finally { globalThis.fetch = real; channelCache.clear(); }
 });
 
-test("provider.models: 云端清单是**叠加**在静态兜底之上，不是整体替换", async () => {
-  // 🔴 回归：若实现从空对象起 `out = {}` 再填云端，静态里那些云端没返回的模型
-  //    （例如老套餐的 GLM-5.2）会从列表里消失 —— 用户可选模型凭空少一半。
+test("provider.models: 云端清单是**权威**——被上游下架的静态模型必须从选择器里消失", async () => {
+  // 🔴 与 0.2.21 之前的「叠加」语义相反，这是有意的：留着下架模型 = 让宿主继续
+  //    轮询一个 404，而 magpie 对不带额度关键词的错误不 failover（整组直接失败）。
+  //    RETIRED_MODELS 就是手工补这个洞的产物 —— 现在让云端自己说了算。
   const plugin = await mod.default({}, {});
   const real = globalThis.fetch;
-  globalThis.fetch = async () => new Response(JSON.stringify({
-    result: { models: [{ model_id: "deepseek-v4.1-flash", context_window: 1000000, max_tokens: 393216, channel: "benefit" }] },
-  }), { status: 200 });
+  globalThis.fetch = async () => builtin([bm("glm-5.3")]);
   try {
-    const base = { "GLM-5.2": { id: "GLM-5.2", name: "GLM-5.2", limit: { context: 0, output: 0 } } };
+    const base = codeartsModels();
     const r = await plugin.provider.models({ models: base }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
-    assert.ok(r["GLM-5.2"], "云端没返回的静态模型必须保留");
-    assert.equal(r["GLM-5.2"], base["GLM-5.2"], "静态条目原样保留");
-    assert.ok(r["deepseek-v4.1-flash"], "云端条目要加进来");
-  } finally {
-    globalThis.fetch = real;
-    channelCache.clear();
-  }
+    assert.ok(r["glm-5.3"]);
+    assert.equal(r["GLM-5.2"], undefined, "上游清单里没有它，就该消失");
+    assert.equal(r["openpangu-2.0-pro"], undefined);
+  } finally { globalThis.fetch = real; channelCache.clear(); }
 });
 
-test("provider.models: 云端模型带 capabilities.input.image（钩子路径不走 modalities）", async () => {
+test("provider.models: 用户自己加进配置的模型不会被云端清单抹掉", async () => {
   const plugin = await mod.default({}, {});
   const real = globalThis.fetch;
-  globalThis.fetch = async () => new Response(JSON.stringify({
-    result: {
-      models: [
-        { model_id: "deepseek-v4.1-flash", context_window: 1000000, max_tokens: 393216, channel: "benefit" },
-        { model_id: "GLM-5.2", context_window: 200000, max_tokens: 128000, channel: "agent" },
-        { model_id: "brand-new-model", context_window: 1000, max_tokens: 100, channel: "benefit" },
-      ],
-    },
-  }), { status: 200 });
+  globalThis.fetch = async () => builtin([bm("glm-5.3")]);
+  try {
+    const base = { ...codeartsModels(), "my-own-alias": { id: "my-own-alias", name: "我的别名" } };
+    const r = await plugin.provider.models({ models: base }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
+    assert.deepEqual(r["my-own-alias"], base["my-own-alias"], "不归本插件管的条目原样保留");
+    assert.ok(r["glm-5.3"]);
+  } finally { globalThis.fetch = real; channelCache.clear(); }
+});
+
+test("provider.models: 补回 capabilities.input.image（钩子路径不走 modalities）", async () => {
+  const plugin = await mod.default({}, {});
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => builtin([
+    bm("glm-5.3"),
+    bm("GLM-5.2"),
+    bm("brand-new-model"),
+  ]);
   try {
     const r = await plugin.provider.models({ models: {} }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
     // 🔴 宿主对 provider.models 的返回值是**原样采用**的，不走 modalities 转换 ——
     // 这里写 modalities 会被静默丢掉，imageSaid 永远是 false
-    for (const id of ["deepseek-v4.1-flash", "GLM-5.2"]) {
+    for (const id of ["glm-5.3", "GLM-5.2", "brand-new-model"]) {
       const seen = hostView(r[id]);
       assert.equal(seen.imageSaid, true, `${id} 必须明确声明，不能是「没说」`);
       assert.equal(seen.image, false, `${id} 实测不收图（带图 → 406 not multimodal）`);
       assert.deepEqual(seen.inputs, ["text"], `${id} 只声明文本输入`);
       assert.deepEqual(seen.outputs, ["text"]);
+      assert.equal(r[id].modalities, undefined, "这条路上 modalities 是死字段");
     }
-    assert.equal(r["deepseek-v4.1-flash"].modalities, undefined, "这条路上 modalities 是死字段");
-    // 清单里没有的模型**同样明确声明 false**：以前是「不写键」，结果宿主照发图片 → 406
-    assert.equal(hostView(r["brand-new-model"]).imageSaid, true, "清单外的模型也要明确说「不收图」");
-    assert.equal(hostView(r["brand-new-model"]).image, false);
-    assert.equal(r["brand-new-model"].modalities, undefined, "这条路上要用 capabilities 而不是 modalities");
   } finally {
     globalThis.fetch = real;
     channelCache.clear();
   }
+});
+
+test("provider.models: 内置清单没有 context_window/max_tokens 时沿用静态兜底，不猜", async () => {
+  // 实测：`/v1/model/builtin` 一个上限字段都不返回。不沿用兜底的话，limit 会变成
+  // undefined 或 0 —— 前者让宿主按默认走，后者会被当成「不设限」。
+  // 用带**非零** context 的兜底来钉：0 在两边都成立，测不出区别。
+  const plugin = await mod.default({}, {});
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => builtin([bm("glm-5.3"), bm("mystery")]);
+  try {
+    const base = codeartsModels();
+    base["glm-5.3"] = { ...base["glm-5.3"], limit: { context: 128000, output: 8192 } };
+    const r = await plugin.provider.models({ models: base }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
+    assert.equal(r["glm-5.3"].limit.context, 128000, "云端没说 → 沿用配置里已有的值");
+    assert.equal(r["glm-5.3"].limit.output, 8192);
+    assert.equal(r["mystery"].limit.context, 0, "兜底里没有的模型也不能凭空造一个正数");
+    assert.equal(r["mystery"].limit.output, undefined);
+  } finally { globalThis.fetch = real; channelCache.clear(); }
+});
+
+test("provider.models: 云端给了 max_tokens 也要收敛到参数上限", async () => {
+  const plugin = await mod.default({}, {});
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => builtin([bm("glm-5.3", { max_tokens: 393216, context_window: 1000000 })]);
+  try {
+    const r = await plugin.provider.models({ models: {} }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
+    assert.equal(r["glm-5.3"].limit.output, MAX_OUTPUT_TOKENS, "393216 是模型能力，不是参数允许的上限");
+    assert.equal(r["glm-5.3"].limit.context, 1000000);
+  } finally { globalThis.fetch = real; channelCache.clear(); }
 });
 
 test("provider.models: 换账号时清掉上一个账号的 channel 判定", async () => {
@@ -2535,9 +2651,7 @@ test("provider.models: 换账号时清掉上一个账号的 channel 判定", asy
   const real = globalThis.fetch;
   // 上一个账号留下的判定
   channelTable(AK).set("stale-model", "agent");
-  globalThis.fetch = async () => new Response(JSON.stringify({
-    result: { models: [{ model_id: "another-model", context_window: 1000, max_tokens: 100, channel: "benefit" }] },
-  }), { status: 200 });
+  globalThis.fetch = async () => builtin([bm("another-model", { channel_source: "benefit" })]);
   try {
     await plugin.provider.models({ models: {} }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
     const mine = channelCache.get(AK);
@@ -2570,12 +2684,11 @@ test("provider.models: 清单里有 null 元素不会打断整份列表", async 
   const plugin = await mod.default({}, {});
   const real = globalThis.fetch;
   globalThis.fetch = async () => new Response(JSON.stringify({
-    result: { models: [null, 42, { model_id: "good-model", context_window: 1000, max_tokens: 100, channel: "benefit" }] },
+    count: 3, builtinModels: [null, 42, bm("good-model")],
   }), { status: 200 });
   try {
     const r = await plugin.provider.models({ models: {} }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
     assert.ok(r["good-model"], "正常元素要留下来");
-    assert.equal(r["good-model"].limit.context, 1000);
   } finally {
     globalThis.fetch = real;
     channelCache.clear();
@@ -2587,14 +2700,10 @@ test("channelCache: 两个账号的通道判定互不影响", async () => {
   const real = globalThis.fetch;
   const OTHER = "LTAI5tOTHERACCOUNT";
   try {
-    globalThis.fetch = async () => new Response(JSON.stringify({
-      result: { models: [{ model_id: "m-agent", channel: "agent" }] },
-    }), { status: 200 });
+    globalThis.fetch = async () => builtin([bm("m-agent", { channel_source: "codearts" })]);
     await plugin.provider.models({ models: {} }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
 
-    globalThis.fetch = async () => new Response(JSON.stringify({
-      result: { models: [{ model_id: "m-benefit", channel: "benefit" }] },
-    }), { status: 200 });
+    globalThis.fetch = async () => builtin([bm("m-benefit", { channel_source: "benefit" })]);
     await plugin.provider.models({ models: {} }, { auth: { type: "api", key: OTHER, metadata: { sk: SK } } });
 
     assert.equal(channelTable(AK).get("m-agent"), "agent", "账号 A 的判定不能被账号 B 抹掉");
@@ -2611,10 +2720,10 @@ test("channelCache: 两个账号的通道判定互不影响", async () => {
 test("provider.models: 云端没有 limit 时不写死 0 以外的猜测值", async () => {
   const plugin = await mod.default({}, {});
   const real = globalThis.fetch;
-  globalThis.fetch = async () => new Response(JSON.stringify({ result: { models: [{ model_id: "mystery" }] } }), { status: 200 });
+  globalThis.fetch = async () => builtin([bm("mystery"), bm("mystery-shown")]);
   try {
     const r = await plugin.provider.models({ models: {} }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
-    assert.equal(r.mystery.limit.context, undefined);
+    assert.equal(r.mystery.limit.context, 0, "0 = 不设限，是唯一诚实的默认值");
     assert.equal(r.mystery.limit.output, undefined);
   } finally {
     globalThis.fetch = real;
@@ -2640,7 +2749,7 @@ test("签到链上没有任何一处另设更长的超时，且共用同一条 d
   // 扫描范围必须覆盖真正发请求的那些函数，而不只是钩子这一小段：
   // opsClaim / opsConfirm / checkinFlow 里塞个 30s 以前是扫不到的。
   const from = src.indexOf("function opsClaim(");
-  const to = src.indexOf("async function fetchBenefitModels(");
+  const to = src.indexOf("async function fetchBuiltinModels(");
   assert.ok(from > 0 && to > from, "扫描范围没找到，检查函数名是否改了");
   const chain = src.slice(from, to);
   assert.ok(!/timeout\s*:/.test(chain), "签到链上不该给单个请求另设超时（会越过宿主 20s）");

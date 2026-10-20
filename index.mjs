@@ -11,7 +11,8 @@
  * - 对话：POST snap-access /api/v2/chat/completions（OpenAI chat 形态，body 原样转发）
  *   · 福利模型（benefit）必须附加 maas_type/model-id/model-name 三个头并参与签名
  *   · 老套餐模型（AgentCenter）不能带这三个头（上游报 unsupported model）
- * - 模型清单：GET opengw /api/v1/gateway/config（福利）+ 内置兜底（老套餐）
+ * - 模型清单：GET snap-access /v1/model/builtin（与 IDE 模型下拉同源，实时）
+ *   · opengw 的 `/api/v1/gateway/config` 自 2026-10-20 起固定 4000，已不再使用
  *
  * 协议事实来源：codearts2api（cnb.cool/itq5）与 Johnsheng1/codearts2api 的逆向实测记录。
  * 基于 MIT 开源协议与社区逆向成果，详见 README 致谢节。
@@ -60,7 +61,8 @@ const CHAT_PATH = "/api/v2/chat/completions";
 const OPENGW_HOST = "https://opengw.developer.huaweicloud.com";
 const CLAIM_PATH = "/api/v1/benefit/claim";
 const BALANCE_PATH = "/api/v1/user/tokens/balance";
-const CONFIG_PATH = "/api/v1/gateway/config";
+/** 内置模型清单（snap 侧，与 IDE 模型下拉同一份数据）—— 见 fetchBuiltinModels。 */
+const BUILTIN_MODELS_PATH = "/v1/model/builtin";
 
 /**
  * snap 引擎上的「积分」这套账（与 opengw 的免费 token 池是两本并行的账）。
@@ -214,6 +216,8 @@ const MODEL_META = {
   "glm-5.3-flash": { name: "GLM-5.3 Flash", context: 0, output: MAX_OUTPUT_TOKENS, benefit: true },
   "deepseek-v4-pro-0813": { name: "DeepSeek V4 Pro", context: 0, output: MAX_OUTPUT_TOKENS, benefit: true },
   "deepseek-v4-flash-0731": { name: "DeepSeek V4 Flash", context: 0, output: MAX_OUTPUT_TOKENS, benefit: true },
+  // 福利期结束后它已经转成普通通道，但**留在黑名单外**：上游哪天恢复福利，
+  // `benefit not found` 熔断器会在 TTL 后自动切回去，不需要改代码。
   "deepseek-v4.1-flash": { name: "DeepSeek V4.1 Flash", context: 0, output: MAX_OUTPUT_TOKENS, benefit: true },
   "openpangu-2.0-pro": { name: "OpenPangu 2.0 Pro", context: 0, output: MAX_OUTPUT_TOKENS, benefit: false },
   "openpangu-2.0-flash": { name: "OpenPangu 2.0 Flash", context: 0, output: MAX_OUTPUT_TOKENS, benefit: false },
@@ -851,16 +855,26 @@ async function checkinFlow(ak, sk) {
 }
 
 /**
- * 福利模型列表：result.models = [{model_id, context_window, max_tokens, channel, …}]。
+ * 内置模型清单：`{count, builtinModels: [{model_id, model_name, model_category, enable,
+ * display_enabled, provider, channel_source, supports_images, credit, …}]}`。
+ *
+ * 🔴 这是**唯一还活着的**模型清单来源（2026-10-21 实测 200）。
+ *    opengw 的 `/api/v1/gateway/config` 自 2026-10-20 起固定回
+ *    `4000 invalid channel, group not found`，再也拿不到任何模型 —— 用它等于让
+ *    「重新获取模型」永远只是个摆设（每次刷新都静默退回静态清单）。
+ *    snap 这条与 IDE 模型下拉用的是同一份数据，华为上新/下架会立刻反映出来。
  *
  * 🔴 失败**不吞**：吞成空数组会让调用方分不清「真的没有模型」和「这次没拉到」，
  * 进而把缓存清空、拿静态兜底清单去判定通道。网络/业务错误一律往上抛。
  */
-async function fetchBenefitModels(ak, sk) {
-  const r = await envelope(CONFIG_PATH, { ak, sk });
-  if (!Array.isArray(r.models)) return [];
+async function fetchBuiltinModels(ak, sk) {
+  const r = await snapEnvelope(BUILTIN_MODELS_PATH, { ak, sk });
+  // 「这次没拿到」与「确实没有模型」必须分开（同 fetchCampaigns 的 BAD_ITEMS）
+  if (!Array.isArray(r?.builtinModels)) {
+    throw Object.assign(new Error("CodeArts 内置模型清单格式异常（缺 builtinModels）"), { errorCode: "BAD_BUILTIN" });
+  }
   // 上游数组里偶尔有 null / 非对象元素，不能让它打断整份清单
-  return r.models.filter((m) => m && typeof m === "object");
+  return r.builtinModels.filter((m) => m && typeof m === "object");
 }
 
 // ---------------------------------------------------------------------------
@@ -1728,32 +1742,56 @@ export default async function codeartsPlugin(_input, options) {
           return provider.models;
         }
         try {
-          const rows = await fetchBenefitModels(ak, sk);
+          const rows = await fetchBuiltinModels(ak, sk);
           // 只替换**本账号**那一层：channel 跟账号走，留着别的账号的判定会串通道；
           // 但也不能整体清空，否则另一个账号的缓存会被这次拉取抹掉。
           // 空清单同样要替换 —— 否则本账号的旧记录会一直生效。
           const table = channelTable(ak);
           table.clear();
+          // 空清单当「这次没拉到」处理，别把用户的模型选择器清空
           if (!rows.length) return provider.models;
-          const out = { ...provider.models };
+
+          // 🔴 云端清单是**权威**，不是叠加：华为下架的模型必须从选择器里消失。
+          //    留着它 = 让宿主继续轮询一个 404，而 magpie 对不带额度关键词的 400/404
+          //    不 failover（整组直接失败）—— RETIRED_MODELS 就是手工补这个洞的。
+          //    只保留本插件没管过的条目（用户自己往配置里加的），别一起抹掉。
+          const managed = new Set(Object.keys(MODEL_META).map((k) => k.toLowerCase()));
+          const out = {};
+          for (const [id, m] of Object.entries(provider.models ?? {})) {
+            if (!managed.has(id.toLowerCase())) out[id] = m;
+          }
+
           for (const m of rows) {
             const id = String(m.model_id ?? m.modelId ?? m.id ?? "").trim();
             if (!id) continue;
             if (modelRetired(id)) continue; // 福利没了、普通通道也不认（见 RETIRED_MODELS）
-            // 🔴 保留云端 channel：既用于本次判定，也写进本账号的 channel 表供 loader 用
-            const channel = String(m.channel ?? "").trim().toLowerCase();
-            if (channel === "agent" || channel === "benefit") table.set(id.toLowerCase(), channel);
+            // 上游自己下架/隐藏的不要发布：`enable:false` 是停用，`display_enabled:false`
+            // 是 IDE 下拉里根本不显示（现在那两个 VL 模型就是这样）。
+            // 发布一个 IDE 都不给的模型 = 让用户选中一个上游不认的 id。
+            if (m.enable === false || m.display_enabled === false) continue;
+
+            const key = id.toLowerCase();
+            // 🔴 channel_source 才是通道：`codearts` = 内置/老套餐（agent）通道，
+            //    不能带福利三头（带了回 4004 benefit not found）。opengw 的
+            //    `channel` 字段已经随网关一起没了，别再指望它。
+            const src = String(m.channel_source ?? "").trim().toLowerCase();
+            const channel = src === "codearts" || src === "agent" ? "agent" : src === "benefit" ? "benefit" : "";
+            if (channel) table.set(key, channel);
+
             out[id] = {
               name: String(m.model_name ?? m.modelName ?? m.name ?? id),
               id,
               limit: {
-                context: optNumber(m.context_window ?? m.contextWindow),
-                // 云端 max_tokens 是模型能力，可能远超上游参数上限 —— 收敛后再发布
-                output: outputLimit(m.max_tokens ?? m.maxTokens),
+                // 内置清单**不带** context_window / max_tokens：有就收敛着发，
+                // 没有就沿用静态兜底（0 = 不设限，绝不猜一个会截断上下文的数）
+                context: optNumber(m.context_window ?? m.contextWindow) ?? optNumber(provider.models?.[id]?.limit?.context) ?? 0,
+                output: outputLimit(m.max_tokens ?? m.maxTokens) ?? optNumber(provider.models?.[id]?.limit?.output),
               },
               reasoning: false,
               tool_call: true,
               // 明确声明收不收图（**不许留空**：留空 = 「没说」= 宿主照发图片 → 406）。
+              // 即使上游写着 supports_images:true 也不采信 —— 0.2.13/0.2.15 实测
+              // 走 magpie 的图片格式一律 406，唯一可信来源是 VISION_MODELS（实测过才加）。
               // 这里必须用 capabilities 而不是 modalities —— 这条钩子的返回值
               // 宿主原样采用，不走 modalities 转换（见上方说明）
               ...capabilitiesField(imageCapable(id)),
@@ -1761,12 +1799,9 @@ export default async function codeartsPlugin(_input, options) {
           }
           return out;
         } catch (e) {
-          // 权益网关**永久**下线（2026-10-20 起 `invalid channel, group not found`）
-          // 不是「这次没拉到」：每次刷新都抛一次只会刷满日志，而静态清单本来就
-          // 是对的。只有网络/临时错误才上抛给宿主记 listError。
-          if (gatewayRetired(e)) return provider.models;
           // 拉取失败：**不清缓存**（旧判定仍然是对这个账号最靠谱的信息），
-          // 并把原因抛给宿主 —— 宿主会记 listError，在提供商页显示出来
+          // 并把原因抛给宿主 —— 宿主会记 listError，在提供商页显示出来。
+          // 静态清单仍由配置钩子给出，所以刷新失败不会让选择器变空。
           throw new Error(`CodeArts 模型清单获取失败: ${redact(e?.message ?? String(e), ak, sk)}`);
         }
       },
@@ -1777,7 +1812,7 @@ export default async function codeartsPlugin(_input, options) {
 /** 测试辅助（宿主不会把它当插件调用）。 */
 export const _internal = {
   rfc3986, sdkSignedHeaders, envelope, snapEnvelope, creds, bare, parseCredential, redact,
-  claimStatus, fetchBalance, fetchBenefitModels,
+  claimStatus, fetchBalance, fetchBuiltinModels,
   fetchCredits, fetchCampaigns, pickDailyCampaign, usableCampaignId, opsClaim, opsConfirm,
   checkinPlan, checkinErrorOutcome, checkinFlow,
   startOfTodayMs, isBenefitChannel, codeartsModels, clampChatBody,
@@ -1790,5 +1825,6 @@ export const _internal = {
   sniffBenefitGone,
   SNAP_HOST, CHAT_PATH, OPENGW_HOST,
   STATS_PATH, OPS_DELIVERY_PATH, OPS_CLAIM_PATH, OPS_CONFIRM_PATH, OPS_CHANNEL,
+  BUILTIN_MODELS_PATH,
   DAILY_CAMPAIGN_TYPE, DAILY_CAMPAIGN_ID, AGENT_TYPE_HEADER,
 };
