@@ -2,8 +2,11 @@
  * magpie-codearts-auth —— magpie/OpenCode provider 插件：华为云码道 CodeArts。
  *
  * - 授权：华为云访问密钥 AK/SK（一个输入框粘贴 "AK:SK"，SDK-HMAC-SHA256 签名）
- * - 每日签到：POST opengw /api/v1/benefit/claim（auth.checkin，magpie ≥ v0.1.1083）
- * - 免费额度：GET /api/v1/user/tokens/balance（auth.usage）
+ * - 每日签到：GET /v1/ops/delivery?channel=IDE → POST /v1/ops/claim → POST /v1/ops/confirm
+ *   （auth.checkin；领的是**积分**，每日 1000，与下面的免费 Token 池是两本并行的账）
+ * - 积分余额：GET snap-manager /snap-manager/v1/statistics/plugin（auth.usage）
+ * - 免费额度：GET opengw /api/v1/user/tokens/balance（2026-10-20 起网关整组下线，
+ *   能拿到才展示 —— 它是另一本账：每日 1000 万 token 池，与积分互不相通）
  * - 对话：POST snap-access /api/v2/chat/completions（OpenAI chat 形态，body 原样转发）
  *   · 福利模型（benefit）必须附加 maas_type/model-id/model-name 三个头并参与签名
  *   · 老套餐模型（AgentCenter）不能带这三个头（上游报 unsupported model）
@@ -32,6 +35,17 @@
  *    `amount / limit` 渲染），`unit` 是 tokens 不是积分（与控制台的积分是两种货币）。
  * ⑥ 模型 context/output 不再猜（猜出来的正数会被宿主当成硬上限，把长上下文截断）。
  * ⑦ 签到状态窗口不再填满 100%（`aside` 虽已免责路由，但满格红条会被误读成额度用尽）。
+ *
+ * --- 0.2.17：签到/余额搬回 snap 侧的两本账（详见 README「0.2.17」节） ---
+ * ⑧ 此前把「限时福利」的 `POST opengw /api/v1/benefit/claim` 当成了签到 —— 那是
+ *    **每日 1000 万免费 token 池**，不是积分。真正的每日签到领 1000 积分在 snap 引擎上：
+ *    `GET /v1/ops/delivery?channel=IDE` 看活动状态 → `POST /v1/ops/claim` 领 →
+ *    `POST /v1/ops/confirm` 确认（三步，缺 confirm 会卡在 CLAIMED）。
+ * ⑨ 积分余额读 `GET /snap-manager/v1/statistics/plugin` 的
+ *    `usageTotalPackageCredit.package_credit_remain`。**前缀必须带 `snap-manager`**
+ *    （与 `/v1/ops/*` 相反，混用是此前 12 条候选路径全部扫不到的原因）。
+ * ⑩ 可选头 `agent-type: PromptCenter` 用小写且参与签名 —— 大写的 `Agent-Type`
+ *    在 APIG 眼里是系统头，不入签名会 401 APIG.0301（实测）。
  */
 
 import { createHash, createHmac } from "node:crypto";
@@ -46,6 +60,59 @@ const OPENGW_HOST = "https://opengw.developer.huaweicloud.com";
 const CLAIM_PATH = "/api/v1/benefit/claim";
 const BALANCE_PATH = "/api/v1/user/tokens/balance";
 const CONFIG_PATH = "/api/v1/gateway/config";
+
+/**
+ * snap 引擎上的「积分」这套账（与 opengw 的免费 token 池是两本并行的账）。
+ *
+ * 🔴 前缀是这个接口最容易踩的坑：这三条 `snap-manager` 前缀**必须带**，
+ *    而 `/v1/ops/*` 那三条**必须不带** —— 混起来就是 `APIG.0101 The API does not
+ *    exist or has not been published in the environment`（此前扫不到签到接口的根因）。
+ */
+const STATS_PATH = "/snap-manager/v1/statistics/plugin"; // 积分余额 / 套餐到期
+const OPS_DELIVERY_PATH = "/v1/ops/delivery"; // 活动清单（签到状态预检）
+const OPS_CLAIM_PATH = "/v1/ops/claim"; // 领取（积分此时即到账）
+const OPS_CONFIRM_PATH = "/v1/ops/confirm"; // 确认（把 CLAIMED 推进到 CONFIRMED）
+
+/** 渠道：IDE = 码道客户端/插件（网页端用 WEB）。 */
+const OPS_CHANNEL = "IDE";
+
+/**
+ * 每日签到活动的身份。`campaignId` 有时会变，所以**按 type 认**，
+ * 只有 type 缺失时才回落到这个 id（见 pickDailyCampaign）。
+ */
+const DAILY_CAMPAIGN_TYPE = "USER_LOGIN";
+const DAILY_CAMPAIGN_ID = 1;
+
+/**
+ * snap 侧的可选头。🔴 必须用小写 `agent-type` **并参与签名**：
+ * 大写的 `Agent-Type` 在 APIG 眼里是系统头，不入 SignedHeaders 直接
+ * 401 `APIG.0301 verify ak sk signature fail`（实测；小写不签也能过，
+ * 但签上更稳，上游收紧策略时也不会把我们打成未签名请求）。
+ */
+const AGENT_TYPE_HEADER = { "agent-type": "PromptCenter" };
+
+/**
+ * snap 侧请求的单次超时。
+ *
+ * 🔴 这是**总预算**问题，不是单个请求的问题：宿主给 `auth.usage` / `auth.checkin`
+ *    钩子的 context 只有 20 秒（`context.WithTimeout(ctx, 20*time.Second)`），而
+ *    签到一次要串 2~3 个请求（delivery → claim → confirm），usage 一次要打两个账
+ *    接口。opengw 那边给的 12 秒是单请求时代的余量，照抄到这里就会超预算：
+ *    3 × 12 = 36 秒，宿主先放弃、插件后报错。
+ *
+ *    实测这一侧快得多（delivery 145~180ms、statistics 233~1440ms、claim/confirm 同量级），
+ *    6 秒已有 4 倍余量；usage 的两个账接口改成并行，最坏也就一个超时。
+ */
+const SNAP_TIMEOUT_MS = 6_000;
+
+/**
+ * 签到这一次调用的内部预算。
+ *
+ * 宿主给 20 秒，这里只用到 17 秒：留 3 秒给宿主自己的序列化/落库。
+ * 超预算就不再「顺手补确认」（那是可选的收尾动作），但**一定会**把已经拿到的
+ * 结论准时返回 —— 报出结果比多做一次写请求重要。
+ */
+const CHECKIN_BUDGET_MS = 17_000;
 
 /**
  * 老套餐（AgentCenter）模型 —— **黑名单语义**：
@@ -493,25 +560,250 @@ async function envelope(path, { method = "GET", body, ak, sk, timeout = 12_000 }
 }
 
 /**
- * GET 同路径的历史用途：参考实现把它当作「签到状态」。
+ * snap 引擎的请求（积分账 / 活动 / 领取 / 确认都走这里）。
  *
- * 🔴 实测（2026-10）：`result.create_time` **不是**签到时间 —— 它与同一响应的
- *    `update_time` 逐字节相同，落在账号首次登录的时刻，且 8 种请求变体都没有
- *    让它推进过一次。它读不出「今天签没签」。插件里已经没有地方再依赖它，
- *    保留导出只是为了让测试与外部探针还能读到原始响应。
+ * 与 `envelope`（opengw）的三点不同，都是实测踩出来的：
+ *   ① 带可选头 `agent-type`（小写，参与签名，见 AGENT_TYPE_HEADER）；
+ *   ② 两种信封并存 —— `/v1/ops/*` 是 `{code, message, data}`（业务码走 HTTP 200），
+ *      `/snap-manager/v1/statistics/plugin` 是**裸对象**。这里按顶层有没有 `code` 分派；
+ *   ③ APIG 的失败是 HTTP 401/404 + `error_code`（APIG.0101 前缀错、APIG.0301 签名、
+ *      APIG.0602 凭据过期），要连着 errorCode 一起抛出去给 checkinErrorOutcome 判。
+ *
+ * 🔴 APIG.0301 的兜底重发：这次抓到的是「大写 Agent-Type 未签名」会被拒。
+ *    万一上游改成「小写也不许签」，我们去掉这个可选头再发一次就能自愈 ——
+ *    它是可选头，去掉不影响语义。
  */
-async function claimStatus(ak, sk) {
-  return envelope(CLAIM_PATH, { ak, sk });
+async function snapEnvelope(path, { method = "GET", body, ak, sk, query, timeout = SNAP_TIMEOUT_MS } = {}) {
+  const url = new URL(`${SNAP_HOST}${path}`);
+  for (const [k, v] of Object.entries(query ?? {})) url.searchParams.set(k, String(v));
+  const href = url.toString();
+  const bodyStr = body !== undefined ? JSON.stringify(body) : "";
+  const send = (extra) => {
+    const target = extra ? sdkSignedHeaders(method, href, bodyStr, ak, sk, extra) : sdkSignedHeaders(method, href, bodyStr, ak, sk);
+    return fetch(href, {
+      method,
+      headers: target,
+      ...(bodyStr ? { body: bodyStr } : {}),
+      signal: AbortSignal.timeout(timeout),
+    });
+  };
+  let res, text;
+  try {
+    res = await send(AGENT_TYPE_HEADER);
+    text = await res.text();
+    if (res.status === 401 && text.includes("APIG.0301")) {
+      res = await send(null);
+      text = await res.text();
+    }
+  } catch (cause) {
+    throw Object.assign(new Error(`CodeArts 请求失败: ${redact(cause?.message ?? String(cause), ak, sk)}`), { cause });
+  }
+  let data;
+  try { data = text ? JSON.parse(text) : undefined; } catch { data = undefined; }
+  if (res.status !== 200 || !data) {
+    throw Object.assign(
+      new Error(`CodeArts ${path} HTTP ${res.status}: ${redact(text.slice(0, 200), ak, sk)}`),
+      { errorCode: data?.error_code },
+    );
+  }
+  // `/v1/ops/*` 信封：code 可能是数字 0 也可能是字符串 "0"（业务码一律走 HTTP 200）
+  if (data.code !== undefined) {
+    if (Number(data.code) !== 0) {
+      throw Object.assign(new Error(`CodeArts ${path} 业务错误 ${data.code}: ${redact(data.message ?? "", ak, sk)}`), {
+        errorCode: String(data.code),
+      });
+    }
+    return data.data ?? {};
+  }
+  return data;
 }
 
-/** 签到领取当日免费额度（服务端按天幂等）。 */
-function claimToday(ak, sk) {
-  return envelope(CLAIM_PATH, { method: "POST", ak, sk });
+/** opengw 的 POST /api/v1/benefit/claim 旧路径已不再用于签到（见 README 0.2.17）。 */
+async function claimStatus(ak, sk) {
+  return envelope(CLAIM_PATH, { ak, sk });
 }
 
 /** 免费额度余额：{total_quota, total_balance, used_amount, …}。 */
 function fetchBalance(ak, sk) {
   return envelope(BALANCE_PATH, { ak, sk });
+}
+
+/**
+ * 积分账：`{remain, amount, used, expiring, packages[], endDate, packageName, isCreditPackage}`。
+ *
+ * 🔴 只认 `usageTotalPackageCredit` 这一个总数。`usageBasicPackageCredit` /
+ *    `usageOnDemandPackageCredit` / `usageBonusPackageCredit` 是它的**构成明细**，
+ *    相加即重复计算（实测：500 + 0 + 12000 = 12500 = 总数）。
+ *    数值本身就是积分，不要再套「1 积分 = 10000 token」的折算 —— 那条只适用于
+ *    每日 token 池，套到这里会把 12000 积分算成 1.2 亿。
+ */
+async function fetchCredits(ak, sk) {
+  const r = await snapEnvelope(STATS_PATH, { ak, sk });
+  const metrics = (Array.isArray(r.metrics) ? r.metrics : []).filter((m) => m && typeof m === "object");
+  const by = (name) => metrics.find((m) => m.name === name) ?? {};
+  const total = by("usageTotalPackageCredit");
+  const packages = [
+    ["基础积分", "usageBasicPackageCredit"],
+    ["按需积分", "usageOnDemandPackageCredit"],
+    ["福利积分", "usageBonusPackageCredit"],
+  ]
+    .map(([name, key]) => {
+      const m = by(key);
+      return { name, amount: num(m.package_credit_amount), used: num(m.package_credit_used), remain: num(m.package_credit_remain) };
+    })
+    .filter((p) => p.amount !== undefined && p.amount > 0);
+  return {
+    remain: num(total.package_credit_remain),
+    amount: num(total.package_credit_amount),
+    used: num(total.package_credit_used),
+    expiring: num(total.package_credit_expiring_amount),
+    packages,
+    endDate: typeof r.end_date === "string" ? r.end_date : undefined,
+    packageName: r.package?.package_name_cn ?? r.package?.package_name_en,
+    // 非积分账户（旧的 Token 计费）拿不到这一项，此时上面几个字段全是 undefined
+    isCreditPackage: r.package?.is_credit_package !== false,
+  };
+}
+
+/** 活动清单（含每日签到的 claimable / status，是幂等预检的唯一真相源）。 */
+async function fetchCampaigns(ak, sk) {
+  const d = await snapEnvelope(OPS_DELIVERY_PATH, { ak, sk, query: { channel: OPS_CHANNEL } });
+  if (!Array.isArray(d.items)) return [];
+  return d.items.filter((i) => i && typeof i === "object");
+}
+
+/**
+ * 活动号必须是正整数才算可用。
+ *
+ * 🔴 两种坏值都必须挡住，否则会发出一个**会被静默丢弃字段**的写请求：
+ *    undefined → `JSON.stringify({campaignId: undefined})` 里那个键直接消失，
+ *    上游只看到缺参数；null → 发出去的是 `{"campaignId":null}`。
+ *    两种都不是「业务失败」，而是我们自己造出来的畸形请求。
+ */
+function usableCampaignId(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+/**
+ * 挑出每日签到那一条：**按 type 认**，不按标题（标题会被上游改文案）。
+ * campaignId 只在 type 缺失时兜底；没有可用活动号的一律不选（见 usableCampaignId）。
+ */
+function pickDailyCampaign(items) {
+  const list = (Array.isArray(items) ? items : []).filter((i) => i && usableCampaignId(i?.campaignId) !== undefined);
+  const wanted = DAILY_CAMPAIGN_TYPE.toUpperCase();
+  return (
+    list.find((i) => String(i?.type ?? "").toUpperCase() === wanted) ??
+    list.find((i) => usableCampaignId(i?.campaignId) === DAILY_CAMPAIGN_ID) ??
+    null
+  );
+}
+
+/** 领取（积分在 claim 这一步就到账，confirm 只推进状态）。 */
+function opsClaim(ak, sk, campaignId, now = Date.now()) {
+  const id = usableCampaignId(campaignId);
+  if (id === undefined) throw new Error("CodeArts 活动号缺失或非法，无法领取");
+  return snapEnvelope(OPS_CLAIM_PATH, {
+    method: "POST",
+    ak,
+    sk,
+    body: { campaignId: id, channel: OPS_CHANNEL, idempotentKey: `claim_${id}_${now}` },
+  });
+}
+
+/** 确认 —— 不带 channel、不带 idempotentKey（带了 channel 会 HTTP 400）。 */
+function opsConfirm(ak, sk, campaignId) {
+  const id = usableCampaignId(campaignId);
+  if (id === undefined) throw new Error("CodeArts 活动号缺失或非法，无法确认");
+  return snapEnvelope(OPS_CONFIRM_PATH, { method: "POST", ak, sk, body: { campaignId: id } });
+}
+
+/**
+ * 走一遍每日签到：查活动 → 按状态决定 claim / confirm → 返回 magpie 契约。
+ *
+ * 顺手把其它卡在 CLAIMED 的活动补上 confirm（例如「新用户注册送 4000 积分」：
+ * 上游是 AUTO_GRANT，发放后停在 CLAIMED，等客户端确认）。积分在 claim 时就已到账，
+ * confirm 只是把状态推进到 CONFIRMED，所以这一步不会多发也不会少发；
+ * 失败只忽略，不影响签到本身的结论。
+ */
+async function checkinFlow(ak, sk) {
+  const startedAt = Date.now();
+  const items = await fetchCampaigns(ak, sk);
+  const daily = pickDailyCampaign(items);
+  const plan = checkinPlan(daily);
+  const confirmed = [];
+  // 补确认是「顺手做的好事」，不能拖垮签到本身：宿主只给 20 秒，走到那一步时
+  // delivery + claim + confirm 已经花掉一部分。留 SNAP_TIMEOUT_MS 的余量，
+  // 装不下就这轮不补，下一轮签到会再试（状态仍是 CLAIMED）。
+  const canSpendOneMore = () => Date.now() - startedAt + SNAP_TIMEOUT_MS <= CHECKIN_BUDGET_MS;
+
+  // 把结果按 magpie 契约裁齐（只留 outcome / credit / message）：
+  // 宿主不认的字段不进契约，给用户看的信息一律并进 message。
+  const finish = (r) => {
+    const suffix = confirmed.length ? `（另补确认 ${confirmed.reduce((a, b) => a + b, 0)} 积分）` : "";
+    return {
+      outcome: r.outcome,
+      ...(r.credit !== undefined ? { credit: r.credit } : {}),
+      message: `${r.message ?? ""}${suffix}`,
+    };
+  };
+
+  const confirmStrays = async () => {
+    const strays = items.filter(
+      (i) =>
+        i &&
+        i !== daily &&
+        String(i.status ?? "").toUpperCase() === "CLAIMED" &&
+        usableCampaignId(i?.campaignId) !== undefined,
+    );
+    for (const c of strays) {
+      if (!canSpendOneMore()) break; // 预算用完就不补了，下一轮再试
+      try {
+        await opsConfirm(ak, sk, c.campaignId);
+        confirmed.push(num(c.benefitAmount) ?? num(c.pendingTotalAmount) ?? 0);
+      } catch {
+        // 拿不到就不拿：这本来是客户端的收尾动作，失败了下次签到再补
+      }
+    }
+  };
+
+  if (plan.action === "claim") {
+    let claimed;
+    try {
+      claimed = await opsClaim(ak, sk, daily.campaignId);
+    } catch (e) {
+      return checkinErrorOutcome(e, plan, "claim");
+    }
+    // 领到之后**一律**补一次 confirm。上游确实会要求补（那时 data.id 非空），
+    // 但 `id` 只是「服务端要求」的提示，不能当唯一依据：字段缺失时漏掉这一步，
+    // 活动就卡在 CLAIMED（积分已到账但状态不是终态）。没有待确认记录时
+    // confirm 回 40001「该活动没有可确认的权益记录」，属于正常，忽略即可。
+    try {
+      await opsConfirm(ak, sk, daily.campaignId);
+    } catch {
+      // 积分在 claim 时已到账；确认失败下一轮签到会按 CLAIMED 再补
+    }
+    await confirmStrays();
+    return finish({
+      outcome: "claimed",
+      credit: num(claimed?.benefitAmount) ?? num(claimed?.credit) ?? num(claimed?.credits) ?? plan.credit,
+      message: "已领取今日签到积分",
+    });
+  }
+
+  if (plan.action === "confirm") {
+    try {
+      await opsConfirm(ak, sk, daily.campaignId);
+    } catch (e) {
+      return checkinErrorOutcome(e, plan, "confirm");
+    }
+    await confirmStrays();
+    return finish({ outcome: "done", credit: plan.credit, message: "今日已签到（补确认）" });
+  }
+
+  // action === "none"：已签或不在活动期，仍然把别处卡住的确认补掉
+  await confirmStrays();
+  return finish({ outcome: plan.outcome, credit: plan.credit, message: plan.message });
 }
 
 /**
@@ -934,51 +1226,77 @@ function startOfTodayMs(now = Date.now()) {
 }
 
 /**
- * 签到结果 → magpie checkin 契约 {outcome, credit?, streak?, message?}。
- * outcome 必须是 claimed | done | ineligible | inactive | captcha | failed 之一；
- * 非枚举值会被宿主归一为 failed 并在 message 里附「the plugin answered no outcome」。
+ * 每日签到的四态 → 该做什么。**纯函数**，写请求由调用方按 action 发起。
  *
- * 🔴 2026-10 实测推翻了这个接口的旧理解：`result.create_time` **不是**最近签到
- *    时间。两个真实账号上它与同一响应的 `update_time` 逐字节相同，且分别落在
- *    「首次登录码道」「更早」的时刻；随后连续 8 种不同请求（header / body /
- *    query 变体，含 maas_type、x-ot-session-id、JSON body）全返回同一个值，
- *    一次都没有推进。它是账号/权益记录的**创建**时间。
- *
- *    把它当签到时间戳，后果是每天都会判成「未推进」→ ineligible，宿主 UI 与
- *    卡片上就永远写着「未签」。上游也没有第二个接口能读到签到状态（把
- *    /api/v1/benefit/* 与 /api/v1/user/* 的 12 个候选路径全扫过，除 claim 与
- *    tokens/balance 外一律 404 APIG.0101），控制台的积分是另一种货币，
- *    这里读不到。
- *
- *    所以：能确定的只有「POST 得到 error_code 0000」。按服务端按天幂等来算，
- *    这就是今天已签 —— 报 done，不编造积分数量，也不报一个假的「未签」。
- *    拿不到任何回答（网络/超时）才是 failed，交给宿主 30 分钟后重试。
+ * 上游 `status` 是一个状态机，四个值各有各的动作（照抄客户端语义）：
+ *   ELIGIBLE  → 还没领：claim（+ 服务端要 confirm 就补 confirm）
+ *   CLAIMED   → **已领但未确认，不是终态**：只补 confirm，绝不能当「今天已签」跳过
+ *   CONFIRMED / CONSUMED → 真已签：不碰写接口
+ *   null / 其它 → 活动不在期（未开始、已过期、账号不在范围）
+ * 漏掉中间那行，签到会永远卡在 CLAIMED —— 积分其实已到账，但活动一直显示没签完。
  */
-function checkinOutcome(posted, createMs, err) {
-  if (posted) {
-    // POST 已受理。create_time 与签到无关（见上），不据它判失败。
-    // credit 不报：上游没有任何字段说这次发了多少，编一个数就是撒谎。
-    return { outcome: "done", message: "今日签到已受理" };
+function checkinPlan(daily) {
+  if (!daily) return { action: "none", outcome: "ineligible", message: "上游没有每日签到活动" };
+  const credit = num(daily.benefitAmount) ?? num(daily.amount);
+  const status = String(daily.status ?? "").toUpperCase();
+  if (status === "ELIGIBLE") {
+    // claimable=false 而 status=ELIGIBLE：服务端自相矛盾（正常是已签才 false）。
+    // 不猜、不硬领，交给宿主下一轮重试。
+    if (daily.claimable === false) {
+      return { action: "none", outcome: "failed", message: "签到可领但服务端标记不可领，稍后重试" };
+    }
+    return { action: "claim", credit };
   }
+  if (status === "CLAIMED") return { action: "confirm", credit };
+  if (status === "CONFIRMED" || status === "CONSUMED") {
+    return { action: "none", outcome: "done", credit, message: "今日已签到" };
+  }
+  return { action: "none", outcome: "ineligible", message: "当前不在签到活动期内" };
+}
+
+/**
+ * 写请求失败 → magpie checkin 契约。outcome 必须是
+ * claimed | done | ineligible | inactive | captcha | failed 之一，非枚举值会被
+ * 宿主归一成 failed 并附一句「the plugin answered no outcome」。
+ *
+ * 🔴 业务码一律走 HTTP 200，所以判定必须看 `errorCode`（snapEnvelope 已从
+ *    信封的 `code` 或 APIG 的 `error_code` 里取出来），不能只看 HTTP 状态。
+ *
+ * 🔴 `40001` 是**同一个码两种含义**，必须按 `kind` 分开：
+ *    claim  回 40001 = 「尚未到达权益刷新时间」= 今天这轮已经领过了 → done
+ *    confirm 回 40001 = 「该活动没有可确认的权益记录」= 压根没有待确认的东西 → done
+ *    混在一起写会把「确认失败」说成「已签到」，状态卡在 CLAIMED 而宿主不再重试。
+ */
+function checkinErrorOutcome(err, plan = {}, kind = "claim") {
   const code = String(err?.errorCode ?? "");
   const msg = String(err?.message ?? "");
-  // 权益网关整个没了（2026-10-20 实测：`invalid channel, group not found`，
-  // 余额 / 领取 / 清单三个接口同时这样回）。活动已下线，不是「这次没签上」，
-  // 报 ineligible 让宿主别再每 30 分钟重试一次必死的请求。
-  if (gatewayRetired(err) || benefitGone(msg)) {
-    return { outcome: "ineligible", message: "上游权益网关已下线（福利活动结束），无需签到" };
+  if (code === "40001") {
+    return kind === "confirm"
+      ? { outcome: "done", credit: plan.credit, message: "签到已确认（服务端无待确认记录）" }
+      : { outcome: "done", credit: plan.credit, message: "今日已签到（未到下一轮刷新时间）" };
   }
-  // 活动已结束 / 不在活动期 → 不是失败，不必重试
-  if (/已结束|not\s*in\s*(the\s*)?activity|activity.*(end|expired)/i.test(msg) || code === "0004") {
-    return { outcome: "ineligible", message: "当前不在签到活动期内" };
+  // 4006 名额领完 / 40401 运营事件不存在 → 都不必重试
+  if (code === "4006" || /名额|抢完|领完/.test(msg)) {
+    return { outcome: "ineligible", message: "签到名额已被领完" };
   }
-  // 账号未开通 / 未实名 → 无需重试
-  if (/未开通|未实名|not\s*(activated|enabled|realname)/i.test(msg) || ["0401", "0403"].includes(code)) {
+  if (code === "40401" || /运营事件不存在/.test(msg)) {
+    return { outcome: "ineligible", message: "签到活动已下线" };
+  }
+  // 确认失败不丢积分（claim 时已到账），但状态会停在 CLAIMED —— 报 failed 让宿主下一轮补
+  if (kind === "confirm") {
+    return { outcome: "failed", message: `签到确认未完成，稍后重试: ${msg.slice(0, 100)}` };
+  }
+  if (/未开通|未实名|not\s*(activated|enabled|realname)/i.test(msg)) {
     return { outcome: "inactive", message: "账号未开通该权益或未实名认证" };
   }
-  // 需要验证码 → 交给用户手动完成
   if (/captcha|验证码|人机|robot/i.test(msg)) {
     return { outcome: "captcha", message: "需要人机验证，请到华为云控制台手动签到" };
+  }
+  if (code === "APIG.0602" || /Invalid token|token.*expired/i.test(msg)) {
+    return { outcome: "failed", message: "凭据已失效，请重新登录" };
+  }
+  if (code === "APIG.0301" || /signature fail|验签/i.test(msg)) {
+    return { outcome: "failed", message: "签名校验失败，请检查 AK/SK" };
   }
   if (err) return { outcome: "failed", message: `签到失败: ${msg.slice(0, 120)}` };
   return { outcome: "failed", message: "签到未生效，请重试或检查账号" };
@@ -1189,56 +1507,96 @@ export default async function codeartsPlugin(_input, options) {
           const auth = await getAuth();
           if (auth?.type !== "api" || !auth.key) return { error: "未登录", windows: [] };
           ({ ak, sk } = creds(auth));
-          const bal = await fetchBalance(ak, sk).catch(() => null);
-          // 🔴 权益网关下线时（`invalid channel, group not found`）余额接口只会一直
-          //    返回空，别让卡片上只写一句「失败」。给出可读的原因，路由不受影响
-          //    —— 这个钩子只影响展示。
-          if (!bal) return { error: "额度接口无数据（上游权益网关可能已下线）", windows: [] };
-          // 🔴 以前这里还会 GET 一次 claim 端点来判断「今日已签」，依据是
-          //    create_time —— 那是权益记录的创建时间，从不随签到推进（见
-          //    checkinOutcome 注释），于是每张卡片上永远写着「今日未签」。
-          //    宿主本来就把签到结果放在卡片上（SubscriptionQuota.checkin，
-          //    来自 plugin-checkin.json 里插件钩子的真实回答）。插件再画一行
-          //    自己的判断，既和宿主打架、又是错的，这次读也没有任何用处。
-          // 字段名在不同响应里不完全一致：优先 total_*，回退 daily_*，再回退互相反推
-          const quota = num(bal.total_quota) ?? num(bal.daily_token_limit);
-          let usedAbs = num(bal.used_amount) ?? num(bal.daily_tokens_used);
-          let left = num(bal.total_balance);
-          if (usedAbs === undefined && quota !== undefined && left !== undefined) usedAbs = quota - left;
-          if (left === undefined && quota !== undefined && usedAbs !== undefined) left = quota - usedAbs;
-          // 上游偶尔会给出「已用 > 总量」或负余额（跨天/统计滞后）。数值不能为负，
-          // 否则宿主会把 used 画成负百分比、显示成「剩得比总量还多」。
-          if (usedAbs !== undefined && usedAbs < 0) usedAbs = 0;
-          if (left !== undefined && left < 0) left = 0;
-          if (quota !== undefined && usedAbs !== undefined && usedAbs > quota) usedAbs = quota;
-
-          // 🔴 magpie 的 window 语义（对照宿主源码与社区插件约定，勿改）：
-          //   used   = **已用百分比**（0~100+），宿主直接渲染成 "N%"
-          //   amount = **已用**的绝对值，宿主 quotaCount() 渲染成 "amount / limit"
-          //   limit  = 绝对值总量
-          //   unit   = 计量单位，拼在数字后面
-          //   aside  = 只展示，不参与路由，也不参与「用尽」判定
-          // 曾把 used 填成绝对值（显示 299530%），又把 amount 填成「剩余」
-          // （于是 "7819948 / 10000000" 被读成「已用 78%」，而真实已用是 21.8%）。
-          const window = { name: "每日免费 Token", used: 0, unit: "tokens" };
-          if (quota !== undefined && quota > 0) {
-            if (usedAbs !== undefined) {
-              window.used = round1((usedAbs / quota) * 100);
-              window.amount = usedAbs;
-              window.limit = quota;
-              window.display = `${Math.round(usedAbs)} / ${Math.round(quota)}`;
-            } else if (left !== undefined) {
-              window.display = `${Math.round(left)} tokens`;
+          const windows = [];
+          // ① 积分账（snap-manager）：这才是「每日签到 +1000 积分」攒起来的那本账，
+          //    用户控制台上看到的 12000+ 就是它。
+          // 🔴 两本账**并行**取：串行时最坏是「积分超时 + token 池超时」= 24 秒，
+          //    超过宿主给钩子的 20 秒预算（见 SNAP_TIMEOUT_MS 的注释）。并行后
+          //    最坏只等于单次超时。
+          let credits = null;
+          let creditsError = "";
+          const [creditsRes, bal] = await Promise.all([
+            fetchCredits(ak, sk).then(
+              (c) => ({ c }),
+              (e) => ({ e }),
+            ),
+            fetchBalance(ak, sk).catch(() => null),
+          ]);
+          if (creditsRes.c) credits = creditsRes.c;
+          else creditsError = redact(creditsRes.e?.message ?? String(creditsRes.e), ak, sk);
+          if (credits && credits.remain !== undefined) {
+            // magpie 的 window 语义（对照宿主源码与社区插件约定，勿改）：
+            //   used   = **已用百分比**（0~100+），宿主直接渲染成 "N%"
+            //   amount = **已用**的绝对值，宿主 quotaCount() 渲染成 "amount / limit"
+            //   limit  = 绝对值总量；unit = 计量单位；aside = 只展示，不参与路由
+            const w = { name: "积分", used: 0, unit: "积分" };
+            if (credits.amount !== undefined && credits.amount > 0) {
+              // 与下面 token 池那段同样的防守：上游会给负值（退积分/统计回滚）或
+              // 「剩余 > 总量」。不夹住的话宿主会把 used 画成负百分比、
+              // 把 amount/limit 画成负数，看着像「倒欠额度」。
+              let usedC = credits.used;
+              if (usedC === undefined && credits.remain !== undefined) usedC = credits.amount - credits.remain;
+              if (usedC === undefined) usedC = 0;
+              if (usedC < 0) usedC = 0;
+              if (usedC > credits.amount) usedC = credits.amount;
+              w.used = round1((usedC / credits.amount) * 100);
+              w.amount = round1(usedC);
+              w.limit = credits.amount;
+              w.display = `${round1(credits.remain ?? credits.amount - usedC)} / ${credits.amount}`;
+            } else {
+              w.display = `${round1(credits.remain)} 积分`;
             }
-          } else if (left !== undefined) {
-            window.display = `${Math.round(left)} tokens`;
+            // 套餐到期日：积分用不完同样作废（实测每账号不同），值得写在卡片上
+            if (credits.endDate) w.aside = `${credits.packageName ?? "套餐"} · 到期 ${credits.endDate}`;
+            windows.push(w);
+          } else if (credits && credits.isCreditPackage === false) {
+            creditsError = "该账号是 Token 计费账户，没有积分余额";
+          }
+          // ② 每日免费 token 池（opengw）：另一本账，福利模型走它。
+          //    2026-10-20 起上游整组下线，所以它现在是**可选**窗口 —— 拿得到才画。
+          //    （请求在开头与积分账并行发出，见上面的 Promise.all。）
+          let poolLeft;
+          if (bal) {
+            // 字段名在不同响应里不完全一致：优先 total_*，回退 daily_*，再回退互相反推
+            const quota = num(bal.total_quota) ?? num(bal.daily_token_limit);
+            let usedAbs = num(bal.used_amount) ?? num(bal.daily_tokens_used);
+            let left = num(bal.total_balance);
+            if (usedAbs === undefined && quota !== undefined && left !== undefined) usedAbs = quota - left;
+            if (left === undefined && quota !== undefined && usedAbs !== undefined) left = quota - usedAbs;
+            // 上游偶尔会给出「已用 > 总量」或负余额（跨天/统计滞后）。数值不能为负，
+            // 否则宿主会把 used 画成负百分比、显示成「剩得比总量还多」。
+            if (usedAbs !== undefined && usedAbs < 0) usedAbs = 0;
+            if (left !== undefined && left < 0) left = 0;
+            if (quota !== undefined && usedAbs !== undefined && usedAbs > quota) usedAbs = quota;
+            const w = { name: "每日免费 Token", used: 0, unit: "tokens" };
+            if (quota !== undefined && quota > 0 && usedAbs !== undefined) {
+              w.used = round1((usedAbs / quota) * 100);
+              w.amount = usedAbs;
+              w.limit = quota;
+              w.display = `${Math.round(usedAbs)} / ${Math.round(quota)}`;
+            } else if (left !== undefined) {
+              w.display = `${Math.round(left)} tokens`;
+            }
+            windows.push(w);
+            poolLeft = left;
+          }
+          if (!windows.length) {
+            return {
+              error: creditsError ? `额度查询失败: ${creditsError}` : "额度接口无数据（积分账与 token 池都取不到）",
+              windows: [],
+            };
           }
           return {
             // magpie 会在 balance 后面自动追加 "left"，这里只写「数量 + 单位」
-            balance: left !== undefined ? `${Math.round(left)} tokens` : "已登录",
-            // 只有额度这一个窗口。签到状态由宿主显示（它读 plugin-checkin.json
-            // 里插件钩子的真实结果），插件不再画第二个、会自相矛盾的状态行。
-            windows: [window],
+            balance:
+              credits?.remain !== undefined
+                ? `${round1(credits.remain)} 积分`
+                : poolLeft !== undefined
+                  ? `${Math.round(poolLeft)} tokens`
+                  : "已登录",
+            // 签到状态由宿主显示（它读 plugin-checkin.json 里插件钩子的真实结果），
+            // 插件不再自己画第二个、会与宿主打架的状态行。
+            windows,
           };
         } catch (e) {
           return { error: `额度查询失败: ${redact(e?.message ?? String(e), ak, sk)}`, windows: [] };
@@ -1250,19 +1608,12 @@ export default async function codeartsPlugin(_input, options) {
           const auth = await getAuth();
           if (auth?.type !== "api" || !auth.key) return { outcome: "inactive", message: "未登录" };
           const { ak, sk } = creds(auth);
-          // 🔴 不再先读一次「签到状态」：那个 GET 的 create_time 是权益记录的
-          //    创建时间，不是签到时间（见 checkinOutcome 的注释），拿它判
-          //    「今天已签」永远为假，只会白多一次往返。
-          //    POST 本身按天幂等：今天已领也返回 0000，所以重复调用无害。
-          let posted;
-          try {
-            posted = await claimToday(ak, sk);
-          } catch (e) {
-            return checkinOutcome(false, undefined, e);
-          }
-          return checkinOutcome(true, num(posted?.create_time));
+          // 签到 = snap 侧的「活动」三步（查活动 → claim → confirm），
+          // 不再碰 opengw 的福利通道 —— 那是另一本账（免费 token 池），
+          // 而且 2026-10-20 起已经整组下线（见 README 0.2.17）。
+          return await checkinFlow(ak, sk);
         } catch (e) {
-          return checkinOutcome(false, undefined, e);
+          return checkinErrorOutcome(e);
         }
       },
     },
@@ -1326,9 +1677,11 @@ export default async function codeartsPlugin(_input, options) {
 
 /** 测试辅助（宿主不会把它当插件调用）。 */
 export const _internal = {
-  rfc3986, sdkSignedHeaders, envelope, creds, bare, parseCredential, redact,
-  claimStatus, claimToday, fetchBalance, fetchBenefitModels,
-  checkinOutcome, startOfTodayMs, isBenefitChannel, codeartsModels, clampChatBody,
+  rfc3986, sdkSignedHeaders, envelope, snapEnvelope, creds, bare, parseCredential, redact,
+  claimStatus, fetchBalance, fetchBenefitModels,
+  fetchCredits, fetchCampaigns, pickDailyCampaign, usableCampaignId, opsClaim, opsConfirm,
+  checkinPlan, checkinErrorOutcome, checkinFlow,
+  startOfTodayMs, isBenefitChannel, codeartsModels, clampChatBody,
   upstreamSessionId, sessionHeaders, num, round1, optNumber, outputLimit, CN_OFFSET_MS,
   channelCache, channelTable, MODEL_META, VISION_MODELS, AGENT_MODELS, MAX_OUTPUT_TOKENS,
   RETIRED_MODELS, modelRetired,
@@ -1337,4 +1690,6 @@ export const _internal = {
   normalizeChatBody, upstreamError, normalizeChatResponse, rewriteStreamError, PEEK_MS,
   sniffBenefitGone,
   SNAP_HOST, CHAT_PATH, OPENGW_HOST,
+  STATS_PATH, OPS_DELIVERY_PATH, OPS_CLAIM_PATH, OPS_CONFIRM_PATH, OPS_CHANNEL,
+  DAILY_CAMPAIGN_TYPE, DAILY_CAMPAIGN_ID, AGENT_TYPE_HEADER,
 };

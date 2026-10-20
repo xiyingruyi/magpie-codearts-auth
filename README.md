@@ -5,8 +5,9 @@
 | 能力 | 说明 |
 |---|---|
 | 授权 | 华为云访问密钥 **AK/SK**（华为云官方 SDK-HMAC-SHA256 签名），登录时自动验证有效性 |
-| **每日签到** ⭐ | 实现 magpie 原生 `auth.checkin` 钩子（magpie ≥ v0.1.1083）——Settings → Usage → Plugins 打开 **Daily check-in**，每天每账号自动签到；签到结果由 magpie 显示在卡片与 `magpie accounts checkin` 里 |
-| 免费额度 | `auth.usage` 显示**每日免费 Token** 的已用/总量 |
+| **每日签到** ⭐ | 实现 magpie 原生 `auth.checkin` 钩子（magpie ≥ v0.1.1083）——Settings → Usage → Plugins 打开 **Daily check-in**，每天每账号自动签到领 **1000 积分**（`/v1/ops/delivery` → `claim` → `confirm`，四态状态机） |
+| **积分余额** | `auth.usage` 显示**积分**（控制台上那个 12000+ 就是它）：已用/总量 + 套餐到期日 |
+| 免费额度 | 另一本账：每日免费 Token 池（opengw，2026-10-20 起整组下线，拿得到才展示） |
 | 对话 | `POST snap-access /api/v2/chat/completions`（OpenAI 形态），按模型自动选通道 |
 | 模型 | 登录后自动同步云端模型清单（含 `channel` 字段），失败时回退内置列表；**逐模型实测声明收不收图**（见 [图片能力](#图片能力0213-实测)） |
 
@@ -14,7 +15,7 @@
 
 ```sh
 magpie plugin add github:liuxigreen/magpie-codearts-auth   # 上游原版
-magpie plugin add github:xiyingruyi/magpie-codearts-auth   # 本 fork（含 0.2.16 修复）
+magpie plugin add github:xiyingruyi/magpie-codearts-auth   # 本 fork（含 0.2.17 修复）
 magpie plugin login codearts
 magpie quota
 ```
@@ -36,36 +37,59 @@ AccessKeyId:SecretAccessKey
 > **为什么不拆成两个框？** magpie 宿主的 `api` 类型登录方法只会给一个「key」输入框，而这个框的值**不会被并进插件 `authorize(inputs)` 收到的 `inputs`**（宿主源码：`apiKey()` 里执行的是 `m.authorize(inputs ?? {})`，用户填的 key 只作为 `save()` 的兜底 `apiKey` 参数）。所以任何依赖 `inputs.key` 的插件都拿不到值。
 > 唯一可靠的做法是让需要的字段都走 `method.prompts` —— 宿主 `nextPrompt()` 会把 prompts 里各项依次问完并合并进 `inputs`。这正是本插件采用单框粘贴组合串的原因。
 
-## 每日签到
+## 每日签到（0.2.17 重写：签到领的是**积分**）
 
-- **协议**：`POST https://opengw.developer.huaweicloud.com/api/v1/benefit/claim`（空 body，AK/SK 签名，服务端按天幂等）
-- **调度**：Settings → Usage → Plugins 的 Daily check-in 开关（默认关）打开后，每天每账号自动签一次（启动 2 分钟后首查、每 30 分钟轮询，`failed` 30 分钟后重试）
-- **结果**：插件只发这一次 POST，`error_code 0000` 即「今日已受理」→ `done`。签到状态由 **magpie 宿主**显示（`SubscriptionQuota.checkin`，来自 `plugin-checkin.json` 里插件钩子的真实回答），插件不再自己画一行状态。
+码道有**两本互不相通的账**，插件以前把它们混成了一本：
 
-> **2026-10 实测：`create_time` 不是签到时间。** 旧版（≤ 0.2.11）把
-> `GET/POST /benefit/claim` 返回的 `result.create_time` 当作「最近签到时间」，据此
-> 判断今天签没签。实测两个真实账号：该值与同一响应的 `update_time` **逐字节相同**，
-> 分别落在「账号首次登录码道」和更早的时刻；随后用 8 种请求变体（不同 header、
-> body、query）连打，**一次都没有推进过**。它是账号/权益记录的**创建**时间。
->
-> 后果正是「明明开了自动签到，卡片上却一直写今日未签」：判定永远为假 → 每天报
-> `ineligible`（宿主显示「not eligible for the check-in」），卡片上那行自绘的状态
-> 也永远是「未签」。上游没有第二个接口能读到签到状态（`/api/v1/benefit/*`、
-> `/api/v1/user/*` 的 12 个候选路径扫过，除 `claim` 与 `tokens/balance` 外一律
-> 404 `APIG.0101`），控制台里的积分是另一种货币（`CREDIT`），插件读不到。
->
-> 0.2.12 起：不再从 `create_time` 推导任何结论，也不再自绘签到窗口；以「POST 被
-> 受理」为止，不编造本次积分（上游没有任何字段说发了多少）。
+| 账 | 上游接口 | 单位 | 谁用 |
+|---|---|---|---|
+| **积分账** | `GET /snap-manager/v1/statistics/plugin` | 积分（CREDIT） | 系统内置模型（GLM-5.2 / OpenPangu 等） |
+| 每日免费 Token 池 | `GET opengw /api/v1/user/tokens/balance` | tokens（1000 万/日，0 点清零） | 福利模型（deepseek-v4.1-flash…） |
+
+「**每日签到领 1000 积分**」进的是**积分账**，走 snap 引擎上的活动接口，三步：
+
+```
+① GET  /v1/ops/delivery?channel=IDE   看活动状态（幂等预检，唯一真相源）
+② POST /v1/ops/claim                  {campaignId, channel:"IDE", idempotentKey:"claim_<id>_<毫秒>"}
+③ POST /v1/ops/confirm                {campaignId}          ← 只在服务端要求时补
+```
+
+- **前缀是这套接口最大的坑**：`/v1/ops/*` **不能**带 `snap-manager`，而
+  `/snap-manager/v1/statistics/plugin` **必须**带。混用一律 `APIG.0101 The API does not
+  exist or has not been published in the environment` —— 这正是此前 12 条候选路径全部
+  扫不到签到接口的原因。
+- **可选头小写 `agent-type: PromptCenter` 且参与签名**。大写的 `Agent-Type` 在 APIG
+  眼里是系统头，不入 SignedHeaders 直接判 401 `APIG.0301`（实测）。插件还在 401
+  APIG.0301 时去掉这个可选头自动重发一次。
+- **活动状态是四态**，照抄客户端语义：`ELIGIBLE` → claim（+ 按需 confirm）；
+  `CLAIMED` = **已领但未确认，不是终态** → 只补 confirm（漏了它活动会永远卡在
+  CLAIMED）；`CONFIRMED` / `CONSUMED` → 已签，不碰写接口；`status: null` → 不在活动期。
+- **顺带补确认**：其它卡在 `CLAIMED` 的活动（例如「新用户注册送 4000 积分」，上游是
+  `AUTO_GRANT`，发放后等客户端确认）也会被一起 confirm。积分在 claim 时就已到账，
+  confirm 只推进状态，不会多发也不会少发；失败只忽略，不影响签到结论。
+- 业务码一律走 **HTTP 200**，所以判定看 `code` 不看状态码：`40001` 尚未到达权益刷新
+  时间（= 今天这轮已领）按 `done` 处理；`4006` 名额领完、`40401` 运营事件不存在 → `ineligible`。
+- **调度**：Settings → Usage → Plugins 的 Daily check-in 开关（默认关）打开后，每天每
+  账号自动签一次（启动 2 分钟后首查、每 30 分钟轮询，`failed` 30 分钟后重试）。签到状态
+  由 **magpie 宿主**显示（`SubscriptionQuota.checkin`，来自 `plugin-checkin.json` 里插件
+  钩子的真实回答），插件不再自己画一行状态。
+
+> **旧版（≤ 0.2.16）为什么错**：它把 `POST opengw /api/v1/benefit/claim` 当成了签到 ——
+> 那是**免费 token 池**的领取，不是积分。0.2.12 起虽然不再从 `create_time` 推导状态，
+> 但「福利网关 2026-10-20 整组下线」之后签到就跟着报 `ineligible`（「福利活动结束，无需
+> 签到」）—— 而**积分签到一直都在**，只是我们从没打对过接口：它挂在 snap 引擎上，前缀
+> 规则还和余额接口相反发展。上游也确有一个接口能读到签到状态，即 `/v1/ops/delivery`。
 
 插件向 magpie 返回的标准 outcome：
 
 | outcome | 触发条件 |
 |---|---|
-| `done` | POST 得到 `error_code 0000`（服务端按天幂等，含「今天已经领过」） |
-| `ineligible` | 上游明确说不在活动期 / 活动已结束 |
+| `claimed` | 本次真的领到了（`credit` = 上游给的 `benefitAmount`，实测 1000） |
+| `done` | 今天已签（`CONFIRMED`/`CONSUMED`，或 claim 回 `40001` 尚未到达刷新时间） |
+| `ineligible` | 活动不在期、活动已下线、名额领完 |
 | `inactive` | 账号未开通该权益或未实名 / 未登录 |
 | `captcha` | 需要人机验证，提示到控制台手动签到 |
-| `failed` | 网络/超时/其它错误（宿主 30 分钟后重试） |
+| `failed` | 网络/超时/签名或凭据问题（宿主 30 分钟后重试） |
 
 ## Usage 卡片字段语义（实测定论）
 
@@ -76,7 +100,7 @@ magpie 的 `usage()` window 字段，本插件按宿主源码逐条对齐：
 | `used` | **已用百分比**（0~100+，可超 100） | 直接显示为 `N%`，`>=98` 染成「spent」红条 |
 | `amount` | 该窗口的**已用**绝对量 | 与 `limit` 组合成 `amount / limit` |
 | `limit` | 绝对值总量（0 / 缺省 = 不设限） | 同上；`limit > 0` 才显示括号数字 |
-| `unit` | 计量单位文案 | 拼在数字后（这里是 `tokens`） |
+| `unit` | 计量单位文案 | 拼在数字后（积分窗口是 `积分`，token 池是 `tokens`） |
 | `aside` | `true` = 只展示，**不参与路由、不参与「用尽」判定** | 侧栏一行 |
 
 **踩坑记录一（0.2.2）**：`used` 被填成绝对值 `299530`，`magpie quota` 显示成 `299530%`。
@@ -86,10 +110,12 @@ magpie 的 `usage()` window 字段，本插件按宿主源码逐条对齐：
 `quotaCount()` 是按 `amount / limit` 当「已用」渲染的。于是明明只用了 21.8%，
 卡片却显示 `7819948 / 10000000`——看起来像「用掉了 78%」。0.2.4 改为填已用。
 
-**踩坑记录三（0.2.3，仍在）**：`total_quota = 10,000,000` 是**每日免费 Token**
-（官方口径：每位用户每日 1000 万 Tokens，当日 24:00 清零，**不与积分包互通**），
-不是积分。控制台里那一万多积分是签到/邀请/学生认证等活动发的另一种货币（`CREDIT`），
-插件没有接口去读它。0.2.4 起窗口名与单位改为 `每日免费 Token` / `tokens`，不再混称「积分」。
+**踩坑记录三（0.2.3，0.2.17 修正）**：`total_quota = 10,000,000` 是**每日免费 Token**
+（官方口径：每位用户每日 1000 万 Tokens，当日 24:00 清零，**不与积分包互通**）。当年由此
+得出「控制台里那一万多积分插件没有接口去读」——**这个结论是错的**：接口一直都在，只是
+余额有两本账，积分那本在 `GET /snap-manager/v1/statistics/plugin`，前缀必须带
+`snap-manager`（而 `/v1/ops/*` 不能带），扫候选路径时正好绕过了它。0.2.17 起两本账分开
+展示：**积分**优先（那是用户真正在控制台上看到的那个数），token 池拿得到才多画一个窗口。
 
 ### 显示成「额度用尽」的真凶（0.2.4 修复）
 
@@ -182,6 +208,73 @@ CODEARTS_AK=... CODEARTS_SK=... node scripts/probe-session.mjs <模式> [并发�
 3. **丢弃云端 `channel` 字段** —— 该字段正是上游构建 `AGENT_MODELS` 的依据；本版保留并写入运行期缓存。
 
 此外补齐了 `ineligible` / `captcha` / `inactive` 三种签到 outcome（骨架版遇到会落到 `failed` 并每 30 分钟无意义重试）。
+
+## 0.2.17（2026-10-21：签到/余额搬回 snap 侧，两本账分开展示）
+
+**起因**：用户指出「每日签到领 1000 积分一直都在，我账户积分余额 12000 多」——0.2.16
+把 opengw 福利网关下线当成了「签到活动结束」，结论完全错了。
+
+**根因：码道有两本互不相通的账，插件把 token 池当成了积分。**
+
+| 账 | 接口 | 前缀 | 实测数值 |
+|---|---|---|---|
+| **积分账** | `GET /snap-manager/v1/statistics/plugin` | **必须带** `snap-manager` | 12500 总额 / 12162.78 剩余 |
+| 每日 token 池 | `GET opengw /api/v1/user/tokens/balance` | —— | 2026-10-20 起 `4000 invalid channel, group not found` |
+
+**实测（本机两账号，2026-10-21）**：
+
+| 请求 | 结果 |
+|---|---|
+| `GET /snap-manager/v1/statistics/plugin`（头 `agent-type: PromptCenter`） | **200**，`metrics[]` 里 `usageTotalPackageCredit` = 12500 / 已用 337.22 / **剩 12162.78**，另有 `usageBasicPackageCredit` 500、`usageBonusPackageCredit` 12000 两个分项；`end_date` 2026-11-12 是**套餐到期日**（积分用不完作废） |
+| `GET /snap-manager/v1/current/user` | 200，`domain_name: xi930214890` |
+| `GET /v1/ops/delivery?channel=IDE` | **200**，`campaignId:1 "每日签到领1000积分"` type `USER_LOGIN`，账号 A `status:CONFIRMED`（今天已签）、账号 B `status:ELIGIBLE` `claimable:true` `pendingTotalAmount:1000`（今天还没签） |
+| 同路径**不带** `snap-manager`（`/v1/statistics/plugin`、`/v1/current/user`） | 404 `APIG.0101 The API does not exist or has not been published` |
+| `/v1/ops/*` **带上** `snap-manager` | 同上 404（两套前缀方向相反） |
+| 可选头写成大写 `Agent-Type` 且不入签名 | 401 `APIG.0301 verify ak sk signature fail`；小写 `agent-type` **入签名或不发**都能过 |
+| `POST /v1/ops/claim {campaignId:987654, channel:"IDE", idempotentKey:…}` | 200 `{"code":40401,"message":"运营事件不存在: 987654"}` —— 形状对，业务上不存在 |
+| 同请求**不带** `channel` | 400 `PROMPTCENTER.00000001 "channel : 参数无效"` —— `channel` 是必填 body 字段 |
+| `POST /v1/ops/confirm {campaignId:987654}` | 200 `{"code":40001,"message":"该活动没有可确认的权益记录"}` |
+
+**修法**：
+
+1. **签到改为 snap 侧三步**：`GET /v1/ops/delivery?channel=IDE` 预检 → 按四态决动作
+   （`ELIGIBLE` claim、`CLAIMED` 只补 confirm、`CONFIRMED`/`CONSUMED` 不动、`null` 不在期）
+   → `POST /v1/ops/claim` → 服务端要求时 `POST /v1/ops/confirm`。`credit` 报上游给的
+   `benefitAmount`（1000），不再是「不编造所以不报」。
+2. **顺带补确认**其它卡在 `CLAIMED` 的活动（新用户注册 4000 积分是 `AUTO_GRANT`，发放后
+   停在 CLAIMED 等确认）。claim 时积分即到账，confirm 只推进状态 —— 不会多发也不会少发。
+3. **`auth.usage` 改读积分账**：窗口 `积分`，`amount/limit` = 已用/总额，`aside` 写
+   「体验版 · 到期 2026-11-12」。token 池降级为**可选**窗口（拿得到才画），两本账不折算、
+   不混进一个数字里。
+4. **新增 `snapEnvelope`**：认两种信封（`/v1/ops/*` 是 `{code,message,data}`，统计接口是
+   **裸对象**），把 APIG 的 `error_code` 与业务 `code` 都带成 `errorCode` 抛出去；
+   401 `APIG.0301` 时去掉 `agent-type` 可选头自动重发一次。
+5. **`checkinOutcome` → `checkinPlan` + `checkinErrorOutcome`**（都是纯函数，写请求由
+   `checkinFlow` 按 action 发起）：业务码走 HTTP 200，所以判定看 `code`——
+   `40001` 按 `done`（今天这轮已领）、`4006`/`40401` → `ineligible`、`APIG.0602` 提示重新登录。
+   **`40001` 是同一个码两种含义**，按 claim/confirm 分开判（claim 那侧是「未到刷新时间」，
+   confirm 那侧是「没有待确认记录」）；confirm 的其它错误报 `failed` 让宿主下一轮补，
+   否则状态会卡在 CLAIMED 而没人再试。
+6. `claimToday` / `claimStatus` 两个 opengw 函数从签到路径上摘掉（`fetchBalance` 仍保留，
+   喂 token 池那个可选窗口）。
+
+**对抗式复核（4 个维度独立找茬 + 逐条反驳）修掉的几处**：
+
+- **不再拿 `data.id` 猜「要不要 confirm」**：领到之后**一律**补一次 confirm，失败就忽略
+  （没有待确认记录时上游回 40001，属正常）。原写法把 `id` 当唯一依据，字段缺失时活动就
+  卡在 CLAIMED（积分已到账但状态非终态）。
+- **活动号必须是正整数**：`campaignId` 为 `undefined` 时 `JSON.stringify` 会把那个键整个
+  丢掉，`null` 时会发出 `{"campaignId":null}` —— 两种都是我们自己造的畸形写请求。
+  `usableCampaignId()` 在 `pickDailyCampaign` 与 `opsClaim`/`opsConfirm` 三层都挡。
+- **积分窗口也做夹取**：上游退积分/统计回滚会给负已用或「剩余 > 总额」，不夹的话宿主
+  会画成 `-0.1%` 和倒欠（token 池那段本来就有这个防守，新路径漏了）。
+- **预算**：`SNAP_TIMEOUT_MS = 6s`（实测这一侧 p50 40ms、最慢 1.4s），usage 的两本账**并行**
+  取，签到内部 17s 预算用完就不再「顺手补确认」—— 宿主给钩子只有 20s，原来的
+  12s × 3 串行最坏 36s，会先被宿主放弃。
+
+**实测（0.2.17 通过 magpie 网关）**：`auth.usage` 返回
+`balance: 12162.8 积分`、窗口 `{"name":"积分","used":2.7,"amount":337.2,"limit":12500,"aside":"体验版 · 到期 2026-11-12"}`；
+第二个账号 `7475.7 积分`（到期 2026-11-17）。测试 188 条。
 
 ## 0.2.16（2026-10-20 晚：上游把福利通道摘了）
 

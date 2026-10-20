@@ -5,8 +5,10 @@ import { readFileSync } from "node:fs";
 
 const mod = await import("../index.mjs");
 const {
-  rfc3986, sdkSignedHeaders, creds, parseCredential, num, round1,
-  checkinOutcome, startOfTodayMs, isBenefitChannel, codeartsModels, redact, clampChatBody,
+  rfc3986, sdkSignedHeaders, envelope, snapEnvelope, creds, parseCredential, num, round1,
+  checkinPlan, checkinErrorOutcome, checkinFlow,
+  fetchCredits, fetchCampaigns, opsClaim, opsConfirm, pickDailyCampaign, usableCampaignId,
+  startOfTodayMs, isBenefitChannel, codeartsModels, redact, clampChatBody,
   outputLimit, MAX_OUTPUT_TOKENS, normalizeChatBody,
   upstreamError, normalizeChatResponse, PEEK_MS,
   upstreamSessionId, sessionHeaders, CN_OFFSET_MS,
@@ -14,6 +16,7 @@ const {
   benefitBroken, markBenefitBroken, benefitGone, gatewayRetired, benefitDown, BENEFIT_DOWN_MS,
   modalitiesField, capabilitiesField, imageCapable,
   SNAP_HOST, CHAT_PATH, OPENGW_HOST,
+  STATS_PATH, OPS_DELIVERY_PATH, OPS_CHANNEL, AGENT_TYPE_HEADER,
 } = mod._internal;
 
 const AK = "LTAI5tABCDEFGHIJKLMN";
@@ -397,31 +400,108 @@ test("sdkSignedHeaders: 会话头也参与签名后签名仍可复算", () => {
 // 签到 outcome
 // ---------------------------------------------------------------------------
 
-test("checkinOutcome: 今日已签 → done", () => {
-  assert.equal(checkinOutcome(true, startOfTodayMs() + 1000).outcome, "done");
+// ---------------------------------------------------------------------------
+// 签到：状态机（checkinPlan）
+// ---------------------------------------------------------------------------
+
+const dailyCampaign = (over = {}) => ({
+  campaignId: 1,
+  title: "每日签到领1000积分",
+  type: "USER_LOGIN",
+  benefitAmount: 1000,
+  benefitUnit: "CREDIT",
+  claimable: true,
+  status: "ELIGIBLE",
+  pendingCount: 0,
+  pendingTotalAmount: 0,
+  ...over,
 });
 
-test("checkinOutcome: 刚签到成功 → done，不编造 credit", () => {
-  const r = checkinOutcome(true, startOfTodayMs() + 1000);
+test("checkinPlan: ELIGIBLE → claim", () => {
+  const p = checkinPlan(dailyCampaign());
+  assert.equal(p.action, "claim");
+  assert.equal(p.credit, 1000);
+});
+
+test("checkinPlan: CLAIMED 是「已领未确认」→ 只补 confirm，不能当成已签跳过", () => {
+  const p = checkinPlan(dailyCampaign({ status: "CLAIMED", claimable: false }));
+  assert.equal(p.action, "confirm", "漏掉这一步，活动会永远卡在 CLAIMED");
+});
+
+test("checkinPlan: CONFIRMED / CONSUMED → done，不碰写接口", () => {
+  for (const status of ["CONFIRMED", "CONSUMED"]) {
+    const p = checkinPlan(dailyCampaign({ status, claimable: false }));
+    assert.equal(p.action, "none");
+    assert.equal(p.outcome, "done");
+    assert.equal(p.credit, 1000, "已签也报得出每日额度（上游给了 benefitAmount）");
+  }
+});
+
+test("checkinPlan: status 为 null / 未知 → ineligible（活动不在期，不必重试）", () => {
+  for (const status of [null, undefined, "", "WHATEVER"]) {
+    const p = checkinPlan(dailyCampaign({ status }));
+    assert.equal(p.outcome, "ineligible");
+    assert.equal(p.action, "none");
+  }
+});
+
+test("checkinPlan: 没有每日签到活动 → ineligible", () => {
+  const p = checkinPlan(null);
+  assert.equal(p.action, "none");
+  assert.equal(p.outcome, "ineligible");
+  assert.match(p.message, /没有每日签到/);
+});
+
+test("checkinPlan: ELIGIBLE 但服务端说 claimable=false → failed（自相矛盾，交给宿主重试）", () => {
+  const p = checkinPlan(dailyCampaign({ claimable: false }));
+  assert.equal(p.action, "none");
+  assert.equal(p.outcome, "failed");
+});
+
+test("checkinPlan: status 大小写不敏感", () => {
+  assert.equal(checkinPlan(dailyCampaign({ status: "eligible" })).action, "claim");
+  assert.equal(checkinPlan(dailyCampaign({ status: "claimed" })).action, "confirm");
+});
+
+test("checkinErrorOutcome: 只有枚举里的 outcome（宿主会归一非枚举值为 failed）", () => {
+  const allowed = ["claimed", "done", "ineligible", "inactive", "captcha", "failed"];
+  const cases = [
+    checkinErrorOutcome({ errorCode: "40001", message: "尚未到达权益刷新时间" }),
+    checkinErrorOutcome({ errorCode: "4006", message: "名额领完" }),
+    checkinErrorOutcome({ errorCode: "40401", message: "运营事件不存在: 1" }),
+    checkinErrorOutcome({ message: "账号未实名认证" }),
+    checkinErrorOutcome({ message: "需要人机验证 captcha" }),
+    checkinErrorOutcome({ errorCode: "APIG.0602", message: "Invalid token" }),
+    checkinErrorOutcome({ errorCode: "APIG.0301", message: "verify ak sk signature fail" }),
+    checkinErrorOutcome(new Error("网络超时")),
+    checkinErrorOutcome(undefined),
+  ];
+  for (const c of cases) assert.ok(allowed.includes(c.outcome), c.outcome);
+});
+
+test("checkinErrorOutcome: 40001「尚未到达权益刷新时间」按已签处理（不是错误）", () => {
+  const r = checkinErrorOutcome({ errorCode: "40001", message: "尚未到达权益刷新时间" });
   assert.equal(r.outcome, "done");
-  // 上游没有字段说明这次发了多少；报一个 1000 是在撒谎
-  assert.equal(r.credit, undefined);
 });
 
-test("checkinOutcome: 活动结束 → ineligible", () => {
-  assert.equal(checkinOutcome(false, undefined, { message: "CodeArts 业务错误 X: 活动已结束" }).outcome, "ineligible");
+test("checkinErrorOutcome: 40001 是同一个码两种含义，按 claim/confirm 分开判", () => {
+  // claim 回 40001 = 今天这轮已领；confirm 回 40001 = 没有待确认记录。
+  // 两种都不用重试，但**不能**把 confirm 的失败一律说成 done ——
+  // 混在一起会让状态卡在 CLAIMED 而宿主不再补。
+  assert.match(checkinErrorOutcome({ errorCode: "40001" }, {}, "claim").message, /已签到/);
+  assert.match(checkinErrorOutcome({ errorCode: "40001" }, {}, "confirm").message, /已确认/);
+  // confirm 的其它错误必须报 failed，宿主下一轮才会补
+  assert.equal(checkinErrorOutcome({ errorCode: "50000", message: "系统繁忙" }, {}, "confirm").outcome, "failed");
 });
 
-test("checkinOutcome: 未实名 → inactive", () => {
-  assert.equal(checkinOutcome(false, undefined, { message: "账号未实名认证" }).outcome, "inactive");
+test("checkinErrorOutcome: 名额领完 / 活动不存在 → ineligible（不必重试）", () => {
+  assert.equal(checkinErrorOutcome({ errorCode: "4006", message: "名额已抢完" }).outcome, "ineligible");
+  assert.equal(checkinErrorOutcome({ errorCode: "40401", message: "运营事件不存在: 1" }).outcome, "ineligible");
 });
 
-test("checkinOutcome: 验证码 → captcha", () => {
-  assert.equal(checkinOutcome(false, undefined, { message: "需要人机验证 captcha" }).outcome, "captcha");
-});
-
-test("checkinOutcome: 普通错误 → failed", () => {
-  assert.equal(checkinOutcome(false, undefined, { message: "网络超时" }).outcome, "failed");
+test("checkinErrorOutcome: 凭据失效与签名失败要给出可操作的提示", () => {
+  assert.match(checkinErrorOutcome({ errorCode: "APIG.0602", message: "Invalid token" }).message, /重新登录/);
+  assert.match(checkinErrorOutcome({ message: "verify ak sk signature fail" }).message, /AK\/SK/);
 });
 
 test("modelRetired: 福利下线后两条通道都不通的模型被摘掉，能跑的留着", () => {
@@ -458,13 +538,12 @@ test("provider.models: 云端清单里的退役模型同样被过滤掉", async 
   }
 });
 
-test("checkinOutcome: 权益网关整个下线 → ineligible（不是 failed，别让宿主每 30 分钟重试）", () => {
-  // 2026-10-20 实测：balance / claim / config 三个接口同时回这一句
-  const r = checkinOutcome(false, undefined, {
-    message: "CodeArts /api/v1/benefit/claim 业务错误 4000: invalid channel, group not found",
-  });
-  assert.equal(r.outcome, "ineligible");
-  assert.match(r.message, /权益网关/);
+test("checkinPlan: 旧版把 opengw 福利通道当签到 —— 它下线后不该再影响到签到结论", () => {
+  // 2026-10-20 实测：balance / claim / config 三个 opengw 接口同时回
+  // `invalid channel, group not found`。积分签到走的是 snap 侧的 /v1/ops/*，
+  // 与这本账无关，所以签到不再读它、也不该据它报 ineligible。
+  const r = checkinPlan(dailyCampaign({ status: "CONFIRMED", claimable: false }));
+  assert.equal(r.outcome, "done");
 });
 
 test("gatewayRetired: 只认「网关下线」这一句，临时错误照旧可重试", () => {
@@ -497,43 +576,440 @@ test("provider.models: 权益网关永久下线时静默退回静态清单（不
   assert.equal(threw, true, "临时错误必须上抛");
 });
 
-test("checkinOutcome: POST 受理即 done —— create_time 与签到无关，不能据它判失败", () => {
-  // 旧实现把「时间戳未推进」判成 ineligible，于是卡片永远显示未签。
-  const old = startOfTodayMs() - 86400000;
-  const r = checkinOutcome(true, old, undefined, old);
+// ---------------------------------------------------------------------------
+// 签到：完整流程（checkinFlow）—— 查活动 → claim → confirm
+// ---------------------------------------------------------------------------
+
+/** 按路径分派的假上游，并记录每次调用（含签名后的头与 body）。 */
+const jsonResponse = (payload, status = 200) =>
+  new Response(JSON.stringify(payload), { status, headers: { "content-type": "application/json" } });
+
+function opsResponder(routes = {}) {
+  const calls = [];
+  const respond = async (url, init = {}) => {
+    const u = new URL(String(url));
+    const body = init.body ? JSON.parse(String(init.body)) : undefined;
+    calls.push({ path: u.pathname, search: u.search, method: init.method ?? "GET", body, headers: init.headers ?? {} });
+    const reply = (route, fallback) =>
+      typeof route === "function" ? route(body) : jsonResponse(route ?? fallback);
+    if (u.pathname.endsWith("/v1/ops/delivery")) {
+      return reply(routes.delivery, { code: 0, message: "ok", data: { items: [] } });
+    }
+    if (u.pathname.endsWith("/v1/ops/claim")) {
+      return reply(routes.claim, { code: 0, message: "ok", data: { id: 42, benefitAmount: 1000 } });
+    }
+    if (u.pathname.endsWith("/v1/ops/confirm")) {
+      return reply(routes.confirm, { code: 0, message: "ok", data: {} });
+    }
+    if (u.pathname.includes("/snap-manager/v1/statistics/plugin")) {
+      return reply(routes.stats, { metrics: [] });
+    }
+    return jsonResponse(
+      { error_code: "APIG.0101", error_msg: "The API does not exist or has not been published in the environment" },
+      404,
+    );
+  };
+  respond.calls = calls;
+  return respond;
+}
+
+/** 用给定的 fetch 实现跑一次 checkin()。 */
+async function checkinWith(respond) {
+  const plugin = await pluginWith();
+  const real = globalThis.fetch;
+  globalThis.fetch = respond;
+  try {
+    return await plugin.auth.checkin(async () => ({ type: "api", key: AK, metadata: { sk: SK } }));
+  } finally {
+    globalThis.fetch = real;
+  }
+}
+
+const deliveryOf = (items) => ({ code: 0, message: "ok", data: { channel: "IDE", serverTime: 1, items } });
+
+test("checkinFlow: ELIGIBLE → claim + confirm，body 带 channel 与 idempotentKey", async () => {
+  const f = opsResponder({ delivery: deliveryOf([dailyCampaign()]) });
+  const r = await checkinWith(f);
+  assert.equal(r.outcome, "claimed");
+  assert.equal(r.credit, 1000);
+  const paths = f.calls.map((c) => `${c.method} ${c.path}`);
+  assert.deepEqual(paths, ["GET /v1/ops/delivery", "POST /v1/ops/claim", "POST /v1/ops/confirm"]);
+  const claim = f.calls[1];
+  assert.equal(claim.body.campaignId, 1);
+  assert.equal(claim.body.channel, "IDE", "channel 必须放在 body —— 缺了上游回「channel : 参数无效」");
+  assert.match(claim.body.idempotentKey, /^claim_1_\d+$/);
+  // confirm 不带 channel / idempotentKey（带了 channel 上游会 HTTP 400）
+  assert.deepEqual(f.calls[2].body, { campaignId: 1 });
+});
+
+test("checkinFlow: 活动清单必须按 channel=IDE 查（网页端才是 WEB）", async () => {
+  const f = opsResponder({ delivery: deliveryOf([dailyCampaign()]) });
+  await checkinWith(f);
+  assert.equal(f.calls[0].search, "?channel=IDE");
+  assert.match(String(f.calls[0].headers.Authorization ?? ""), /^SDK-HMAC-SHA256 Access=/);
+});
+
+test("checkinFlow: claim 返回 data.id 为空也照样补 confirm（不能拿 id 猜「要不要确认」）", async () => {
+  const f = opsResponder({
+    delivery: deliveryOf([dailyCampaign()]),
+    claim: { code: 0, message: "ok", data: { id: null, benefitAmount: 1000 } },
+    // 没有待确认记录时上游回 40001 —— 属于正常，不许影响结论
+    confirm: { code: 40001, message: "该活动没有可确认的权益记录" },
+  });
+  const r = await checkinWith(f);
+  assert.equal(r.outcome, "claimed");
+  assert.equal(r.credit, 1000);
+  assert.deepEqual(f.calls.map((c) => c.method), ["GET", "POST", "POST"], "仍然要补一次 confirm");
+});
+
+test("checkinFlow: 补 confirm 报 40001 不当成「确认失败」（那个码是「没有待确认记录」）", async () => {
+  const f = opsResponder({
+    delivery: deliveryOf([dailyCampaign({ status: "CLAIMED", claimable: false })]),
+    confirm: { code: 40001, message: "该活动没有可确认的权益记录" },
+  });
+  const r = await checkinWith(f);
+  assert.equal(r.outcome, "done", "没有待确认记录 = 已经处理完，不是失败");
+  assert.match(r.message, /已确认|已签到/);
+});
+
+test("checkinFlow: confirm 报其它错 → failed（状态会停在 CLAIMED，交给宿主下一轮补）", async () => {
+  const f = opsResponder({
+    delivery: deliveryOf([dailyCampaign({ status: "CLAIMED", claimable: false })]),
+    confirm: { code: 50000, message: "系统繁忙" },
+  });
+  assert.equal((await checkinWith(f)).outcome, "failed");
+});
+
+test("checkinFlow: 活动号缺失/为 null 时不发畸形写请求", async () => {
+  // type 认得出来但没有可用活动号 —— 发出去只会变成 {campaignId: null} 或字段被丢掉
+  const f = opsResponder({ delivery: deliveryOf([{ type: "USER_LOGIN", status: "ELIGIBLE", claimable: true }]) });
+  const r = await checkinWith(f);
+  assert.equal(r.outcome, "ineligible");
+  assert.deepEqual(f.calls.map((c) => c.method), ["GET"], "一个写请求都不该发");
+});
+
+test("checkinFlow: 补确认时跳过活动号非法的条目（null / 0 / 字符串垃圾）", async () => {
+  const f = opsResponder({
+    delivery: deliveryOf([
+      dailyCampaign({ status: "CONFIRMED", claimable: false }),
+      { campaignId: null, type: "NEW_USER_REGISTER", benefitAmount: 4000, status: "CLAIMED" },
+      { campaignId: 0, type: "INVITE_USER", benefitAmount: 1000, status: "CLAIMED" },
+    ]),
+  });
+  const r = await checkinWith(f);
   assert.equal(r.outcome, "done");
-  // 上游没有任何字段说这次发多少，不编造 credit
-  assert.equal(r.credit, undefined);
+  assert.deepEqual(f.calls.map((c) => c.method), ["GET"], "非法活动号不该触发 confirm");
+  assert.doesNotMatch(r.message, /4000/, "没确认成功就不能把它写进结果");
 });
 
-test("checkinOutcome: POST 受理但没有时间戳 → 仍然 done", () => {
-  assert.equal(checkinOutcome(true, undefined).outcome, "done");
+test("checkinFlow: CLAIMED → 只补 confirm（不发 claim，绝不重复领取）", async () => {
+  const f = opsResponder({ delivery: deliveryOf([dailyCampaign({ status: "CLAIMED", claimable: false })]) });
+  const r = await checkinWith(f);
+  assert.equal(r.outcome, "done");
+  assert.equal(r.credit, 1000);
+  assert.deepEqual(f.calls.map((c) => c.path), ["/v1/ops/delivery", "/v1/ops/confirm"]);
 });
 
-test("checkinOutcome: 未发起签到、时间戳再新也不算已签", () => {
-  const old = startOfTodayMs() - 86400000;
-  assert.equal(checkinOutcome(false, old, undefined, old).outcome, "failed");
+test("checkinFlow: CONFIRMED → done，一个写请求都不发", async () => {
+  const f = opsResponder({ delivery: deliveryOf([dailyCampaign({ status: "CONFIRMED", claimable: false })]) });
+  const r = await checkinWith(f);
+  assert.equal(r.outcome, "done");
+  assert.deepEqual(f.calls.map((c) => c.method), ["GET"]);
 });
 
-test("checkinOutcome: 无参 → failed（不产生非枚举值）", () => {
-  assert.equal(checkinOutcome(false, undefined).outcome, "failed");
+test("checkinFlow: 清单里没有每日签到活动 → ineligible，不发写请求", async () => {
+  const f = opsResponder({ delivery: deliveryOf([{ campaignId: 3, type: "INVITE_USER", status: null }]) });
+  const r = await checkinWith(f);
+  assert.equal(r.outcome, "ineligible");
+  assert.deepEqual(f.calls.map((c) => c.method), ["GET"]);
 });
 
-test("checkinOutcome: 所有 outcome 都在 magpie 枚举内", () => {
-  const allowed = ["claimed", "done", "ineligible", "inactive", "captcha", "failed"];
-  const old = startOfTodayMs() - 86400000;
-  const cases = [
-    checkinOutcome(true, startOfTodayMs() + 1),
-    checkinOutcome(false, startOfTodayMs() + 1),
-    checkinOutcome(false, undefined, { message: "活动已结束" }),
-    checkinOutcome(false, undefined, { message: "未实名" }),
-    checkinOutcome(false, undefined, { message: "captcha" }),
-    checkinOutcome(false, undefined, { message: "err" }),
-    checkinOutcome(false, undefined),
-    checkinOutcome(true, old, undefined, old),
-    checkinOutcome(false, old, undefined, old),
-  ];
-  for (const c of cases) assert.ok(allowed.includes(c.outcome), c.outcome);
+test("checkinFlow: 顺带补确认其它卡在 CLAIMED 的活动（新用户注册 4000 积分）", async () => {
+  const f = opsResponder({
+    delivery: deliveryOf([
+      dailyCampaign({ status: "CONFIRMED", claimable: false }),
+      { campaignId: 4, type: "NEW_USER_REGISTER", benefitAmount: 4000, status: "CLAIMED", claimable: false },
+    ]),
+  });
+  const r = await checkinWith(f);
+  assert.equal(r.outcome, "done");
+  assert.deepEqual(f.calls.map((c) => c.path), ["/v1/ops/delivery", "/v1/ops/confirm"]);
+  assert.equal(f.calls[1].body.campaignId, 4);
+  assert.match(r.message, /4000/, "到手的 4000 积分要写在结果里");
+});
+
+test("checkinFlow: 补确认失败不影响签到结论（积分在 claim 时就已到账）", async () => {
+  const f = opsResponder({
+    delivery: deliveryOf([
+      dailyCampaign({ status: "ELIGIBLE" }),
+      { campaignId: 4, type: "NEW_USER_REGISTER", benefitAmount: 4000, status: "CLAIMED" },
+    ]),
+    // 只让「新用户注册」那次确认失败
+    confirm: (body) => (body.campaignId === 4 ? jsonResponse({ code: 50000, message: "boom" }) : jsonResponse({ code: 0, message: "ok", data: {} })),
+  });
+  const r = await checkinWith(f);
+  assert.equal(r.outcome, "claimed");
+  assert.equal(r.credit, 1000);
+  assert.doesNotMatch(r.message, /4000/, "没确认成功就不能把 4000 写进结果");
+});
+
+test("checkinFlow: 每天的活动按 type 认，不按标题（标题会被上游改文案）", async () => {
+  const f = opsResponder({ delivery: deliveryOf([dailyCampaign({ title: "签到", status: "ELIGIBLE" })]) });
+  assert.equal((await checkinWith(f)).outcome, "claimed");
+});
+
+test("checkinFlow: campaignId 认得出字符串形式的活动（上游两种都出现过）", async () => {
+  const f = opsResponder({ delivery: deliveryOf([dailyCampaign({ campaignId: "1", type: undefined })]) });
+  assert.equal((await checkinWith(f)).outcome, "claimed");
+});
+
+test("checkinFlow: claim 业务码 40001 → done（今天这一轮已领过）", async () => {
+  const f = opsResponder({
+    delivery: deliveryOf([dailyCampaign()]),
+    claim: { code: 40001, message: "尚未到达权益刷新时间" },
+  });
+  const r = await checkinWith(f);
+  assert.equal(r.outcome, "done");
+});
+
+test("checkinFlow: claim 业务码 40401（活动已下线）→ ineligible，不再每 30 分钟重试", async () => {
+  const f = opsResponder({
+    delivery: deliveryOf([dailyCampaign()]),
+    claim: { code: 40401, message: "运营事件不存在: 1" },
+  });
+  assert.equal((await checkinWith(f)).outcome, "ineligible");
+});
+
+test("checkinFlow: 网络错误 → failed（宿主 30 分钟后重试）", async () => {
+  const r = await checkinWith(async () => { throw new Error("fetch failed"); });
+  assert.equal(r.outcome, "failed");
+});
+
+test("checkinFlow: 未登录 / 无凭据 → inactive", async () => {
+  const plugin = await pluginWith();
+  assert.equal((await plugin.auth.checkin(async () => ({ type: "api", key: "" }))).outcome, "inactive");
+});
+
+test("checkinFlow: 结果只带 magpie 契约里的字段（outcome / credit / message）", async () => {
+  const f = opsResponder({ delivery: deliveryOf([dailyCampaign()]) });
+  const r = await checkinWith(f);
+  assert.deepEqual(Object.keys(r).sort(), ["credit", "message", "outcome"]);
+});
+
+// ---------------------------------------------------------------------------
+// snap 信封（前缀规则与业务码都藏在这里）
+// ---------------------------------------------------------------------------
+
+/** 用给定的 fetch 实现跑一段。 */
+async function withFetch(respond, fn) {
+  const real = globalThis.fetch;
+  globalThis.fetch = respond;
+  try {
+    return await fn();
+  } finally {
+    globalThis.fetch = real;
+  }
+}
+
+test("snapEnvelope: /v1/ops 的 code 非 0 抛业务码（HTTP 仍是 200）", async () => {
+  await withFetch(
+    async () => jsonResponse({ code: 40401, message: "运营事件不存在: 1" }),
+    async () => {
+      await assert.rejects(
+        () => snapEnvelope("/v1/ops/claim", { method: "POST", ak: AK, sk: SK, body: { campaignId: 1 } }),
+        (e) => e.errorCode === "40401",
+      );
+    },
+  );
+});
+
+test("snapEnvelope: code 为字符串 \"0\" 也算成功（上游两种写法都有）", async () => {
+  const r = await withFetch(async () => jsonResponse({ code: "0", message: "ok", data: { id: 7 } }), () =>
+    snapEnvelope("/v1/ops/claim", { method: "POST", ak: AK, sk: SK, body: { campaignId: 1 } }));
+  assert.deepEqual(r, { id: 7 });
+});
+
+test("snapEnvelope: statistics/plugin 是裸对象，没有 code 信封，整份返回", async () => {
+  const r = await withFetch(async () => jsonResponse({ metrics: [{ name: "usageTotalPackageCredit" }] }), () =>
+    snapEnvelope(STATS_PATH, { ak: AK, sk: SK }));
+  assert.equal(Array.isArray(r.metrics), true, "裸对象不该被当作信封剥成空 data");
+});
+
+test("snapEnvelope: 前缀写错（APIG.0101）也带出 errorCode，别把「接口不存在」当成网络故障", async () => {
+  await withFetch(
+    async () =>
+      jsonResponse({ error_code: "APIG.0101", error_msg: "The API does not exist or has not been published in the environment" }, 404),
+    async () => {
+      await assert.rejects(
+        () => snapEnvelope(STATS_PATH, { ak: AK, sk: SK }),
+        (e) => e.errorCode === "APIG.0101" && /APIG\.0101/.test(e.message),
+      );
+    },
+  );
+});
+
+test("snapEnvelope: 401 APIG.0301 → 去掉 agent-type 再发一次就自愈", async () => {
+  const seen = [];
+  const r = await withFetch(
+    async (url, init) => {
+      seen.push(init.headers);
+      if (seen.length === 1) {
+        return jsonResponse({ error_code: "APIG.0301", error_msg: "verify ak sk signature fail" }, 401);
+      }
+      return jsonResponse({ metrics: [] });
+    },
+    () => snapEnvelope(STATS_PATH, { ak: AK, sk: SK }),
+  );
+  assert.deepEqual(r, { metrics: [] });
+  assert.equal(seen.length, 2, "应当重发一次");
+  assert.equal(seen[0]["agent-type"], "PromptCenter", "第一次带可选头");
+  assert.equal(seen[1]["agent-type"], undefined, "第二次去掉可选头");
+});
+
+test("snapEnvelope: agent-type 参与签名（大写的 Agent-Type 不入签名会被 APIG 判 401）", () => {
+  const h = sdkSignedHeaders("GET", `${SNAP_HOST}${STATS_PATH}`, "", AK, SK, AGENT_TYPE_HEADER);
+  assert.match(h.Authorization, /SignedHeaders=[^,]*agent-type/);
+});
+
+test("snapEnvelope: query 参与签名（channel=IDE 写错就 401）", () => {
+  const h = sdkSignedHeaders("GET", `${SNAP_HOST}/v1/ops/delivery?channel=IDE`, "", AK, SK, AGENT_TYPE_HEADER);
+  assert.match(h.Authorization, /SignedHeaders=/);
+  // canonicalQuery 进了签名：换个 channel 值签名必然不同
+  const other = sdkSignedHeaders("GET", `${SNAP_HOST}/v1/ops/delivery?channel=WEB`, "", AK, SK, AGENT_TYPE_HEADER);
+  assert.notEqual(h.Authorization, other.Authorization);
+});
+
+// ---------------------------------------------------------------------------
+// 积分账（fetchCredits）
+// ---------------------------------------------------------------------------
+
+const statsPayload = (over = {}) => ({
+  start_date: "2026-10-11",
+  end_date: "2026-11-12",
+  package: {
+    spec_code: "codearts.agent.individual.trial",
+    status: "normal",
+    package_name_cn: "体验版",
+    package_name_en: "Trial",
+    is_token_package: false,
+    is_credit_package: true,
+  },
+  show: { metrics: true, package: true },
+  metrics: [
+    { name: "usageTokenChatMessages", usage_token_num: 4170599, package_token_amount: 1 },
+    {
+      name: "usageTotalPackageCredit",
+      package_credit_amount: 12500,
+      package_credit_used: 337.22,
+      package_credit_remain: 12162.78,
+      package_credit_expiring_amount: 0,
+    },
+    { name: "usageBasicPackageCredit", package_credit_amount: 500, package_credit_used: 0, package_credit_remain: 500 },
+    { name: "usageOnDemandPackageCredit", package_credit_amount: 0, package_credit_used: 0, package_credit_remain: 0 },
+    { name: "usageBonusPackageCredit", package_credit_amount: 12000, package_credit_used: 337.22, package_credit_remain: 11662.78 },
+  ],
+  model_metrics: [],
+  ...over,
+});
+
+test("fetchCredits: 只认总数，不累加分项（500 + 0 + 12000 = 12500 是构成明细）", async () => {
+  const f = opsResponder({ stats: statsPayload() });
+  const c = await withFetch(f, () => fetchCredits(AK, SK));
+  assert.equal(c.remain, 12162.78);
+  assert.equal(c.amount, 12500);
+  assert.equal(c.used, 337.22);
+  assert.equal(c.endDate, "2026-11-12");
+  assert.equal(c.packageName, "体验版");
+  assert.equal(c.isCreditPackage, true);
+  // 分项只用于展示，amount=0 的不进列表
+  assert.deepEqual(c.packages.map((p) => p.name), ["基础积分", "福利积分"]);
+  assert.equal(f.calls[0].path, STATS_PATH, "必须带 snap-manager 前缀");
+});
+
+test("fetchCredits: 数值就是积分，不做 token 折算（套 1 积分=10000 token 会算成 1.2 亿）", () => {
+  // 上游没给任何单位换算字段，直接照抄 12162.78
+  return withFetch(async () => jsonResponse(statsPayload()), async () => {
+    const c = await fetchCredits(AK, SK);
+    assert.ok(c.remain < 100000, "不该被放大成 token 口径");
+  });
+});
+
+test("fetchCredits: 旧 Token 计费账户没有积分指标 → remain undefined，不判 0", async () => {
+  const payload = statsPayload({
+    package: { package_name_cn: "老套餐", is_credit_package: false, is_token_package: true },
+    metrics: [{ name: "usageTokenChatMessages", usage_token_num: 100, package_token_amount: 1 }],
+  });
+  const c = await withFetch(opsResponder({ stats: payload }), () => fetchCredits(AK, SK));
+  assert.equal(c.remain, undefined);
+  assert.equal(c.isCreditPackage, false);
+});
+
+test("fetchCredits: 指标缺失/脏数据不抛（只是拿不到数）", async () => {
+  const c = await withFetch(opsResponder({ stats: { metrics: [null, "x", { name: "usageTotalPackageCredit" }] } }), () =>
+    fetchCredits(AK, SK));
+  assert.equal(c.remain, undefined);
+});
+
+test("fetchCampaigns: 只放行对象元素（上游数组里偶尔有 null）", async () => {
+  const items = await withFetch(
+    opsResponder({ delivery: { code: 0, message: "ok", data: { items: [null, 7, dailyCampaign()] } } }),
+    () => fetchCampaigns(AK, SK),
+  );
+  assert.equal(items.length, 1);
+  assert.equal(items[0].campaignId, 1);
+});
+
+test("pickDailyCampaign: 按 type 认；type 缺失才退回 campaignId", () => {
+  assert.equal(pickDailyCampaign([{ campaignId: 9, type: "USER_LOGIN" }]).campaignId, 9);
+  assert.equal(pickDailyCampaign([{ campaignId: 1, type: "SOMETHING_ELSE" }]).campaignId, 1);
+  assert.equal(pickDailyCampaign([{ campaignId: 3, type: "INVITE_USER" }]), null);
+  assert.equal(pickDailyCampaign([]), null);
+  assert.equal(pickDailyCampaign(undefined), null);
+});
+
+test("pickDailyCampaign: 活动号不可用的条目直接跳过（发了就是畸形请求）", () => {
+  assert.equal(pickDailyCampaign([{ type: "USER_LOGIN", status: "ELIGIBLE" }]), null);
+  assert.equal(pickDailyCampaign([{ campaignId: null, type: "USER_LOGIN" }]), null);
+  assert.equal(pickDailyCampaign([{ campaignId: 0, type: "USER_LOGIN" }]), null);
+  assert.equal(pickDailyCampaign([{ campaignId: "abc", type: "USER_LOGIN" }]), null);
+  // 字符串数字是上游真实出现过的形态，要认
+  assert.equal(pickDailyCampaign([{ campaignId: "1", type: "USER_LOGIN" }]).campaignId, "1");
+});
+
+test("usableCampaignId: 只认正整数（含字符串数字）", () => {
+  assert.equal(usableCampaignId(1), 1);
+  assert.equal(usableCampaignId("1"), 1);
+  assert.equal(usableCampaignId(0), undefined);
+  assert.equal(usableCampaignId(-3), undefined);
+  assert.equal(usableCampaignId(null), undefined);
+  assert.equal(usableCampaignId(undefined), undefined);
+  assert.equal(usableCampaignId("abc"), undefined);
+  assert.equal(usableCampaignId(NaN), undefined);
+});
+
+test("opsClaim / opsConfirm: 活动号非法时直接抛，绝不发出畸形写请求", async () => {
+  const f = opsResponder();
+  await withFetch(f, async () => {
+    for (const bad of [undefined, null, 0, "abc"]) {
+      // 这两个是同步抛（在 fetch 之前就挡下），用 throws 断言
+      assert.throws(() => opsClaim(AK, SK, bad), /活动号/);
+      assert.throws(() => opsConfirm(AK, SK, bad), /活动号/);
+    }
+  });
+  assert.equal(f.calls.length, 0, "一次请求都不该发出去");
+});
+
+test("opsClaim: idempotentKey 是 body 字段（格式 claim_<campaignId>_<毫秒>），channel 也在 body", async () => {
+  const f = opsResponder();
+  await withFetch(f, () => opsClaim(AK, SK, 1, 1792515974422));
+  assert.deepEqual(f.calls[0].body, { campaignId: 1, channel: "IDE", idempotentKey: "claim_1_1792515974422" });
+});
+
+test("opsConfirm: 只带 campaignId（带 channel 上游会 HTTP 400）", async () => {
+  const f = opsResponder();
+  await withFetch(f, () => opsConfirm(AK, SK, 1));
+  assert.deepEqual(f.calls[0].body, { campaignId: 1 });
+  assert.equal(f.calls[0].method, "POST");
 });
 
 // ---------------------------------------------------------------------------
@@ -1390,14 +1866,168 @@ test("usage: 余额接口失败 → 返回 error 而不是抛错", async () => {
 test("usage: 余额查询不带会话头（opengw 不是对话会话，且登录依赖它）", async () => {
   const seen = [];
   await usageWith(async (url, init) => {
-    seen.push(init.headers);
+    seen.push({ url: String(url), headers: init.headers });
+    if (String(url).includes(STATS_PATH)) return jsonResponse(statsPayload());
     return new Response(JSON.stringify({ result: { total_quota: 10, total_balance: 5, used_amount: 5 } }), { status: 200 });
   });
-  assert.equal(seen.length, 1, "usage 只该问余额一次（签到状态由宿主显示）");
-  for (const h of seen) {
-    assert.equal(h["x-ot-session-id"], undefined, "opengw 接口不该带会话头");
-    assert.match(h.Authorization, /SignedHeaders=content-type;host;x-sdk-date, Signature=/);
+  assert.equal(seen.length, 2, "积分账 + token 池各一次");
+  for (const { headers } of seen) {
+    assert.equal(headers["x-ot-session-id"], undefined, "额度类接口不该带会话头");
   }
+  // 积分账走 snap 引擎：必须带 snap-manager 前缀与 agent-type 可选头
+  const stats = seen.find((s) => s.url.includes(STATS_PATH));
+  assert.equal(stats.headers["agent-type"], AGENT_TYPE_HEADER["agent-type"], "snap 侧接口带 agent-type");
+  assert.match(stats.headers.Authorization, /agent-type/);
+  // token 池走 opengw：不额外加头
+  const pool = seen.find((s) => s.url.includes("tokens/balance"));
+  assert.equal(pool.headers["agent-type"], undefined);
+  assert.match(pool.headers.Authorization, /SignedHeaders=content-type;host;x-sdk-date, Signature=/);
+});
+
+// ---------------------------------------------------------------------------
+// usage：积分账（snap 侧）—— 用户控制台上的 12000+ 就是它
+// ---------------------------------------------------------------------------
+
+/** 积分账 + token 池。任一传 undefined 表示该接口不可用。 */
+const accountsResponder = (credits, balance) => async (url) => {
+  if (String(url).includes(STATS_PATH)) {
+    return credits === undefined
+      ? jsonResponse({ error_code: "APIG.0502", error_msg: "service unavailable" }, 500)
+      : jsonResponse(credits);
+  }
+  if (balance === undefined) return jsonResponse({ error_code: "4000", error_msg: "invalid channel, group not found" });
+  return jsonResponse({ result: balance });
+};
+
+test("usage: 积分账是主窗口（token 池下线后仍能显示 12000+ 积分）", async () => {
+  // token 池（opengw）= 2026-10-20 起的真实状态：整组回 invalid channel
+  const u = await usageWith(accountsResponder(statsPayload(), undefined));
+  assert.equal(u.windows.length, 1, "token 池取不到就不画那个窗口");
+  const w = u.windows[0];
+  assert.equal(w.name, "积分");
+  assert.equal(w.unit, "积分");
+  assert.equal(w.limit, 12500);
+  assert.equal(w.amount, 337.2, "amount 是已用");
+  assert.equal(w.used, 2.7, "337.22/12500 = 2.7%");
+  assert.equal(w.display, "12162.8 / 12500");
+  assert.match(u.balance, /12162\.8 积分/);
+});
+
+test("usage: 两本账都在时各画一个窗口，互不折算", async () => {
+  const u = await usageWith(accountsResponder(statsPayload(), { total_quota: 10000000, total_balance: 7819948, used_amount: 2180052 }));
+  assert.deepEqual(u.windows.map((w) => w.name), ["积分", "每日免费 Token"]);
+  assert.equal(u.windows[0].unit, "积分");
+  assert.equal(u.windows[1].unit, "tokens");
+  assert.equal(u.windows[1].used, 21.8);
+});
+
+test("usage: 积分窗口 amount / limit 与 used 百分比自洽（宿主按 amount/limit 渲染）", async () => {
+  const u = await usageWith(accountsResponder(statsPayload(), undefined));
+  const w = u.windows[0];
+  assert.equal(round1((w.amount / w.limit) * 100), w.used);
+});
+
+test("usage: 积分用不完会作废 —— 套餐到期日写进 aside", async () => {
+  const u = await usageWith(accountsResponder(statsPayload(), undefined));
+  assert.match(u.windows[0].aside, /体验版/);
+  assert.match(u.windows[0].aside, /2026-11-12/);
+});
+
+test("usage: 没有总额度字段时不产生 NaN（只报剩余）", async () => {
+  const payload = statsPayload({
+    metrics: [{ name: "usageTotalPackageCredit", package_credit_remain: 42, package_credit_amount: 0, package_credit_used: 0 }],
+  });
+  const u = await usageWith(accountsResponder(payload, undefined));
+  const w = u.windows[0];
+  assert.equal(w.used, 0);
+  assert.ok(Number.isFinite(w.used));
+  assert.equal(w.limit, undefined);
+  assert.match(w.display, /42/);
+});
+
+test("usage: 非积分账户（旧 Token 计费）给出可读原因，而不是「失败」", async () => {
+  const payload = statsPayload({
+    package: { package_name_cn: "老套餐", is_credit_package: false, is_token_package: true },
+    metrics: [],
+  });
+  const u = await usageWith(accountsResponder(payload, undefined));
+  assert.match(u.error, /Token 计费账户/);
+  assert.deepEqual(u.windows, []);
+});
+
+test("usage: 积分接口挂了但 token 池还在 → 照常出窗口，不整体报错", async () => {
+  const u = await usageWith(accountsResponder(undefined, { total_quota: 10000000, total_balance: 9000000, used_amount: 1000000 }));
+  assert.equal(u.windows.length, 1);
+  assert.equal(u.windows[0].name, "每日免费 Token");
+  assert.equal(u.error, undefined);
+});
+
+test("usage: 两本账都取不到 → error（不画空窗口）", async () => {
+  const u = await usageWith(accountsResponder(undefined, undefined));
+  assert.match(u.error, /积分账|额度/);
+  assert.deepEqual(u.windows, []);
+});
+
+test("usage: 积分窗口的 used 在任何脏数据下都不为 NaN", async () => {
+  const bodies = [
+    statsPayload(),
+    { metrics: [{ name: "usageTotalPackageCredit", package_credit_amount: "abc", package_credit_used: "def" }] },
+    { metrics: [{ name: "usageTotalPackageCredit", package_credit_amount: 100, package_credit_used: 200 }] },
+    { metrics: null },
+    {},
+  ];
+  for (const b of bodies) {
+    const u = await usageWith(accountsResponder(b, undefined));
+    for (const w of u.windows) {
+      assert.ok(Number.isFinite(w.used), `used 必须是有限数: ${JSON.stringify(b)} → ${w.used}`);
+      assert.ok(w.amount === undefined || Number.isFinite(w.amount));
+      assert.ok(w.limit === undefined || Number.isFinite(w.limit));
+    }
+  }
+});
+
+test("usage: 积分出现负已用 / 剩余超总额时夹住，不画负百分比、不倒欠", async () => {
+  // 上游退积分或统计回滚时会给负数/越界值；宿主会照单渲染成 "-0.1%" 与 "13000 / 12500"
+  const negative = await usageWith(
+    accountsResponder(
+      statsPayload({
+        metrics: [{ name: "usageTotalPackageCredit", package_credit_amount: 12500, package_credit_used: -10, package_credit_remain: 12510 }],
+      }),
+      undefined,
+    ),
+  );
+  assert.equal(negative.windows[0].used, 0);
+  assert.equal(negative.windows[0].amount, 0);
+
+  // 已用 > 总额（统计滞后）→ 夹到 100%，amount 不超过 limit
+  const over = await usageWith(
+    accountsResponder(
+      statsPayload({
+        metrics: [{ name: "usageTotalPackageCredit", package_credit_amount: 12500, package_credit_used: 99999, package_credit_remain: 0 }],
+      }),
+      undefined,
+    ),
+  );
+  assert.equal(over.windows[0].used, 100);
+  assert.equal(over.windows[0].amount, 12500);
+});
+
+test("usage: 积分与 token 池并行取（串行会吃掉宿主 20 秒预算的两倍）", async () => {
+  const started = [];
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const respond = async (url) => {
+    started.push(String(url));
+    await gate; // 谁先到都得等闸门，串行实现会在这里卡死（第二个请求永远发不出）
+    if (String(url).includes(STATS_PATH)) return jsonResponse(statsPayload());
+    return jsonResponse({ result: { total_quota: 10, total_balance: 5, used_amount: 5 } });
+  };
+  const pending = usageWith(respond);
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(started.length, 2, `两个账接口必须同时在飞，实际只发了 ${started.length} 个`);
+  release();
+  const u = await pending;
+  assert.deepEqual(u.windows.map((w) => w.name), ["积分", "每日免费 Token"]);
 });
 
 test("redact: 上游错误体里回显的 AK/SK 会被擦掉", async () => {
@@ -1443,51 +2073,28 @@ test("checkin: 未登录 → inactive", async () => {
   assert.equal((await plugin.auth.checkin(async () => undefined)).outcome, "inactive");
 });
 
-/**
- * 签到钩子：只发一次 POST，按「受理即今日已签」报 done。
- *
- * 旧实现先 GET 一次状态、再 POST、再回读，全是为了从 create_time 推签到
- * 状态。实测那个字段是权益记录的创建时间，从不随签到推进（见
- * checkinOutcome 的注释），所以这一整套推导连同它带来的 ineligible 都是错的。
- */
-test("checkin: 只发一次 POST，受理即 done", async () => {
+test("checkin: 钩子打的是 snap 的活动接口，不再碰 opengw 的 benefit/claim", async () => {
   const plugin = await mod.default({}, {});
   const real = globalThis.fetch;
-  const urls = [];
-  globalThis.fetch = async (url, init) => {
-    urls.push(`${init?.method ?? "GET"} ${String(url)}`);
-    return new Response(JSON.stringify({ result: { create_time: Date.now() - 86400_000 } }), { status: 200 });
-  };
+  const f = opsResponder({ delivery: deliveryOf([dailyCampaign({ status: "CONFIRMED", claimable: false })]) });
+  globalThis.fetch = f;
   try {
     const got = await plugin.auth.checkin(async () => ({ type: "api", key: AK, metadata: { sk: SK } }));
-    assert.equal(got.outcome, "done", `受理就该是 done，实际 ${got.outcome}`);
-    assert.equal(urls.length, 1, `只该打一次接口，实际 ${urls.join(", ")}`);
-    assert.match(urls[0], /^POST .*\/benefit\/claim/);
+    assert.equal(got.outcome, "done");
+    assert.equal(f.calls.filter((c) => c.path.includes("benefit/claim")).length, 0, "福利通道不是签到");
+    assert.deepEqual(f.calls.map((c) => c.path), ["/v1/ops/delivery"]);
   } finally {
     globalThis.fetch = real;
   }
 });
 
-test("checkin: 旧时间戳不再被判成 ineligible（这就是「开了自动签到还显示未签」的根因）", async () => {
+test("checkin: 活动不在期 → ineligible（不是 failed，宿主不必反复重试）", async () => {
   const plugin = await mod.default({}, {});
   const real = globalThis.fetch;
-  const yesterday = Date.now() - 86400_000;
-  globalThis.fetch = async () => new Response(JSON.stringify({ result: { create_time: yesterday } }), { status: 200 });
+  globalThis.fetch = opsResponder({ delivery: deliveryOf([dailyCampaign({ status: null, claimable: false })]) });
   try {
     const got = await plugin.auth.checkin(async () => ({ type: "api", key: AK, metadata: { sk: SK } }));
-    assert.equal(got.outcome, "done");
-  } finally {
-    globalThis.fetch = real;
-  }
-});
-
-test("checkin: 上游没给 result 也报 done（200 + 0000 就是受理）", async () => {
-  const plugin = await mod.default({}, {});
-  const real = globalThis.fetch;
-  globalThis.fetch = async () => new Response(JSON.stringify({ error_code: "0000" }), { status: 200 });
-  try {
-    const got = await plugin.auth.checkin(async () => ({ type: "api", key: AK, metadata: { sk: SK } }));
-    assert.equal(got.outcome, "done");
+    assert.equal(got.outcome, "ineligible");
   } finally {
     globalThis.fetch = real;
   }
