@@ -7,7 +7,7 @@
 | 授权 | 华为云访问密钥 **AK/SK**（华为云官方 SDK-HMAC-SHA256 签名），登录时自动验证有效性 |
 | **每日签到** ⭐ | 实现 magpie 原生 `auth.checkin` 钩子（magpie ≥ v0.1.1083）——Settings → Usage → Plugins 打开 **Daily check-in**，每天每账号自动签到领 **1000 积分**（`/v1/ops/delivery` → `claim` → `confirm`，四态状态机） |
 | **积分余额** | `auth.usage` 显示**积分**（控制台上那个 12000+ 就是它）：已用/总量 + 套餐到期日 |
-| 免费额度 | 另一本账：每日免费 Token 池（opengw，2026-10-20 起整组下线，拿得到才展示） |
+| ~~免费 Token 池~~ | **2026-10-20 官方已结束**（论坛公告 + 活动 PDF 目录移除 + 实测 `4000 invalid channel, group not found`），只剩积分一本账 |
 | 对话 | `POST snap-access /api/v2/chat/completions`（OpenAI 形态），按模型自动选通道 |
 | 模型 | 登录后自动同步云端模型清单（含 `channel` 字段），失败时回退内置列表；**逐模型实测声明收不收图**（见 [图片能力](#图片能力0213-实测)） |
 
@@ -44,7 +44,40 @@ AccessKeyId:SecretAccessKey
 | 账 | 上游接口 | 单位 | 谁用 |
 |---|---|---|---|
 | **积分账** | `GET /snap-manager/v1/statistics/plugin` | 积分（CREDIT） | 系统内置模型（GLM-5.2 / OpenPangu 等） |
-| 每日免费 Token 池 | `GET opengw /api/v1/user/tokens/balance` | tokens（1000 万/日，0 点清零） | 福利模型（deepseek-v4.1-flash…） |
+| ~~每日免费 Token 池~~ | ~~`GET opengw /api/v1/user/tokens/balance`~~ | ~~tokens（1000 万/日，0 点清零）~~ | **2026-10-20 已结束**（见下） |
+
+### 每日免费 Token 池：官方确认已于 2026-10-20 结束
+
+这不是「接口搬家」，是活动本身下线。2026-10-21 查证到的官方证据：
+
+| 证据 | 内容 |
+|---|---|
+| 华为云开发者论坛活动帖底部「温馨提醒」 | **「华为云码道每日领千万 token 限时活动已于 2026 年 10 月 20 日结束，本活动页面已同步下线相关福利部分。」** |
+| 官方《活动》PDF（**文档版本 01，发布日期 2026-10-20**） | 目录只剩 4 篇：Skill 创新大赛、每日签到得积分、完成学生认证得积分、邀请新用户得积分 —— **全文 0 次出现 Token** |
+| 帮助中心 `llms.txt` 的「活动」索引 | 同上 4 篇；原 `codeartsagent_offers_0001.html`《限时领取Tokens》**已从索引里删除**，直接访问返回站点 404 |
+| 实测（本机两账号） | `GET opengw /api/v1/user/tokens/balance` 与 `/api/v1/gateway/config` 一律 `200 {"error_code":"4000","error_msg":"invalid channel, group not found"}`；不带鉴权则是 `401 APIG.0301`（说明**路由还在、鉴权也还在，是后端那个 channel 分组没了**） |
+
+⚠️ 不要被 `activity.huaweicloud.com/codearts_agent.html` 误导：它仍在线、仍写「每日 1,000 万免费
+Token、0 点清零」，但那是 **2026-09-02 的缓存版本**，页面从未写结束日期（只有一句「保留随时终止或
+调整的权利」）—— 属于没及时下架的营销页，不能当作活动仍在的依据。
+
+**替代品就是积分**：现行免费来源全在积分账上，且都有明确有效期。
+
+| 来源 | 额度 | 有效期 | 活动截止（UTC+8） |
+|---|---|---|---|
+| 每日签到 | 1000 积分/天 | 发放起 **30 天** | 2026-12-31 00:00 |
+| 新用户注册 | 4000 积分（一次） | 30 天 | 2026-12-31 00:00 |
+| 学生认证 | 4000 积分（一次） | **90 天** | 2026-12-31 00:00 |
+| 邀请新用户 | 邀请人 1000 / 被邀请人 6000 | 1 个月，上限 5 万 | 2026-11-15 23:59:59 |
+| 套餐积分 | 体验版 500/月；标准 2000、高级 4000、旗舰 10000 | 按计费周期刷新，**未用不结转** | —— |
+
+> 体验版（免费）积分用尽后**不能买积分包、不能继续发起请求** —— 所以那 1000/天的签到对
+> 免费账号是真的有用，不是可有可无。
+
+来源：[每日签到得积分](https://support.huaweicloud.com/offers-codeartsagent/codeartsagent_offers_0004.html)、
+[个人订阅](https://support.huaweicloud.com/price-codeartsagent/codeartsagent_billing_0029.html)、
+[积分计费模式](https://support.huaweicloud.com/price-codeartsagent/codeartsagent_billing_0028.html)、
+[活动 PDF（2026-10-20）](https://support.huaweicloud.com/offers-codeartsagent/codeartsagent-offers-pdf.pdf)。
 
 「**每日签到领 1000 积分**」进的是**积分账**，走 snap 引擎上的活动接口，三步：
 
@@ -209,6 +242,26 @@ CODEARTS_AK=... CODEARTS_SK=... node scripts/probe-session.mjs <模式> [并发�
 3. **丢弃云端 `channel` 字段** —— 该字段正是上游构建 `AGENT_MODELS` 的依据；本版保留并写入运行期缓存。
 
 此外补齐了 `ineligible` / `captcha` / `inactive` 三种签到 outcome（骨架版遇到会落到 `failed` 并每 30 分钟无意义重试）。
+
+## 0.2.18（2026-10-21：确认免费 Token 池已结束，文档对齐）
+
+只有文档与注释变更，**代码逻辑未动**，193 条测试全绿。起因是用户追问「每日免费池还在吗」。
+
+**结论：2026-10-20 官方已结束，不是接口搬家。** 证据见上文
+[每日免费 Token 池：官方确认已于 2026-10-20 结束](#每日免费-token-池官方确认已于-2026-10-20-结束)：
+
+- 华为云开发者论坛活动帖的「温馨提醒」原文写明 **2026 年 10 月 20 日结束**；
+- 2026-10-20 发布的官方《活动》PDF（文档版本 01）目录里已**整篇移除**《限时领取Tokens》，全文 0 次 Token；
+- 帮助中心 `llms.txt` 的「活动」索引同步删掉了该篇，直连返回站点 404；
+- 实测两账号：`opengw` 的 `/user/tokens/balance`、`/gateway/config` 仍是 `200 + 4000 invalid channel, group not found`
+  （不带鉴权是 `401 APIG.0301`，路由与鉴权都在，**是后端那个 channel 分组没了**）。
+
+**唯一容易看错的地方**：`activity.huaweicloud.com/codearts_agent.html` 还挂着「每日 1,000 万免费 Token」，
+但那是 **2026-09-02 的缓存版本**、从未写结束日期 —— 营销页没下架，不代表活动还在。
+
+**替代品是积分**，四个免费来源都有明确有效期（签到 1000/30 天、注册 4000/30 天、
+学生认证 4000/90 天、邀请 1000+6000/1 个月），活动多在 2026-12-31 00:00 截止；
+体验版套餐每月 500 积分且用尽后不可买积分包。README 的能力表与账本表已按此改写。
 
 ## 0.2.17（2026-10-21：签到/余额搬回 snap 侧，两本账分开展示）
 

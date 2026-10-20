@@ -3,10 +3,11 @@
  *
  * - 授权：华为云访问密钥 AK/SK（一个输入框粘贴 "AK:SK"，SDK-HMAC-SHA256 签名）
  * - 每日签到：GET /v1/ops/delivery?channel=IDE → POST /v1/ops/claim → POST /v1/ops/confirm
- *   （auth.checkin；领的是**积分**，每日 1000，与下面的免费 Token 池是两本并行的账）
+ *   （auth.checkin；领的是**积分**，每日 1000）
  * - 积分余额：GET snap-manager /snap-manager/v1/statistics/plugin（auth.usage）
- * - 免费额度：GET opengw /api/v1/user/tokens/balance（2026-10-20 起网关整组下线，
- *   能拿到才展示 —— 它是另一本账：每日 1000 万 token 池，与积分互不相通）
+ * - 免费 Token 池：**2026-10-20 官方已结束**（论坛公告 + 活动 PDF 目录移除 + 实测
+ *   `4000 invalid channel, group not found`）。opengw 那套 balance/config 保留为
+ *   「拿得到才展示」的可选窗口，但不再指望它——现在只有积分一本账。
  * - 对话：POST snap-access /api/v2/chat/completions（OpenAI chat 形态，body 原样转发）
  *   · 福利模型（benefit）必须附加 maas_type/model-id/model-name 三个头并参与签名
  *   · 老套餐模型（AgentCenter）不能带这三个头（上游报 unsupported model）
