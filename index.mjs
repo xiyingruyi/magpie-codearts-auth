@@ -55,6 +55,32 @@ const CONFIG_PATH = "/api/v1/gateway/config";
 const AGENT_MODELS = ["openpangu-2.0-pro", "openpangu-2.0-flash", "GLM-5.2"];
 
 /**
+ * 上游**已确认不可用**的模型 —— 不再出现在清单里。
+ *
+ * 2026-10-20 福利通道下线后逐个直连实测（两个账号、流式与非流式都试）：
+ *
+ *   模型                     带福利头            不带福利头
+ *   deepseek-v4.1-flash      4004 benefit gone   **200 正常推理**
+ *   deepseek-v4-pro-0813     4004 benefit gone   404 model is not registered
+ *   glm-5.3-flash            4004 benefit gone   404 model is not registered
+ *   deepseek-v4-flash-0731   4004 benefit gone   404 model is not registered
+ *
+ * 后三个现在**两条通道都不通**。留在清单里只会让 magpie 轮询到它们、拿一个 400
+ * —— 而 magpie 对不带额度关键词的 400 是不 failover 的（整组直接失败，实测
+ * `group/auto-deepseek-v4-pro` 4 次里 1 次这样挂）。摘掉它们，组里就只剩真能跑
+ * 的成员。
+ *
+ * 活动恢复后它们会重新出现在云端清单里 —— 那时把名字从这里删掉即可（云端清单
+ * 本来就会覆盖静态兜底，这里只影响「不该被轮询」的那一层）。名字统一小写比较。
+ */
+const RETIRED_MODELS = new Set(["deepseek-v4-pro-0813", "glm-5.3-flash", "deepseek-v4-flash-0731"]);
+
+/** 这条模型还该不该出现在清单里。 */
+function modelRetired(id) {
+  return RETIRED_MODELS.has(String(id ?? "").trim().toLowerCase());
+}
+
+/**
  * 上游 `max_tokens` **参数的硬上限**（实测出来的，不是猜的）。
  *
  * 实测：`max_tokens=65536` 正常返回；`65537` 起上游报
@@ -290,6 +316,65 @@ function isBenefitChannel(modelId, knownChannel = "", ak = "") {
   if (ch === "agent") return false;
   // 无 channel 信息 → 黑名单：命中 AgentCenter 名单才算老套餐，其余按 benefit
   return !AGENT_MODELS.some((m) => m.toLowerCase() === id.toLowerCase());
+}
+
+/**
+ * 福利通道的熔断表：`AK|modelId` → 到期时间戳。
+ *
+ * 🔴 2026-10-20 22:00 前后，上游把福利通道整个摘掉了（两个账号、四个福利模型
+ *    全部复现）。任何此前属于「限时福利」的模型只要带上那三个头就回
+ *      {"error_code":"4004","error_msg":"benefit not found"}      （非流式）
+ *      data:{"error_code":"InferHub.4004.200","error_msg":"benefit not found"} （流式首帧）
+ *    而**不带**这三个头时 `deepseek-v4.1-flash` 照常推理（实测 200）。
+ *
+ *    这三个头参与签名，所以「该不该带」只能在拿到响应之后才知道 —— 每次都先撞
+ *    一次再重发，等于把每个请求的延迟翻倍。这里按「账号 + 模型」记一笔：撞到
+ *    `benefit not found` 就在 TTL 内直接走普通通道，TTL 过后再试一次福利通道
+ *    （上游把活动恢复时能自动切回去）。
+ *
+ *    按模型而不是按账号记账，是因为「福利没了」完全可能只发生在某个模型上
+ *    （活动只续了其中几个），一刀切会让好用的模型也跟着降级。
+ */
+const BENEFIT_DOWN_MS = 10 * 60 * 1000;
+const benefitDown = new Map();
+
+const benefitKey = (ak, model) => `${String(ak ?? "")}|${String(model ?? "").trim().toLowerCase()}`;
+
+/** 该账号这条模型的福利通道是否处于熔断期。 */
+function benefitBroken(ak, model, now = Date.now()) {
+  const until = benefitDown.get(benefitKey(ak, model));
+  if (until === undefined) return false;
+  if (until > now) return true;
+  benefitDown.delete(benefitKey(ak, model)); // 过期就清掉，允许再试福利通道
+  return false;
+}
+
+/** 记一笔「这账号这条模型的福利通道不通」，TTL 内不再带那三个头。 */
+function markBenefitBroken(ak, model, now = Date.now()) {
+  benefitDown.set(benefitKey(ak, model), now + BENEFIT_DOWN_MS);
+}
+
+/**
+ * 上游「福利通道没了」的两种写法（非流式 `4004 benefit not found`、
+ * 流式首帧 `InferHub.4004.200 benefit not found`）。
+ *
+ * 只认这个签名，不认错误码 —— `4004` 太宽，别把别的业务错误也当成福利下线
+ * 而去掉签名头重发。
+ */
+function benefitGone(text) {
+  return /benefit\s+not\s+found|InferHub\.4004\b/i.test(String(text ?? ""));
+}
+
+/**
+ * 权益网关整体下线（余额 / 领取 / 清单三个接口同一句
+ * `4000 invalid channel, group not found`，实测 2026-10-20）。
+ *
+ * 这类错误是**终局**，不是「这次没拉到」：调用方据此静默退回静态清单 / 报
+ * `ineligible`，而不是一直重试并刷日志。服务端哪天恢复，这条判定自然不再命中。
+ */
+function gatewayRetired(err) {
+  const msg = String(err?.message ?? err ?? "");
+  return /invalid\s+channel|group\s+not\s+found/i.test(msg);
 }
 
 // ---------------------------------------------------------------------------
@@ -690,6 +775,7 @@ function streamWithErrorEvents(prefix, dec, reader, firstRead = null) {
   const enc = new TextEncoder();
   let buf = prefix;
   let pending = firstRead;
+  let closed = false;
   const rewrite = (line) => {
     const t = line.startsWith("data:") ? line.slice(5).trim() : "";
     if (!t || t === "[DONE]") return line;
@@ -697,36 +783,48 @@ function streamWithErrorEvents(prefix, dec, reader, firstRead = null) {
     if (!err) return line;
     return `data:${JSON.stringify({ error: { message: err.message, type: "codearts_error", code: err.code } })}`;
   };
+  /** 把缓冲区里**已经完整**的行入队；返回这次入队的行数。 */
   const drain = (controller) => {
     const lines = buf.split("\n");
     buf = lines.pop();
-    if (lines.length) controller.enqueue(enc.encode(lines.map(rewrite).join("\n") + "\n"));
+    if (!lines.length) return 0;
+    controller.enqueue(enc.encode(lines.map(rewrite).join("\n") + "\n"));
+    return lines.length;
   };
   return new ReadableStream({
     start(controller) {
       drain(controller);
     },
     async pull(controller) {
-      let value, done;
+      if (closed) return;
+      // 🔴 一个 pull 里必须读到**至少一整行**才返回。
+      //    以前是「读一块 → 入队完整的行 → 返回」，遇到上游把 `data:` 和后面的
+      //    内容分成两个 chunk 时（实测很常见），这一轮什么都没入队就返回了；
+      //    Node 的 ReadableStream 在 pull 空手而归之后不会再调 pull，
+      //    于是流就停在那儿 —— 20 次压测挂 3~4 次，客户端表现为「回答永不结束」。
       try {
-        ({ value, done } = pending ? await pending : await reader.read());
-        pending = null;
-      } catch (e) {
-        controller.error(e);
-        return;
-      }
-      if (done) {
-        if (buf) {
-          controller.enqueue(enc.encode(rewrite(buf)));
-          buf = "";
+        for (;;) {
+          const { value, done } = pending ? await pending : await reader.read();
+          pending = null;
+          if (done) {
+            closed = true;
+            if (buf) {
+              controller.enqueue(enc.encode(rewrite(buf)));
+              buf = "";
+            }
+            controller.close();
+            return;
+          }
+          buf += dec.decode(value, { stream: true });
+          if (drain(controller)) return;
         }
-        controller.close();
-        return;
+      } catch (e) {
+        closed = true;
+        controller.error(e);
       }
-      buf += dec.decode(value, { stream: true });
-      drain(controller);
     },
     cancel(reason) {
+      closed = true;
       reader.cancel(reason).catch(() => {});
     },
   });
@@ -755,6 +853,71 @@ async function normalizeChatResponse(res) {
 /** 保留一位小数（百分比的展示精度）。 */
 function round1(n) {
   return Math.round(Number(n) * 10) / 10;
+}
+
+/**
+ * 对话应答的统一收尾：先窥探首帧判断「福利通道是不是没了」，再把响应规范化。
+ *
+ * 两种下线形态都要认（实测 2026-10-20）：
+ *   · 非流式：HTTP 200 + `{"error_code":"4004","error_msg":"benefit not found"}`
+ *   · 流式  ：HTTP 200 + SSE 首帧 `data:{"error_code":"InferHub.4004.200",…}`
+ *
+ * 🔴 **窥探与改写必须一次做完，绝不能分两层**。踩过的两个坑：
+ *
+ *    ① 用 `res.clone()` 窥探 —— clone 会把上游流 tee 成两支，取消窥探那一支
+ *       会把另一支一起卡住（对真上游实测：卡在 `reader.cancel()` 上永不返回）。
+ *    ② 先在这里 peek 一层、再让 `normalizeChatResponse` 包第二层 —— 同一次
+ *       未完成的 `read()` 被两层流各挂一份，~15% 的流式请求永远不结束。
+ *
+ *    所以这里只拿一次 reader：读出首帧用于判定，然后把「已读到的字节 + 这个
+ *    reader + 那次可能还没回来的 read」一起交给 `streamWithErrorEvents` 继续
+ *    转发。命中时返回 `{gone:true}`，调用方丢掉这个响应、换个签名重发。
+ *
+ * 返回 `{gone:true, err}` 或 `{gone:false, res}`（res 已是规范化后的成品，
+ * 调用方**直接**交出去，不要再包 normalizeChatResponse）。
+ */
+async function sniffBenefitGone(res) {
+  if (!res || res.status !== 200 || !res.body) return { gone: false, res };
+  const ct = String(res.headers.get("content-type") ?? "").toLowerCase();
+  // 只有对话的两种应答形态值得看；别的一律不碰
+  if (!ct.includes("application/json") && !ct.includes("text/event-stream")) return { gone: false, res };
+
+  if (!ct.includes("text/event-stream")) {
+    let text;
+    try { text = await res.text(); } catch { return { gone: false, res } };
+    if (benefitGone(text)) {
+      try { await res.body?.cancel?.(); } catch { /* 已读完 */ }
+      return { gone: true, err: upstreamError(text) ?? { message: "benefit not found" } };
+    }
+    // 与 normalizeChatResponse 的非流式分支同一套处理：藏起来的错误翻成 400
+    const err = upstreamError(text);
+    if (err) return { gone: false, res: errorResponse(err) };
+    return {
+      gone: false,
+      res: new Response(text, {
+        status: res.status,
+        statusText: res.statusText,
+        headers: cloneHeadersWithout(res.headers),
+      }),
+    };
+  }
+
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  const { text, pending, err } = await peekStream(reader, dec);
+  if (benefitGone(text) || (err && benefitGone(err.message))) {
+    try { await reader.cancel(); } catch { /* 已经断了 */ }
+    return { gone: true, err: err ?? upstreamError(text) ?? { message: "benefit not found" } };
+  }
+  // 不是福利下线：把窥探结果原样接回去，剩下的照旧按行转发/改写
+  return {
+    gone: false,
+    res: new Response(streamWithErrorEvents(text, dec, reader, pending), {
+      status: res.status,
+      statusText: res.statusText,
+      headers: cloneHeadersWithout(res.headers),
+    }),
+  };
 }
 
 /**
@@ -799,6 +962,12 @@ function checkinOutcome(posted, createMs, err) {
   }
   const code = String(err?.errorCode ?? "");
   const msg = String(err?.message ?? "");
+  // 权益网关整个没了（2026-10-20 实测：`invalid channel, group not found`，
+  // 余额 / 领取 / 清单三个接口同时这样回）。活动已下线，不是「这次没签上」，
+  // 报 ineligible 让宿主别再每 30 分钟重试一次必死的请求。
+  if (gatewayRetired(err) || benefitGone(msg)) {
+    return { outcome: "ineligible", message: "上游权益网关已下线（福利活动结束），无需签到" };
+  }
   // 活动已结束 / 不在活动期 → 不是失败，不必重试
   if (/已结束|not\s*in\s*(the\s*)?activity|activity.*(end|expired)/i.test(msg) || code === "0004") {
     return { outcome: "ineligible", message: "当前不在签到活动期内" };
@@ -822,6 +991,7 @@ function checkinOutcome(posted, createMs, err) {
 function codeartsModels() {
   const out = {};
   for (const [id, meta] of Object.entries(MODEL_META)) {
+    if (modelRetired(id)) continue; // 两条通道都不通，别让宿主轮询到（见 RETIRED_MODELS）
     out[id] = {
       name: meta.name,
       id,
@@ -960,28 +1130,48 @@ export default async function codeartsPlugin(_input, options) {
             if (isChat && bodyStr) {
               try { model = String(JSON.parse(bodyStr).model ?? ""); } catch { /* 保持空 */ }
             }
-            const extra = isChat && isBenefitChannel(model, "", ak)
-              ? { ...session, maas_type: "benefit", "model-id": model, "model-name": model }
-              : session;
-            const headers = sdkSignedHeaders(method, target, bodyStr, ak, sk, extra);
+            const benefit = isChat && isBenefitChannel(model, "", ak);
+            const send = async (withBenefit) => {
+              const extra = withBenefit
+                ? { ...session, maas_type: "benefit", "model-id": model, "model-name": model }
+                : session;
+              const headers = sdkSignedHeaders(method, target, bodyStr, ak, sk, extra);
 
-            // 原请求的其它头（例如 accept: text/event-stream）要保留：
-            // 流式与非流式靠它区分，丢了会让上游按非流式应答。
-            const merged = new Headers(req?.headers);
-            new Headers(init?.headers).forEach((v, k) => merged.set(k, v));
-            for (const [k, v] of Object.entries(headers)) merged.set(k, v);
-            // host 只参与签名，不能手动发；magpie 自己的交接头只给插件读，
-            // 不能转给上游厂商（别指望宿主替我们擦，新版本可能不再擦）
-            merged.delete("host");
-            for (const k of MAGPIE_ONLY_HEADERS) merged.delete(k);
+              // 原请求的其它头（例如 accept: text/event-stream）要保留：
+              // 流式与非流式靠它区分，丢了会让上游按非流式应答。
+              const merged = new Headers(req?.headers);
+              new Headers(init?.headers).forEach((v, k) => merged.set(k, v));
+              for (const [k, v] of Object.entries(headers)) merged.set(k, v);
+              // host 只参与签名，不能手动发；magpie 自己的交接头只给插件读，
+              // 不能转给上游厂商（别指望宿主替我们擦，新版本可能不再擦）
+              merged.delete("host");
+              for (const k of MAGPIE_ONLY_HEADERS) merged.delete(k);
 
-            const forwarded = bodyStr === "" ? undefined : bodyStr;
-            const res = await fetch(target, {
-              method,
-              headers: merged,
-              ...(forwarded !== undefined ? { body: forwarded } : {}),
-              signal: init?.signal ?? req?.signal,
-            });
+              const forwarded = bodyStr === "" ? undefined : bodyStr;
+              return fetch(target, {
+                method,
+                headers: merged,
+                ...(forwarded !== undefined ? { body: forwarded } : {}),
+                signal: init?.signal ?? req?.signal,
+              });
+            };
+
+            // 福利通道是**按签名头**选的，带错了只有上游知道。撞到 `benefit not found`
+            // 就当场去掉那三个头重发一次（同一请求、同一 body，签名随头重算），
+            // 并把这条模型记进熔断表，TTL 内不再先撞一次。详见 benefitDown 的注释。
+            // 🔴 sniffBenefitGone 返回的 res 已经是成品（窥探 + 改写一次做完），
+            //    **不能再包一层 normalizeChatResponse**（见它的注释）。
+            if (benefit && !benefitBroken(ak, model)) {
+              const probe = await sniffBenefitGone(await send(true));
+              if (!probe.gone) return probe.res;
+              markBenefitBroken(ak, model);
+              // 去掉签名头重发。普通通道若是**真的**能跑就用它；跑不了（`model is
+              // not registered`）说明这条模型只有福利通道认，那就把「福利没了」
+              // 这条更可执行的错误交给调用方。
+              const plain = await normalizeChatResponse(await send(false));
+              return plain.status === 400 ? errorResponse(probe.err) : plain;
+            }
+            const res = await send(false);
             // 上游会把「模型不存在」这类错误藏在 HTTP 200 里（见 normalizeChatResponse）
             return isChat ? normalizeChatResponse(res) : res;
           },
@@ -1000,7 +1190,10 @@ export default async function codeartsPlugin(_input, options) {
           if (auth?.type !== "api" || !auth.key) return { error: "未登录", windows: [] };
           ({ ak, sk } = creds(auth));
           const bal = await fetchBalance(ak, sk).catch(() => null);
-          if (!bal) return { error: "额度接口无数据", windows: [] };
+          // 🔴 权益网关下线时（`invalid channel, group not found`）余额接口只会一直
+          //    返回空，别让卡片上只写一句「失败」。给出可读的原因，路由不受影响
+          //    —— 这个钩子只影响展示。
+          if (!bal) return { error: "额度接口无数据（上游权益网关可能已下线）", windows: [] };
           // 🔴 以前这里还会 GET 一次 claim 端点来判断「今日已签」，依据是
           //    create_time —— 那是权益记录的创建时间，从不随签到推进（见
           //    checkinOutcome 注释），于是每张卡片上永远写着「今日未签」。
@@ -1096,6 +1289,7 @@ export default async function codeartsPlugin(_input, options) {
           for (const m of rows) {
             const id = String(m.model_id ?? m.modelId ?? m.id ?? "").trim();
             if (!id) continue;
+            if (modelRetired(id)) continue; // 福利没了、普通通道也不认（见 RETIRED_MODELS）
             // 🔴 保留云端 channel：既用于本次判定，也写进本账号的 channel 表供 loader 用
             const channel = String(m.channel ?? "").trim().toLowerCase();
             if (channel === "agent" || channel === "benefit") table.set(id.toLowerCase(), channel);
@@ -1117,6 +1311,10 @@ export default async function codeartsPlugin(_input, options) {
           }
           return out;
         } catch (e) {
+          // 权益网关**永久**下线（2026-10-20 起 `invalid channel, group not found`）
+          // 不是「这次没拉到」：每次刷新都抛一次只会刷满日志，而静态清单本来就
+          // 是对的。只有网络/临时错误才上抛给宿主记 listError。
+          if (gatewayRetired(e)) return provider.models;
           // 拉取失败：**不清缓存**（旧判定仍然是对这个账号最靠谱的信息），
           // 并把原因抛给宿主 —— 宿主会记 listError，在提供商页显示出来
           throw new Error(`CodeArts 模型清单获取失败: ${redact(e?.message ?? String(e), ak, sk)}`);
@@ -1133,7 +1331,10 @@ export const _internal = {
   checkinOutcome, startOfTodayMs, isBenefitChannel, codeartsModels, clampChatBody,
   upstreamSessionId, sessionHeaders, num, round1, optNumber, outputLimit, CN_OFFSET_MS,
   channelCache, channelTable, MODEL_META, VISION_MODELS, AGENT_MODELS, MAX_OUTPUT_TOKENS,
+  RETIRED_MODELS, modelRetired,
+  benefitBroken, markBenefitBroken, benefitGone, gatewayRetired, benefitDown, BENEFIT_DOWN_MS,
   modalitiesField, capabilitiesField, imageCapable,
   normalizeChatBody, upstreamError, normalizeChatResponse, rewriteStreamError, PEEK_MS,
+  sniffBenefitGone,
   SNAP_HOST, CHAT_PATH, OPENGW_HOST,
 };

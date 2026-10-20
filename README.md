@@ -14,7 +14,7 @@
 
 ```sh
 magpie plugin add github:liuxigreen/magpie-codearts-auth   # 上游原版
-magpie plugin add github:xiyingruyi/magpie-codearts-auth   # 本 fork（含 0.2.15 修复）
+magpie plugin add github:xiyingruyi/magpie-codearts-auth   # 本 fork（含 0.2.16 修复）
 magpie plugin login codearts
 magpie quota
 ```
@@ -182,6 +182,40 @@ CODEARTS_AK=... CODEARTS_SK=... node scripts/probe-session.mjs <模式> [并发�
 3. **丢弃云端 `channel` 字段** —— 该字段正是上游构建 `AGENT_MODELS` 的依据；本版保留并写入运行期缓存。
 
 此外补齐了 `ineligible` / `captcha` / `inactive` 三种签到 outcome（骨架版遇到会落到 `failed` 并每 30 分钟无意义重试）。
+
+## 0.2.16（2026-10-20 晚：上游把福利通道摘了）
+
+**现象**：所有福利模型（`deepseek-v4.1-flash` / `deepseek-v4-pro-0813` /
+`glm-5.3-flash` / `deepseek-v4-flash-0731`）突然 400：
+
+```
+{"code":"InferHub.4004.200","message":"CodeArts 码道 (Huawei): benefit not found", …}
+```
+
+**根因**（直连实测，两个账号四模型全复现）：上游把「限时福利」分组整个下线了。
+
+| 请求 | 结果 |
+|---|---|
+| 带 `maas_type: benefit` + `model-id` + `model-name`（三个头参与签名） | **四个福利模型全部** `4004 benefit not found` |
+| 不带这三个头 | `deepseek-v4.1-flash` 正常推理（非流式 / 流式 / 带工具 / `max_tokens=65536` 全 200）；其余三个回 `InferHub.002002009.404 model is not registered` |
+| `opengw` 的 `/gateway/config`、`/user/tokens/balance`、`/benefit/claim` | 一律 `4000 invalid channel, group not found`（权益网关本身下线，签到与余额一并失效） |
+
+**修法**：
+
+- 撞到 `benefit not found`（非流式 `4004`、流式首帧 `InferHub.4004.200`）就**去掉那三个头重发一次**（同一 body，签名随头重算）。普通通道能跑就用它；跑不了（`model is not registered`）就把「福利没了」这条可行动的错误报给调用方，而不是把两个错误都糊掉。
+- 加 `benefitDown` 熔断表（按 **账号+模型**，10 分钟）：撞过一次之后 TTL 内直接走普通通道，不再每次先撞一次白花一倍延迟；TTL 过后自动重试福利通道，活动恢复后能自己切回去。
+- `auth.checkin`：`invalid channel / group not found` → `ineligible`（不是 `failed`），否则宿主每 30 分钟重试一次必死的请求；`usage` 卡片给出可读原因。
+- **退役模型**（`RETIRED_MODELS`）：`deepseek-v4-pro-0813` / `glm-5.3-flash` / `deepseek-v4-flash-0731` 福利头没了之后，不带头的普通通道回 `404 model is not registered` —— **两条通道都不通**。它们仍留在清单里的话，magpie 轮询到就得到一个不带额度关键词的 400，而 magpie 对这种 400 **不 failover**（实测 `group/auto-deepseek-v4-pro` 4 次挂 1 次）。所以从清单里摘掉，云端清单里出现时也同样过滤。
+- 名单钩子在「权益网关永久下线」时**静默退回静态清单**，不再每次刷新都刷一条 `listError`；网络类临时错误仍照旧上抛。
+
+**同时修掉的两个流式缺陷**（都不是这次引入的，是压测时才暴露）：
+
+| # | 问题 | 修法 |
+|---|---|---|
+| ㉘ | `streamWithErrorEvents` 的 `pull()` 在下游缓冲区里**还没有完整一行**时直接返回。上游把 `data:` 和后面的内容分成两个 chunk 时（实测很常见），这一轮什么都没入队就返回 → Node 的 `ReadableStream` 在 `pull` 空手而归后**不会再调用 `pull`**，而客户端的那次 read 永远挂着：**20 次压测挂 3~4 次**，表现是「回答永远不结束」（0.2.15 也有，只是此前没压测到） | `pull` 里循环读到**至少一整行**才返回；`done`/出错时置 `closed`，避免重复收尾 |
+| ㉙ | 用 `res.clone()` 窥探首帧会 tee 上游流：取消窥探那一支时另一支一起卡死（实测 `reader.cancel()` 永不返回） | 窥探只用**一个** reader，判定完把「已读字节 + reader + 还没回来的那次 read」一并交给转发层，全程只有一层流 |
+
+测试 140 条。
 
 ## 0.2.4 – 0.2.15（本 fork）
 

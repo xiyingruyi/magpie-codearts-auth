@@ -10,7 +10,8 @@ const {
   outputLimit, MAX_OUTPUT_TOKENS, normalizeChatBody,
   upstreamError, normalizeChatResponse, PEEK_MS,
   upstreamSessionId, sessionHeaders, CN_OFFSET_MS,
-  channelCache, channelTable, MODEL_META, VISION_MODELS, AGENT_MODELS,
+  channelCache, channelTable, MODEL_META, VISION_MODELS, AGENT_MODELS, RETIRED_MODELS, modelRetired,
+  benefitBroken, markBenefitBroken, benefitGone, gatewayRetired, benefitDown, BENEFIT_DOWN_MS,
   modalitiesField, capabilitiesField, imageCapable,
   SNAP_HOST, CHAT_PATH, OPENGW_HOST,
 } = mod._internal;
@@ -27,7 +28,7 @@ async function usageWith(respond, ak = AK, sk = SK) {
   const real = globalThis.fetch;
   globalThis.fetch = respond;
   try {
-    return await plugin.auth.usage(async () => ({ type: "api", key: ak, metadata: { sk } }));
+    return await plugin.auth.usage(async () => ({ type: "api", key: ak, metadata: { sk: SK } }));
   } finally {
     globalThis.fetch = real;
   }
@@ -175,6 +176,152 @@ test("MODEL_META 里标了 benefit 的模型，判定也确实是 benefit（一�
 });
 
 // ---------------------------------------------------------------------------
+// 福利通道下线（2026-10-20 上游改动）
+// ---------------------------------------------------------------------------
+
+test("benefitGone: 认得上游两种写法（非流式 4004 / 流式 InferHub.4004.200）", () => {
+  assert.equal(benefitGone(JSON.stringify({ error_code: "4004", error_msg: "benefit not found", result: null })), true);
+  assert.equal(benefitGone(`data:{"error_code":"InferHub.4004.200","error_msg":"benefit not found"}`), true);
+  assert.equal(benefitGone('{"error_code":"InferHub.4004.200"}'), true);
+});
+
+test("benefitGone: 不误伤别的错误（4004 单独出现、model not registered、正常回答）", () => {
+  assert.equal(benefitGone('{"error_code":"4004","error_msg":"something else"}'), false, "4004 本身太宽，不能当判据");
+  assert.equal(benefitGone('{"error_code":"InferHub.002002009.404","error_msg":"The model is not registered"}'), false);
+  assert.equal(benefitGone('{"usage":{"prompt_tokens":1},"choices":[]}'), false);
+  assert.equal(benefitGone(""), false);
+});
+
+test("benefitBroken / markBenefitBroken: 按账号+模型记账，TTL 过后自动放行", () => {
+  benefitDown.clear();
+  const now = 1_800_000_000_000;
+  assert.equal(benefitBroken(AK, "deepseek-v4.1-flash", now), false, "没记过 → 不熔断");
+  markBenefitBroken(AK, "deepseek-v4.1-flash", now);
+  assert.equal(benefitBroken(AK, "deepseek-v4.1-flash", now + 1000), true);
+  assert.equal(benefitBroken(AK, "DeepSeek-V4.1-Flash", now + 1000), true, "模型名大小写不敏感");
+  assert.equal(benefitBroken("LTAIother", "deepseek-v4.1-flash", now + 1000), false, "换个账号不算熔断");
+  assert.equal(benefitBroken(AK, "glm-5.3-flash", now + 1000), false, "只熔断出事的那个模型");
+  assert.equal(benefitBroken(AK, "deepseek-v4.1-flash", now + BENEFIT_DOWN_MS + 1), false, "TTL 过后再试一次福利通道");
+  benefitDown.clear();
+});
+
+test("loader.fetch: 撞到 benefit not found 就去掉三头重发，并把这条模型熔断", async () => {
+  benefitDown.clear();
+  const plugin = await mod.default({}, {});
+  const l = await plugin.auth.loader(async () => ({ type: "api", key: AK, metadata: { sk: SK } }));
+  const target = hostUrl(l.baseURL);
+  const body = JSON.stringify({ model: "deepseek-v4.1-flash", messages: [{ role: "user", content: "hi" }], stream: false });
+  const calls = [];
+  const real = globalThis.fetch;
+  globalThis.fetch = async (u, i) => {
+    calls.push({ url: u, headers: new Headers(i.headers), body: i.body });
+    if (i.headers.get("maas_type") === "benefit") {
+      return new Response(JSON.stringify({ error_code: "4004", error_msg: "benefit not found", result: null }), {
+        status: 200, headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({ id: "ok", choices: [{ message: { role: "assistant", content: "hi" } }], usage: {} }), {
+      status: 200, headers: { "content-type": "application/json" },
+    });
+  };
+  let res;
+  try {
+    res = await l.fetch(target, { method: "POST", body });
+  } finally {
+    globalThis.fetch = real;
+  }
+  assert.equal(calls.length, 2, "应恰好重发一次");
+  assert.equal(calls[0].headers.get("maas_type"), "benefit", "第一次按福利通道走");
+  assert.equal(calls[1].headers.get("maas_type"), null, "第二次去掉福利头");
+  assert.doesNotMatch(calls[1].headers.get("Authorization"), /maas_type/, "签名也要跟着去掉这个头");
+  assert.equal(calls[1].body, body, "body 一个字节都不改（只有头变了）");
+  assert.equal(res.status, 200, "普通通道成功后应把正常回答交给调用方");
+  assert.equal(benefitBroken(AK, "deepseek-v4.1-flash"), true, "这条模型应被熔断");
+
+  // 熔断期内再来一次：直接走普通通道，不再先撞一次
+  calls.length = 0;
+  globalThis.fetch = async (u, i) => {
+    calls.push({ url: u, headers: new Headers(i.headers), body: i.body });
+    return new Response(JSON.stringify({ id: "ok", choices: [], usage: {} }), {
+      status: 200, headers: { "content-type": "application/json" },
+    });
+  };
+  try {
+    await l.fetch(target, { method: "POST", body });
+  } finally {
+    globalThis.fetch = real;
+  }
+  assert.equal(calls.length, 1, "熔断期内不该再试福利通道");
+  assert.equal(calls[0].headers.get("maas_type"), null);
+  benefitDown.clear();
+});
+
+test("loader.fetch: 普通通道也不认这条模型时，报「福利没了」而不是顺带把问题糊掉", async () => {
+  benefitDown.clear();
+  const plugin = await mod.default({}, {});
+  const l = await plugin.auth.loader(async () => ({ type: "api", key: AK, metadata: { sk: SK } }));
+  const target = hostUrl(l.baseURL);
+  const body = JSON.stringify({ model: "deepseek-v4-pro-0813", messages: [{ role: "user", content: "hi" }], stream: false });
+  const real = globalThis.fetch;
+  globalThis.fetch = async (u, i) => {
+    if (i.headers.get("maas_type") === "benefit") {
+      return new Response(JSON.stringify({ error_code: "4004", error_msg: "benefit not found", result: null }), {
+        status: 200, headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({ error_code: "InferHub.002002009.404", error_msg: "The model is not registered" }), {
+      status: 200, headers: { "content-type": "application/json" },
+    });
+  };
+  let res;
+  try {
+    res = await l.fetch(target, { method: "POST", body });
+  } finally {
+    globalThis.fetch = real;
+  }
+  const parsed = JSON.parse(await res.text());
+  assert.equal(parsed.error.message, "benefit not found", "上游摘掉的就是福利通道，报这条才可行动");
+  assert.equal(benefitBroken(AK, "deepseek-v4-pro-0813"), true, "无论重发结果如何都熔断，避免每次都双倍延迟");
+  benefitDown.clear();
+});
+
+test("loader.fetch: 流式首帧是福利下线错误时同样摘头重发（不能把错误事件当回答转出去）", async () => {
+  benefitDown.clear();
+  const plugin = await mod.default({}, {});
+  const l = await plugin.auth.loader(async () => ({ type: "api", key: AK, metadata: { sk: SK } }));
+  const target = hostUrl(l.baseURL);
+  const body = JSON.stringify({ model: "deepseek-v4.1-flash", messages: [{ role: "user", content: "hi" }], stream: true });
+  let calls = 0;
+  const real = globalThis.fetch;
+  globalThis.fetch = async (u, i) => {
+    calls += 1;
+    if (i.headers.get("maas_type") === "benefit") {
+      return new Response(
+        `data:${JSON.stringify({ error_code: "InferHub.4004.200", error_msg: "benefit not found" })}\n\n`,
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    }
+    return new Response(
+      `data:${JSON.stringify({ choices: [{ delta: { content: "hi" } }] })}\n\ndata:[DONE]\n\n`,
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+  };
+  let res;
+  try {
+    res = await l.fetch(target, { method: "POST", body });
+  } finally {
+    globalThis.fetch = real;
+  }
+  assert.equal(calls, 2, "流式也要重发一次");
+  assert.equal(res.status, 200);
+  const text = await res.text();
+  assert.match(text, /"content":"hi"/, "应拿到普通通道的正常分片");
+  assert.doesNotMatch(text, /benefit not found/);
+  benefitDown.clear();
+});
+
+
+// ---------------------------------------------------------------------------
 // 签名
 // ---------------------------------------------------------------------------
 
@@ -277,6 +424,79 @@ test("checkinOutcome: 普通错误 → failed", () => {
   assert.equal(checkinOutcome(false, undefined, { message: "网络超时" }).outcome, "failed");
 });
 
+test("modelRetired: 福利下线后两条通道都不通的模型被摘掉，能跑的留着", () => {
+  // 2026-10-20 实测：带福利头 4004，不带福利头 404 model is not registered
+  for (const id of ["deepseek-v4-pro-0813", "glm-5.3-flash", "deepseek-v4-flash-0731"]) {
+    assert.equal(modelRetired(id), true, `${id} 应退役`);
+    assert.equal(modelRetired(id.toUpperCase()), true, `${id} 大小写不敏感`);
+  }
+  // 不带福利头能正常推理的 —— 必须留着
+  for (const id of ["deepseek-v4.1-flash", "openpangu-2.0-flash", "GLM-5.2"]) {
+    assert.equal(modelRetired(id), false, `${id} 还能跑，不该退役`);
+    assert.ok(codeartsModels()[id], `${id} 应该在清单里`);
+  }
+});
+
+test("provider.models: 云端清单里的退役模型同样被过滤掉", async () => {
+  const plugin = await mod.default({}, {});
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    result: {
+      models: [
+        { model_id: "deepseek-v4-pro-0813", context_window: 1000000, max_tokens: 393216, channel: "benefit" },
+        { model_id: "deepseek-v4.1-flash", context_window: 1000000, max_tokens: 393216, channel: "benefit" },
+      ],
+    },
+  }), { status: 200 });
+  try {
+    const r = await plugin.provider.models({ models: {} }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
+    assert.equal(r["deepseek-v4-pro-0813"], undefined, "退役模型不该被发布（否则宿主轮询到就是不带 failover 的 400）");
+    assert.ok(r["deepseek-v4.1-flash"]);
+  } finally {
+    globalThis.fetch = real;
+    channelCache.clear();
+  }
+});
+
+test("checkinOutcome: 权益网关整个下线 → ineligible（不是 failed，别让宿主每 30 分钟重试）", () => {
+  // 2026-10-20 实测：balance / claim / config 三个接口同时回这一句
+  const r = checkinOutcome(false, undefined, {
+    message: "CodeArts /api/v1/benefit/claim 业务错误 4000: invalid channel, group not found",
+  });
+  assert.equal(r.outcome, "ineligible");
+  assert.match(r.message, /权益网关/);
+});
+
+test("gatewayRetired: 只认「网关下线」这一句，临时错误照旧可重试", () => {
+  assert.equal(gatewayRetired(new Error("CodeArts /api/v1/user/tokens/balance 业务错误 4000: invalid channel, group not found")), true);
+  assert.equal(gatewayRetired(new Error("CodeArts /api/v1/benefit/claim HTTP 502: bad gateway")), false);
+  assert.equal(gatewayRetired(new Error("CodeArts 请求失败: fetch failed")), false);
+});
+
+test("provider.models: 权益网关永久下线时静默退回静态清单（不再每次刷一条 listError）", async () => {
+  const plugin = await mod.default({}, {});
+  const real = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ error_code: "4000", error_msg: "invalid channel, group not found", result: null }), {
+      status: 200, headers: { "content-type": "application/json" },
+    });
+  let got;
+  try {
+    got = await plugin.provider.models({ models: codeartsModels() }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
+  } finally {
+    globalThis.fetch = real;
+  }
+  assert.deepEqual(got, codeartsModels(), "应原样退回静态清单");
+
+  // 网络类错误仍要抛（宿主据此显示 listError）
+  globalThis.fetch = async () => { throw new Error("fetch failed"); };
+  let threw = false;
+  try {
+    await plugin.provider.models({ models: codeartsModels() }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
+  } catch { threw = true; } finally { globalThis.fetch = real; }
+  assert.equal(threw, true, "临时错误必须上抛");
+});
+
 test("checkinOutcome: POST 受理即 done —— create_time 与签到无关，不能据它判失败", () => {
   // 旧实现把「时间戳未推进」判成 ineligible，于是卡片永远显示未签。
   const old = startOfTodayMs() - 86400000;
@@ -367,9 +587,13 @@ test("round1: 一位小数", () => {
 // 模型清单
 // ---------------------------------------------------------------------------
 
-test("codeartsModels: 含全部内置模型且形状正确", () => {
+test("codeartsModels: 含全部内置模型且形状正确（已退役的不在其中）", () => {
   const m = codeartsModels();
-  assert.equal(Object.keys(m).length, Object.keys(MODEL_META).length);
+  const live = Object.keys(MODEL_META).filter((id) => !modelRetired(id));
+  assert.equal(Object.keys(m).length, live.length);
+  for (const id of RETIRED_MODELS) {
+    assert.equal(m[id], undefined, `${id} 两条通道都不通，不该再出现在清单里`);
+  }
   for (const [id, v] of Object.entries(m)) {
     assert.equal(v.id, id);
     assert.equal(typeof v.name, "string");
@@ -646,7 +870,7 @@ function hostUrl(baseURL) {
  * 只接手 SNAP_HOST 的地址，所以对话测试必须用宿主会给的 URL。
  */
 async function callLoader(plugin, { key = AK, sk = SK, url, init = {}, respond } = {}) {
-  const l = await plugin.auth.loader(async () => ({ type: "api", key, metadata: { sk } }));
+  const l = await plugin.auth.loader(async () => ({ type: "api", key, metadata: { sk: SK } }));
   const target = url ?? hostUrl(l.baseURL);
   let seen;
   const real = globalThis.fetch;
@@ -1297,7 +1521,7 @@ test("provider.models: 云端清单覆盖并保留真实 context/output", async 
   globalThis.fetch = async () => new Response(JSON.stringify({
     result: {
       models: [
-        { model_id: "deepseek-v4-pro-0813", context_window: 1000000, max_tokens: 393216, channel: "benefit" },
+        { model_id: "deepseek-v4.1-flash", context_window: 1000000, max_tokens: 393216, channel: "benefit" },
         { model_id: "GLM-5.2", context_window: 200000, max_tokens: 128000, channel: "agent" },
       ],
     },
@@ -1305,13 +1529,13 @@ test("provider.models: 云端清单覆盖并保留真实 context/output", async 
   try {
     const base = { "GLM-5.2": { id: "GLM-5.2", name: "GLM-5.2", limit: { context: 0, output: 0 } } };
     const r = await plugin.provider.models({ models: base }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
-    assert.equal(r["deepseek-v4-pro-0813"].limit.context, 1000000);
+    assert.equal(r["deepseek-v4.1-flash"].limit.context, 1000000);
     // 云端 393216 是模型能力，上游 max_tokens 参数上限 65536 —— 发布前收敛
-    assert.equal(r["deepseek-v4-pro-0813"].limit.output, MAX_OUTPUT_TOKENS);
+    assert.equal(r["deepseek-v4.1-flash"].limit.output, MAX_OUTPUT_TOKENS);
     assert.equal(r["GLM-5.2"].limit.context, 200000);
     // 缓存按账号隔离：AK 那一层里能查到本账号的判定
     const mine = channelCache.get(AK);
-    assert.equal(mine.get("deepseek-v4-pro-0813"), "benefit");
+    assert.equal(mine.get("deepseek-v4.1-flash"), "benefit");
     assert.equal(mine.get("glm-5.2"), "agent", "键统一小写");
   } finally {
     globalThis.fetch = real;
@@ -1325,8 +1549,8 @@ test("provider.models: 云端模型带 capabilities.input.image（钩子路径�
   globalThis.fetch = async () => new Response(JSON.stringify({
     result: {
       models: [
-        { model_id: "deepseek-v4-pro-0813", context_window: 1000000, max_tokens: 393216, channel: "benefit" },
         { model_id: "deepseek-v4.1-flash", context_window: 1000000, max_tokens: 393216, channel: "benefit" },
+        { model_id: "GLM-5.2", context_window: 200000, max_tokens: 128000, channel: "agent" },
         { model_id: "brand-new-model", context_window: 1000, max_tokens: 100, channel: "benefit" },
       ],
     },
@@ -1335,7 +1559,7 @@ test("provider.models: 云端模型带 capabilities.input.image（钩子路径�
     const r = await plugin.provider.models({ models: {} }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
     // 🔴 宿主对 provider.models 的返回值是**原样采用**的，不走 modalities 转换 ——
     // 这里写 modalities 会被静默丢掉，imageSaid 永远是 false
-    for (const id of ["deepseek-v4-pro-0813", "deepseek-v4.1-flash"]) {
+    for (const id of ["deepseek-v4.1-flash", "GLM-5.2"]) {
       const seen = hostView(r[id]);
       assert.equal(seen.imageSaid, true, `${id} 必须明确声明，不能是「没说」`);
       assert.equal(seen.image, false, `${id} 实测不收图（带图 → 406 not multimodal）`);
