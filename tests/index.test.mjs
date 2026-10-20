@@ -948,6 +948,8 @@ const statsPayload = (over = {}) => ({
   metrics: [
     { name: "usageTokenChatMessages", usage_token_num: 4170599, package_token_amount: 1 },
     {
+      // 总数与下面三个分项**之和故意不等**（实测分叉：337.59 vs 350.05）。
+      // 相等的话「读总数」与「累加分项」在数值上无法区分，测试就白写了。
       name: "usageTotalPackageCredit",
       package_credit_amount: 12500,
       package_credit_used: 337.22,
@@ -956,16 +958,18 @@ const statsPayload = (over = {}) => ({
     },
     { name: "usageBasicPackageCredit", package_credit_amount: 500, package_credit_used: 0, package_credit_remain: 500 },
     { name: "usageOnDemandPackageCredit", package_credit_amount: 0, package_credit_used: 0, package_credit_remain: 0 },
-    { name: "usageBonusPackageCredit", package_credit_amount: 12000, package_credit_used: 337.22, package_credit_remain: 11662.78 },
+    { name: "usageBonusPackageCredit", package_credit_amount: 11500, package_credit_used: 300.05, package_credit_remain: 11199.95 },
   ],
   model_metrics: [],
   ...over,
 });
 
-test("fetchCredits: 只认总数，不累加分项（500 + 0 + 12000 = 12500 是构成明细）", async () => {
+test("fetchCredits: 只认总数，不累加分项", async () => {
+  // 🔴 夹具里的总数**故意不等于**分项之和（实测就出现过：分项 337.59 vs 总数 350.05，
+  //    上游统计滞后/裁剪时两者会分叉）。若夹具让两者相等，把实现改成累加分项也能全绿。
   const f = opsResponder({ stats: statsPayload() });
   const c = await withFetch(f, () => fetchCredits(AK, SK));
-  assert.equal(c.remain, 12162.78);
+  assert.equal(c.remain, 12162.78, "分项之和是 500 + 11199.95 = 11699.95，读到 12162.78 才说明读的是总数");
   assert.equal(c.amount, 12500);
   assert.equal(c.used, 337.22);
   assert.equal(c.endDate, "2026-11-12");
