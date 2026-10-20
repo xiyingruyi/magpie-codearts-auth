@@ -78,7 +78,7 @@ const MAX_OUTPUT_TOKENS = 65536;
  *    `output` 则用**实测的参数上限** `MAX_OUTPUT_TOKENS` —— 它是真的，不是猜的，
  *    而且不设限会让客户端去要一个上游必然拒绝的数（见上）。
  *
- * 🔴 `image`（0.2.13）＝**这个模型收不收图**，逐模型实测，不按名字猜。
+ * 🔴 **codearts 全线不收图**（0.2.15 定论，0.2.13/0.2.14 判错了，见下）。
  *
  *    宿主 `internal/plugin/host.js` 最终读的是模型条目的 `capabilities.input.image`，
  *    再摊成 `image` / `imageSaid` 两个字段，而 `imageSaid` 只在它是**布尔值**时才为真：
@@ -86,29 +86,56 @@ const MAX_OUTPUT_TOKENS = 65536;
  *      · 「明确说不收」的模型，宿主不把带图请求发给它 —— 实测同一个
  *        raccoon 纯文本模型，纯文本请求被试 160 次、带图请求被试 **0** 次；
  *      · 「没说」的照发不误 —— 撞上游
- *        `400 InferHub.001001020.406 The request model is not multimodal`，
+ *        `406 InferHub.001001020.406 The request model is not multimodal`，
  *        还让账号白挨一次 60 秒 backoff（2026-10-20 18:47 的两次就是这样来的）。
- *    所以纯文本模型必须**明确**写 `image: false`，留空就是留了个坑。
+ *    所以必须**明确**声明，留空就是留了个坑。
  *
- *    这里的能力是实测的（2026-10-20，发 64×64 纯色 PNG 要求答颜色）：
- *      · `deepseek-v4-pro-0813` 绿/红/黄三色 **3/3 全对** → 真能看图；
- *        当天 production 里它也确实成功服务了 18 次带图请求。
- *      · `glm-5.3-flash`、`deepseek-v4.1-flash` 一律 400 not multimodal。
- *      · `deepseek-v4-flash-0731` / 两个 openpangu / GLM-5.2 未逐一带图实测，
- *        按同族纯文本模型保守声明 —— 与 `MAX_OUTPUT_TOKENS` 同性质：**实测值，
- *        模型能力变了要跟着改**。
- *      · `kimi-k2.6-vl`（名字带 vl）云端清单里有但账号调不通（`unsupported model`，
- *        两种大小写都试过），也不在注册清单里，故不列。
+ *    **为什么是「全线不收」**（2026-10-20 三个独立证据，详见 README）：
+ *      ① 直连实测（同一端点、同一 benefit 头、只改有没有图）：
+ *         `deepseek-v4-pro-0813` 纯文本 → **200**，同一模型带图 → **406 not multimodal**；
+ *         `deepseek-v4.1-flash` / `glm-5.3-flash` 带图同样 406。
+ *      ② AgentCenter（`/v1/agent-center/agents/detail`，老套餐通道）**真的给
+ *         `supports_images` 字段** —— 该账号下 5 个模型全是 `false`。
+ *      ③ 免费额度网关（`gateway/config`，本插件用的）只有
+ *         `model_id/model_name/context_window/max_tokens/sort` 五个字段、**不含任何能力信息**；
+ *         社区参考实现 codearts2api 对这条通道同样硬编码 `supports_images: False`。
+ *
+ *    ⚠️ 0.2.13 曾据一次**方法有误**的探测把 `deepseek-v4-pro-0813` 标成 `image: true`，
+ *    0.2.14 又把云端路径修对形状 —— 方向都是反的：那等于**请宿主把图片发给一个必然 406
+ *    的模型**。凌晨日志里它「成功服务 18 次带图请求」是假象：那是第 30 轮长对话，
+ *    图片出现在早前轮次，宿主已用「识图模型转文字描述」把原图替成了文字（所以 200）。
  */
 const MODEL_META = {
-  "glm-5.3-flash": { name: "GLM-5.3 Flash", context: 0, output: MAX_OUTPUT_TOKENS, image: false, benefit: true },
-  "deepseek-v4-pro-0813": { name: "DeepSeek V4 Pro", context: 0, output: MAX_OUTPUT_TOKENS, image: true, benefit: true },
-  "deepseek-v4-flash-0731": { name: "DeepSeek V4 Flash", context: 0, output: MAX_OUTPUT_TOKENS, image: false, benefit: true },
-  "deepseek-v4.1-flash": { name: "DeepSeek V4.1 Flash", context: 0, output: MAX_OUTPUT_TOKENS, image: false, benefit: true },
-  "openpangu-2.0-pro": { name: "OpenPangu 2.0 Pro", context: 0, output: MAX_OUTPUT_TOKENS, image: false, benefit: false },
-  "openpangu-2.0-flash": { name: "OpenPangu 2.0 Flash", context: 0, output: MAX_OUTPUT_TOKENS, image: false, benefit: false },
-  "GLM-5.2": { name: "GLM-5.2", context: 0, output: MAX_OUTPUT_TOKENS, image: false, benefit: false },
+  "glm-5.3-flash": { name: "GLM-5.3 Flash", context: 0, output: MAX_OUTPUT_TOKENS, benefit: true },
+  "deepseek-v4-pro-0813": { name: "DeepSeek V4 Pro", context: 0, output: MAX_OUTPUT_TOKENS, benefit: true },
+  "deepseek-v4-flash-0731": { name: "DeepSeek V4 Flash", context: 0, output: MAX_OUTPUT_TOKENS, benefit: true },
+  "deepseek-v4.1-flash": { name: "DeepSeek V4.1 Flash", context: 0, output: MAX_OUTPUT_TOKENS, benefit: true },
+  "openpangu-2.0-pro": { name: "OpenPangu 2.0 Pro", context: 0, output: MAX_OUTPUT_TOKENS, benefit: false },
+  "openpangu-2.0-flash": { name: "OpenPangu 2.0 Flash", context: 0, output: MAX_OUTPUT_TOKENS, benefit: false },
+  "GLM-5.2": { name: "GLM-5.2", context: 0, output: MAX_OUTPUT_TOKENS, benefit: false },
 };
+
+/**
+ * **实测确认能通过 magpie 的图片格式收图**的模型 id（小写）—— 目前为空。
+ *
+ * 这是唯一的例外名单，也是将来华为真支持图片时的扩展点：把模型 id 加进来，
+ * 两个产出模型的路径会自动把它声明成 `image: true`。加之前**必须直连实测过**
+ * （同一端点、同一通道头、只改有没有图，且纯文本对照必须是 200），
+ * 不要再像 0.2.13 那样凭一次方法有误的探测就标 true。
+ */
+const VISION_MODELS = new Set([]);
+
+/**
+ * 这个模型收不收图。
+ *
+ * **默认 false（明确说不收），不是「没说」** —— 理由见 `MODEL_META` 上面那段：
+ * codearts 全线实测不收图，而「没说」会让宿主把带图请求发过来撞 406。
+ * 清单里查不到的模型（云端新上的）同样按 false 发，宁可漏掉一个将来可能支持图片的
+ * 新模型（后果只是它不接带图请求），也不让带图请求打到一个必然失败的地方。
+ */
+function imageCapable(id) {
+  return VISION_MODELS.has(String(id ?? "").trim().toLowerCase());
+}
 
 /**
  * 模型条目里要合并的 `modalities` 字段 —— **只给配置钩子（`codeartsModels()`）用**。
@@ -181,15 +208,6 @@ function capabilitiesField(image) {
     },
   };
 }
-
-/**
- * `MODEL_META` 按小写 id 索引。
- *
- * 云端 `gateway/config` 回的 `model_id` 大小写不保证和静态表一致（表里是
- * `GLM-5.2`，云端可能回别的写法），所以查表统一走小写，与 `channelTable`
- * 存 channel 时的做法一致（那边也是 `id.toLowerCase()`）。
- */
-const MODEL_META_LOWER = Object.fromEntries(Object.entries(MODEL_META).map(([id, m]) => [id.toLowerCase(), m]));
 
 /** 对话端点的绝对地址（loader 里判断「这是不是对话请求」用）。 */
 const CHAT_ABS = `${SNAP_HOST}${CHAT_PATH}`;
@@ -811,7 +829,7 @@ function codeartsModels() {
       reasoning: false,
       tool_call: true,
       // 让宿主知道这个模型收不收图（见 MODEL_META 上方的说明）
-      ...modalitiesField(meta.image),
+      ...modalitiesField(imageCapable(id)),
     };
   }
   return out;
@@ -1091,10 +1109,10 @@ export default async function codeartsPlugin(_input, options) {
               },
               reasoning: false,
               tool_call: true,
-              // 图片能力查静态表（云端 id 大小写不保证一致）；查不到就是「没说」，
-              // 一个键都不写。这里必须用 capabilities 而不是 modalities ——
-              // 这条钩子的返回值宿主原样采用，不走 modalities 转换（见上方说明）
-              ...capabilitiesField(MODEL_META_LOWER[id.toLowerCase()]?.image),
+              // 明确声明收不收图（**不许留空**：留空 = 「没说」= 宿主照发图片 → 406）。
+              // 这里必须用 capabilities 而不是 modalities —— 这条钩子的返回值
+              // 宿主原样采用，不走 modalities 转换（见上方说明）
+              ...capabilitiesField(imageCapable(id)),
             };
           }
           return out;
@@ -1114,8 +1132,8 @@ export const _internal = {
   claimStatus, claimToday, fetchBalance, fetchBenefitModels,
   checkinOutcome, startOfTodayMs, isBenefitChannel, codeartsModels, clampChatBody,
   upstreamSessionId, sessionHeaders, num, round1, optNumber, outputLimit, CN_OFFSET_MS,
-  channelCache, channelTable, MODEL_META, MODEL_META_LOWER, AGENT_MODELS, MAX_OUTPUT_TOKENS,
-  modalitiesField, capabilitiesField,
+  channelCache, channelTable, MODEL_META, VISION_MODELS, AGENT_MODELS, MAX_OUTPUT_TOKENS,
+  modalitiesField, capabilitiesField, imageCapable,
   normalizeChatBody, upstreamError, normalizeChatResponse, rewriteStreamError, PEEK_MS,
   SNAP_HOST, CHAT_PATH, OPENGW_HOST,
 };

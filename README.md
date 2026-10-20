@@ -14,7 +14,7 @@
 
 ```sh
 magpie plugin add github:liuxigreen/magpie-codearts-auth   # 上游原版
-magpie plugin add github:xiyingruyi/magpie-codearts-auth   # 本 fork（含 0.2.14 修复）
+magpie plugin add github:xiyingruyi/magpie-codearts-auth   # 本 fork（含 0.2.15 修复）
 magpie plugin login codearts
 magpie quota
 ```
@@ -183,7 +183,7 @@ CODEARTS_AK=... CODEARTS_SK=... node scripts/probe-session.mjs <模式> [并发�
 
 此外补齐了 `ineligible` / `captcha` / `inactive` 三种签到 outcome（骨架版遇到会落到 `failed` 并每 30 分钟无意义重试）。
 
-## 0.2.4 – 0.2.14（本 fork）
+## 0.2.4 – 0.2.15（本 fork）
 
 在 0.2.3 基础上的改动，逐条都有单测覆盖：
 
@@ -214,27 +214,47 @@ CODEARTS_AK=... CODEARTS_SK=... node scripts/probe-session.mjs <模式> [并发�
 | ㉓ | `usage()` 的 `catch` 引用了 `try` 块内的 `const ak/sk`：凭据不完整时 `creds()` 抛错 → catch 再抛 `ReferenceError`，宿主拿到异常而非「额度查询失败」 | `ak/sk` 提到 `try` 外声明，catch 照常脱敏并返回 error |
 | ㉔ | 流式窥探若直接 `await reader.read()`：上游长思考时可能数秒不发一个字节，宿主就一直拿不到响应头（只判时间戳是拦不住的） | 窥探与 3 秒定时器竞速；超时放弃窥探，把那次**未完成**的 read 交给后续转发，一个字节都不丢 |
 
-| ㉕ | 插件从不声明模型收不收图，magpie 只能记成**「没说」**（`imageSaid:false`）→ 带图请求照样被发给纯文本成员，上游 400 `The request model is not multimodal`、账号被 backoff 60 秒（额度一个 token 没动，所以卡片照旧满格）；而**唯一真会看图**的 `deepseek-v4-pro-0813` 也被记成不能看图 | 新增 `MODEL_META[].image`，逐模型实测声明（见下节）。配置钩子路径写 `modalities`、`provider.models` 钩子路径写 `capabilities` —— 宿主对这两条路的处理**不同**，写错会被静默丢掉；固化表里查不到的模型**一个键都不写**，保持「没说」 |
+| ㉕ | 插件从不声明模型收不收图，magpie 只能记成**「没说」**（`imageSaid:false`）→ 带图请求照样被发给空文本成员，上游 406 `The request model is not multimodal`、账号被 backoff 60 秒（额度一个 token 没动，所以卡片照旧满格） | 给每个模型**明确**声明收不收图：配置钩子路径写 `modalities`、`provider.models` 钩子路径写 `capabilities` —— 宿主对这两条路的处理**不同**，写错会被静默丢掉 |
 | ㉖ | 云端路径把「明确说不收图」写成了 `capabilities: { input: { text: true } }` —— **省掉值为 `false` 的键**。而宿主的 `imageSaid` 判的是 `typeof m.capabilities?.input?.image === "boolean"`，`undefined` 不是布尔 → 又退回「没说」，等于㉕白修（配置钩子那 3 个模型是对的，只有云端那 4 个没生效） | `capabilitiesField()` 照抄宿主自己的 `modalities()`：**每个模态键都在、值都是布尔**。补一条断言 `typeof input.image === "boolean"` 的单测钉死 —— 这条断言就是原来缺的那一条 |
+| ㉗ | **㉕㉖ 的方向整体判错了**：探针绕过了插件自己的通道判定（benefit 通道要 `maas_type: benefit` + `model-id`/`model-name` 三个头并参与签名），于是把「模型未注册」的 404 和「格式不对」的 406 误读成能力差异，给 `deepseek-v4-pro-0813` 标了 `image: true` —— 等于**请宿主把图片发给一个必然 406 的模型** | 用正确通道头重测：codearts **全线不收图**。改为默认全 `false`，例外走 `VISION_MODELS` 名单（当前为空）。清单里没有的模型也明确声明 `false`（原来是「不写键」，会被照发图片） |
 
 测试从 45 条增到 129 条，覆盖上述每一条以及「`used` 永不为 NaN」「空响应不抛错」
 「余额字段为 0 不被 `||` 吞掉」等边界。
 
-### 图片能力（0.2.13 起）
+### 图片能力（0.2.15 定论：codearts 全线不收图）
 
-**识图能力是按模型分的，不是按平台分的。** 实测方法：直接调
-`codearts/<model>`，发一张 64×64 纯色 PNG，要求答颜色。
+**结论：codearts 没有任何模型能通过 magpie 的图片格式收图**，所以插件给每一个模型
+（包括云端新上、清单里没有的）都**明确声明** `image: false`。这样 magpie 在带图请求里
+会跳过 codearts，改派给路由组里能看图的成员（workbuddy / loomy / qoder 等），
+你最初遇到的 406 和随之而来的 60 秒 backoff 就不会再出现。
 
-| 模型 | 收不收图 | 依据 |
-|---|---|---|
-| `deepseek-v4-pro-0813` | ✅ **收** | 绿/红/黄三色 **3/3 全答对**；线上带图请求它成功服务 18 次 |
-| `glm-5.3-flash` | ❌ 不收 | 400 `InferHub.001001020.406 The request model is not multimodal` |
-| `deepseek-v4.1-flash` | ❌ 不收 | 同上 |
-| `deepseek-v4-flash-0731` | ❌ 不收 | 未单独实测，同族纯文本，保守声明 |
-| `openpangu-2.0-pro` / `openpangu-2.0-flash` / `GLM-5.2` | ❌ 不收 | 老套餐纯文本 |
-| `kimi-k2.6-vl` | — | 云端清单里有，但账号调不通（`unsupported model`，两种大小写都试过），**不列** |
+**三个独立证据**（2026-10-20）：
 
-**为什么要声明**：宿主 `internal/plugin/host.js` 把模型能力读成三态 ——
+1. **直连实测**（同一端点、同一 benefit 通道头，只改有没有图）：
+
+   | 请求 | 结果 |
+   |---|---|
+   | `deepseek-v4-pro-0813` 纯文本 | **200** ✓（说明端点与头都对） |
+   | `deepseek-v4-pro-0813` 带图 | **406** `InferHub.001001020.406 The request model is not multimodal` |
+   | `deepseek-v4.1-flash` 带图 | 406 |
+   | `glm-5.3-flash` 带图 | 406 |
+
+   试过 OpenAI 的 `image_url`(data URI / 裸 base64)、`input_image`、`image`、
+   `source{base64}` 等多种形状，以及 64×64 纯色图与 512×512、256×256 噪声图，
+   **没有一种被接受**。
+2. **AgentCenter**（`/v1/agent-center/agents/detail`，老套餐通道）**确实提供
+   `supports_images` 字段** —— 该账号下 5 个模型（`GLM-5.2` / `glm-5.2-sft-harmony` /
+   `openpangu-2.0-pro` / `openpangu-2.0-flash` / `glm-5.3`）**全是 `false`**。
+3. **免费额度网关**（`/api/v1/gateway/config`，本插件用的那条）**不含任何能力信息** ——
+   只有 `model_id` / `model_name` / `context_window` / `max_tokens` / `sort` 五个字段；
+   社区参考实现 codearts2api 对这条通道同样硬编码 `supports_images: False`。
+
+⚠️ **凌晨日志里 `deepseek-v4-pro-0813`「成功服务 18 次带图请求」是假象**：那是第 30 轮的
+长对话，图片出现在早前轮次，宿主已用「识图模型转文字描述」把原图换成了文字，模型收到
+的是纯文本所以 200。不要去信「它接过带图请求且成功」这种二手证据 ——
+**判定能力必须自己直连发一张图，并且要有纯文本对照**。
+
+**为什么要声明成 `false` 而不是留空**：宿主 `internal/plugin/host.js` 把能力读成三态 ——
 
 ```js
 image:     !!m.capabilities?.input?.image,                     // 会不会看图
@@ -243,14 +263,13 @@ imageSaid: typeof m.capabilities?.input?.image === "boolean",  // 厂商有没�
 
 | 怎么写 | 宿主读出 | 语义 | 带图请求 |
 |---|---|---|---|
-| 一个键都不写 | `image:false, imageSaid:false` | **没说** | 照发（会撞 400） |
-| `input.image = false` | `image:false, imageSaid:true` | **明确说不收** | **跳过** |
+| 一个键都不写 | `image:false, imageSaid:false` | **没说** | 照发（会撞 406） |
+| `input.image = false` | `image:false, imageSaid:true` | **明确说不收** | **跳过** ✓ |
 | `input.image = true` | `image:true, imageSaid:true` | 收图 | 可以派给它 |
 
-关键是中间那一行：`imageSaid` 要的是**真的布尔**，所以**值为 `false` 的键不能省**。
 实测证据：同一个 `raccoon/sn-deepseek-v4-1-flash`（`image:false, imageSaid:true`）一天里
 纯文本请求被尝试 160 次、**带图请求 0 次**；而「没说」的 codearts 被尝试了 20 次，
-里面就有那两次 400。
+里面就有那两次 406。**`imageSaid` 要的是真的布尔，所以值为 `false` 的键不能省。**
 
 ⚠️ **两条路径写的字段不一样，这是最容易踩的坑**（都有单测盯着）：
 
@@ -260,8 +279,12 @@ imageSaid: typeof m.capabilities?.input?.image === "boolean",  // 厂商有没�
 | `provider.models` 钩子的云端清单 | 返回值被**原样采用**（`{ ...m, id, providerID }`），**不做**任何 `modalities` 转换 | `capabilities: { input: {…}, output: {…} }`，照抄宿主的 `modalities()` |
 
 「照抄宿主的 `modalities()`」的意思是**五个模态键（`text/image/audio/video/pdf`）一个不落、
-值全是布尔** —— 见上面那张表中间一行。0.2.13 在云端路径上写成了 `{ text: true }`，
-少了 `image: false`，于是一路静默失效到线上才被发现（㉖）。
+值全是布尔**。0.2.13 在云端路径上写成了 `{ text: true }`，少了 `image: false`，
+于是一路静默失效到线上才被发现（㉖）。
+
+**将来华为真支持了怎么办**：把模型 id 加进 `VISION_MODELS`（`index.mjs` 里那个集合），
+两条路径会自动把它声明成 `image: true`。加之前**必须直连实测过**：同一端点、同一通道头、
+只改有没有图，且**纯文本对照必须是 200**（否则你连端点选错了都不知道 —— ㉗ 就是这么翻车的）。
 
 **维护提示**：`image` 和 `context: 0`、`MAX_OUTPUT_TOKENS` 一样是**实测值不是猜的** ——
 上游模型能力变了（或新模型进清单）要跟着改；表里查不到的模型宁可保持「没说」

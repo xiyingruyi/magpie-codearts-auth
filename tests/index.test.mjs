@@ -10,8 +10,8 @@ const {
   outputLimit, MAX_OUTPUT_TOKENS, normalizeChatBody,
   upstreamError, normalizeChatResponse, PEEK_MS,
   upstreamSessionId, sessionHeaders, CN_OFFSET_MS,
-  channelCache, channelTable, MODEL_META, AGENT_MODELS,
-  modalitiesField, capabilitiesField,
+  channelCache, channelTable, MODEL_META, VISION_MODELS, AGENT_MODELS,
+  modalitiesField, capabilitiesField, imageCapable,
   SNAP_HOST, CHAT_PATH, OPENGW_HOST,
 } = mod._internal;
 
@@ -429,14 +429,21 @@ const viaConfigHook = (entry) => ({
   },
 });
 
-test("MODEL_META: 每个模型都实测声明了 image，且只有 pro-0813 会看图", () => {
-  for (const [id, meta] of Object.entries(MODEL_META)) {
-    assert.equal(typeof meta.image, "boolean", `${id} 必须带布尔 image —— 漏了会退回「没说」`);
+test("imageCapable: codearts 全线不收图，且清单外的模型也按「不收」处理", () => {
+  // 2026-10-20 直连实测（同一端点、同一 benefit 头，只改有没有图）：
+  //   deepseek-v4-pro-0813 纯文本 → 200 ；同一模型带图 → 406 not multimodal
+  // AgentCenter 给的 supports_images 也是全 false。所以默认必须是 false。
+  assert.equal(VISION_MODELS.size, 0, "例外名单为空 —— 不要凭一次探测就往里加");
+  for (const id of Object.keys(MODEL_META)) {
+    assert.equal(imageCapable(id), false, `${id} 不该被标成能收图`);
   }
-  // 实测（2026-10-20，发 64×64 纯色 PNG 要求答颜色）：绿/红/黄 3/3 全对
-  assert.equal(MODEL_META["deepseek-v4-pro-0813"].image, true);
-  const seeing = Object.entries(MODEL_META).filter(([, m]) => m.image).map(([id]) => id);
-  assert.deepEqual(seeing, ["deepseek-v4-pro-0813"], "当前只有这一个能看图，多出来就是没实测就标了");
+  // 清单里没有的（云端新上的）同样按「不收」处理，不能退回「没说」
+  assert.equal(imageCapable("brand-new-model"), false);
+  assert.equal(imageCapable("kimi-k2.6-vl"), false, "名字带 vl 也不代表这个通道能用");
+  // 大小写与空值
+  assert.equal(imageCapable("GLM-5.2"), false);
+  assert.equal(imageCapable(undefined), false, "拿不到 id 时也不能变成 true");
+  assert.equal(imageCapable(""), false);
 });
 
 test("modalitiesField: 未知就不写键；只认布尔值", () => {
@@ -478,21 +485,18 @@ test("两条路给宿主的结论必须一致（配置钩子 vs provider.models 
   assert.equal(hostView(capabilitiesField(undefined)).imageSaid, false);
 });
 
-test("配置钩子路径: 每个模型在宿主眼里都是「说过了」（不能是「没说」）", () => {
+test("配置钩子路径: 每个模型在宿主眼里都是「明确说不收图」", () => {
   for (const [id, v] of Object.entries(codeartsModels())) {
-    assert.equal(hostView(viaConfigHook(v)).imageSaid, true, `${id} 必须明确声明收不收图`);
+    const seen = hostView(viaConfigHook(v));
+    assert.equal(seen.imageSaid, true, `${id} 必须明确声明收不收图，不能是「没说」`);
+    assert.equal(seen.image, false, `${id} 实测不收图`);
   }
 });
 
-test("codeartsModels（配置钩子路径）: 每个模型都带 modalities，text 打头", () => {
+test("codeartsModels（配置钩子路径）: 每个模型都带 modalities，只有文本", () => {
   for (const [id, v] of Object.entries(codeartsModels())) {
     assert.deepEqual(v.modalities.output, ["text"], `${id} 的输出只有文本`);
-    assert.equal(v.modalities.input[0], "text", `${id} 必须先收文本`);
-    assert.equal(
-      v.modalities.input.includes("image"),
-      MODEL_META[id].image,
-      `${id} 的 modalities 必须和 MODEL_META.image 一致`,
-    );
+    assert.deepEqual(v.modalities.input, ["text"], `${id} 实测不收图，输入只声明文本`);
   }
 });
 
@@ -1331,18 +1335,18 @@ test("provider.models: 云端模型带 capabilities.input.image（钩子路径�
     const r = await plugin.provider.models({ models: {} }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
     // 🔴 宿主对 provider.models 的返回值是**原样采用**的，不走 modalities 转换 ——
     // 这里写 modalities 会被静默丢掉，imageSaid 永远是 false
-    assert.equal(hostView(r["deepseek-v4-pro-0813"]).imageSaid, true, "能看图的模型要「说过了」");
-    assert.equal(hostView(r["deepseek-v4-pro-0813"]).image, true);
-    assert.deepEqual(hostView(r["deepseek-v4-pro-0813"]).inputs, ["text", "image"]);
-    // 纯文本模型必须落在「明确说不收」这一态，不是「没说」——
-    // 只有前者会让宿主在带图请求里跳过它
-    assert.equal(hostView(r["deepseek-v4.1-flash"]).imageSaid, true, "纯文本模型要明确说不收图，不能是「没说」");
-    assert.equal(hostView(r["deepseek-v4.1-flash"]).image, false);
-    assert.deepEqual(hostView(r["deepseek-v4.1-flash"]).inputs, ["text"]);
+    for (const id of ["deepseek-v4-pro-0813", "deepseek-v4.1-flash"]) {
+      const seen = hostView(r[id]);
+      assert.equal(seen.imageSaid, true, `${id} 必须明确声明，不能是「没说」`);
+      assert.equal(seen.image, false, `${id} 实测不收图（带图 → 406 not multimodal）`);
+      assert.deepEqual(seen.inputs, ["text"], `${id} 只声明文本输入`);
+      assert.deepEqual(seen.outputs, ["text"]);
+    }
     assert.equal(r["deepseek-v4.1-flash"].modalities, undefined, "这条路上 modalities 是死字段");
-    // 表里没有的模型：保持「没说」，宁可退回 0.2.12 行为也不编一个可能错的 false
-    assert.equal(r["brand-new-model"].capabilities, undefined, "查不到就不写，保持「没说」");
-    assert.equal(hostView(r["brand-new-model"]).imageSaid, false, "查不到 = 没说 = 带图请求仍会尝试它");
+    // 清单里没有的模型**同样明确声明 false**：以前是「不写键」，结果宿主照发图片 → 406
+    assert.equal(hostView(r["brand-new-model"]).imageSaid, true, "清单外的模型也要明确说「不收图」");
+    assert.equal(hostView(r["brand-new-model"]).image, false);
+    assert.equal(r["brand-new-model"].modalities, undefined, "这条路上要用 capabilities 而不是 modalities");
   } finally {
     globalThis.fetch = real;
     channelCache.clear();
