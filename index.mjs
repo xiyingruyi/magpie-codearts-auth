@@ -739,8 +739,10 @@ async function checkinFlow(ak, sk) {
 
   // 把结果按 magpie 契约裁齐（只留 outcome / credit / message）：
   // 宿主不认的字段不进契约，给用户看的信息一律并进 message。
+  // 🔴 补确认只说「几个活动」，**不说积分数量**：那些活动本来就是 CLAIMED
+  //    （= 积分在 claim 时已到账，只是缺一步确认），写出金额会被读成「多赚了 N」。
   const finish = (r) => {
-    const suffix = confirmed.length ? `（另补确认 ${confirmed.reduce((a, b) => a + b, 0)} 积分）` : "";
+    const suffix = confirmed.length ? `（另补确认 ${confirmed.length} 个待确认活动）` : "";
     return {
       outcome: r.outcome,
       ...(r.credit !== undefined ? { credit: r.credit } : {}),
@@ -760,7 +762,7 @@ async function checkinFlow(ak, sk) {
       if (!canSpendOneMore()) break; // 预算用完就不补了，下一轮再试
       try {
         await opsConfirm(ak, sk, c.campaignId);
-        confirmed.push(num(c.benefitAmount) ?? num(c.pendingTotalAmount) ?? 0);
+        confirmed.push(c.campaignId);
       } catch {
         // 拿不到就不拿：这本来是客户端的收尾动作，失败了下次签到再补
       }

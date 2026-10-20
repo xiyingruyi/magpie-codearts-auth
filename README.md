@@ -66,7 +66,8 @@ AccessKeyId:SecretAccessKey
   CLAIMED）；`CONFIRMED` / `CONSUMED` → 已签，不碰写接口；`status: null` → 不在活动期。
 - **顺带补确认**：其它卡在 `CLAIMED` 的活动（例如「新用户注册送 4000 积分」，上游是
   `AUTO_GRANT`，发放后等客户端确认）也会被一起 confirm。积分在 claim 时就已到账，
-  confirm 只推进状态，不会多发也不会少发；失败只忽略，不影响签到结论。
+  confirm 只推进状态，不会多发也不会少发；失败只忽略，不影响签到结论。结果里只写
+  「另补确认 N 个待确认活动」，**不写金额** —— 那些积分本来就在余额里，报数字会被读成「多赚了」。
 - 业务码一律走 **HTTP 200**，所以判定看 `code` 不看状态码：`40001` 尚未到达权益刷新
   时间（= 今天这轮已领）按 `done` 处理；`4006` 名额领完、`40401` 运营事件不存在 → `ineligible`。
 - **调度**：Settings → Usage → Plugins 的 Daily check-in 开关（默认关）打开后，每天每
@@ -274,7 +275,15 @@ CODEARTS_AK=... CODEARTS_SK=... node scripts/probe-session.mjs <模式> [并发�
 
 **实测（0.2.17 通过 magpie 网关）**：`auth.usage` 返回
 `balance: 12162.8 积分`、窗口 `{"name":"积分","used":2.7,"amount":337.2,"limit":12500,"aside":"体验版 · 到期 2026-11-12"}`；
-第二个账号 `7475.7 积分`（到期 2026-11-17）。测试 188 条。
+第二个账号 `7475.7 积分`（到期 2026-11-17）。`magpie accounts checkin codearts` 实跑：
+
+```
+✓ CodeArts 码道 (Huawei) API key …1XCY checked in today +1000
+✓ CodeArts 码道 (Huawei) API key …BJ0C checked in today +1000 · already
+```
+
+第二个账号余额 7475.7 → **8475.7**（额度上限 7500 → 8500），`plugin-checkin.json` 记
+`outcome: claimed, credit: 1000`。测试 193 条。
 
 ## 0.2.16（2026-10-20 晚：上游把福利通道摘了）
 

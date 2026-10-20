@@ -782,7 +782,10 @@ test("checkinFlow: 顺带补确认其它卡在 CLAIMED 的活动（新用户注�
   assert.equal(r.outcome, "done");
   assert.deepEqual(f.calls.map((c) => c.path), ["/v1/ops/delivery", "/v1/ops/confirm"]);
   assert.equal(f.calls[1].body.campaignId, 4);
-  assert.match(r.message, /4000/, "到手的 4000 积分要写在结果里");
+  // 🔴 只报「几个活动」，不报积分数量：那些活动本来就是 CLAIMED（积分早已到账），
+  //    写出 4000 会被读成「多赚了 4000」。
+  assert.match(r.message, /另补确认 1 个/);
+  assert.doesNotMatch(r.message, /4000/, "补确认的金额不能写进结果");
 });
 
 test("checkinFlow: 补确认失败不影响签到结论（积分在 claim 时就已到账）", async () => {
@@ -797,7 +800,7 @@ test("checkinFlow: 补确认失败不影响签到结论（积分在 claim 时就
   const r = await checkinWith(f);
   assert.equal(r.outcome, "claimed");
   assert.equal(r.credit, 1000);
-  assert.doesNotMatch(r.message, /4000/, "没确认成功就不能把 4000 写进结果");
+  assert.doesNotMatch(r.message, /另补确认/, "没确认成功就不能说补确认了");
 });
 
 test("checkinFlow: 每天的活动按 type 认，不按标题（标题会被上游改文案）", async () => {
