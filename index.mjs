@@ -133,25 +133,53 @@ function modalitiesField(image) {
 }
 
 /**
+ * 宿主认可的模态种类，顺序照抄 `internal/plugin/host.js` 的 `MODALITIES`。
+ */
+const MODALITIES = ["text", "image", "audio", "video", "pdf"];
+
+/**
+ * 把模态清单摊成宿主 `capabilities.input` / `.output` 要的形状。
+ *
+ * **这必须和宿主自己的 `modalities()` 逐字一致 —— 每个键都要在，值必须是布尔。**
+ * 宿主判定「厂商有没有说」用的是：
+ *
+ *   `imageSaid: typeof m.capabilities?.input?.image === "boolean"`
+ *
+ * 所以省掉值为 false 的键不是「简洁」，是把「明确说不收」降级成「没说」：
+ * `{ text: true }` 里根本没有 `image`，`typeof undefined !== "boolean"`，
+ * `imageSaid` 依旧是 false —— 带图请求照旧发给这个纯文本模型。
+ * （0.2.13 就是这么写错的，已在 0.2.14 修掉。）
+ *
+ * @param {string[]} list 该方向支持的模态
+ * @returns {Record<string, boolean>}
+ */
+const modalities = (list) =>
+  Object.fromEntries(MODALITIES.map((k) => [k, (list ?? ["text"]).includes(k)]));
+
+/**
  * 模型条目里要合并的 `capabilities` 字段 —— **只给 `provider.models` 钩子用**。
  *
  * 与 `modalitiesField()` 是同一件事的两条路（原因见上面那段）。宿主最终读的是
  * `m.capabilities?.input?.image`，所以：
  *
- *   · `input: { text: true, image: true }`  → `image:true,  imageSaid:true`（会看图）
- *   · `input: { text: true }`               → `image:false, imageSaid:true`（明确不看）
- *   · 整个键不写                            → `image:false, imageSaid:false`（没说）
+ *   · `input: { …, image: true }`   → `image:true,  imageSaid:true`（会看图）
+ *   · `input: { …, image: false }`  → `image:false, imageSaid:true`（**明确**不看）
+ *   · 整个键不写                     → `image:false, imageSaid:false`（没说）
  *
- * `text: true` **必须自己写**：配置路径那份默认值（`input: { text: true }`）在
- * 钩子路径上不存在，只给 `{ image: true }` 会让 `kinds()` 只认领 `["image"]`，
- * 界面可能当成「这模型只收图」。
+ * 中间那条就是本函数存在的理由：只有显式写了 `image: false`，宿主才会在带图请求里
+ * **跳过**这个模型。输出方向固定只有文本，与配置路径的默认值保持一致。
  *
  * @param {unknown} image `MODEL_META[id].image`：布尔值才算说了
- * @returns {{ capabilities?: { input: { text: true, image?: true } } }}
+ * @returns {{ capabilities?: { input: Record<string, boolean>, output: Record<string, boolean> } }}
  */
 function capabilitiesField(image) {
   if (typeof image !== "boolean") return {};
-  return { capabilities: { input: image ? { text: true, image: true } : { text: true } } };
+  return {
+    capabilities: {
+      input: modalities(image ? ["text", "image"] : ["text"]),
+      output: modalities(["text"]),
+    },
+  };
 }
 
 /**

@@ -388,10 +388,46 @@ test("codeartsModels: context 不猜；output 用实测参数上限（不是猜�
   }
 });
 
-// --- 图片能力声明（0.2.13）------------------------------------------------
+// --- 图片能力声明（0.2.13 起）---------------------------------------------
 // 三态：没写 = 「没说」；`image:false` = 「明确说不收」；`image:true` = 「会看图」。
 // magpie 只对**明确声明**不收图的模型硬过滤带图请求，所以「没说」和
 // 「明确说不收」的行为完全不同 —— 这几个测试就是钉死这条区别。
+//
+// 下面三个 helper 是**照抄宿主 `internal/plugin/host.js`** 的读法，用来验证
+// 「配置钩子」与「provider.models 钩子」这两条路给宿主的结论完全一致。
+// 0.2.13 之所以翻车，就是云端那条路少写了 `image: false` 这个键。
+
+/** 宿主 MODALITIES：每个键都在，值必须是布尔。 */
+const HOST_MODALITIES = ["text", "image", "audio", "video", "pdf"];
+const hostModalities = (list) =>
+  Object.fromEntries(HOST_MODALITIES.map((k) => [k, (list ?? ["text"]).includes(k)]));
+
+/** 宿主的 kinds()：只留值为 true 的键，一个都没有就 undefined。 */
+const hostKinds = (c) => {
+  if (!c || typeof c !== "object") return undefined;
+  const out = Object.keys(c).filter((k) => c[k] === true);
+  return out.length ? out : undefined;
+};
+
+/** 宿主从一条模型定义里最终读出的能力。 */
+const hostView = (m) => ({
+  image: !!m.capabilities?.input?.image,
+  imageSaid: typeof m.capabilities?.input?.image === "boolean",
+  inputs: hostKinds(m.capabilities?.input),
+  outputs: hostKinds(m.capabilities?.output),
+});
+
+/** 宿主对**配置钩子**模型做的事：用 modalities 重建 capabilities。 */
+const viaConfigHook = (entry) => ({
+  capabilities: {
+    temperature: true,
+    toolcall: true,
+    input: { text: true },
+    output: { text: true },
+    ...(entry.modalities?.input ? { input: hostModalities(entry.modalities.input) } : {}),
+    ...(entry.modalities?.output ? { output: hostModalities(entry.modalities.output) } : {}),
+  },
+});
 
 test("MODEL_META: 每个模型都实测声明了 image，且只有 pro-0813 会看图", () => {
   for (const [id, meta] of Object.entries(MODEL_META)) {
@@ -411,11 +447,41 @@ test("modalitiesField: 未知就不写键；只认布尔值", () => {
   assert.deepEqual(modalitiesField(true), { modalities: { input: ["text", "image"], output: ["text"] } });
 });
 
-test("capabilitiesField: text 必须自己带上，不能只剩 image", () => {
+test("capabilitiesField: image 必须是真布尔 —— 省掉 false 那个键就等于没声明", () => {
   assert.deepEqual(capabilitiesField(undefined), {}, "未知 = 一个键都不写");
-  assert.deepEqual(capabilitiesField(false), { capabilities: { input: { text: true } } });
-  // 只写 { image: true } 的话 kinds() 只认领 ["image"]，界面会当成只收图
-  assert.deepEqual(capabilitiesField(true), { capabilities: { input: { text: true, image: true } } });
+  assert.deepEqual(capabilitiesField("true"), {}, "字符串不算说了");
+  // 🔴 这里必须断言 typeof === "boolean"：宿主的 imageSaid 判的是
+  //    `typeof m.capabilities?.input?.image === "boolean"`，
+  //    写成 `{ text: true }`（省掉 image）= undefined → imageSaid 仍是 false，
+  //    带图请求照旧发给纯文本模型。0.2.13 就是这么错的。
+  for (const image of [true, false]) {
+    const got = capabilitiesField(image);
+    assert.equal(typeof got.capabilities.input.image, "boolean", `image=${image} 时 image 键必须在且是布尔`);
+    assert.equal(got.capabilities.input.image, image);
+    assert.equal(got.capabilities.input.text, true, "text 不能被挤掉");
+    assert.deepEqual(got.capabilities.output, hostModalities(["text"]));
+  }
+});
+
+test("两条路给宿主的结论必须一致（配置钩子 vs provider.models 钩子）", () => {
+  for (const image of [true, false]) {
+    const fromConfig = hostView(viaConfigHook(modalitiesField(image)));
+    const fromHook = hostView(capabilitiesField(image));
+    assert.deepEqual(fromHook, fromConfig, `image=${image} 时两条路的 image/imageSaid/inputs/outputs 必须一致`);
+    assert.equal(fromHook.imageSaid, true, "声明了就必须是「说过了」，不能退回「没说」");
+    assert.equal(fromHook.image, image);
+    assert.deepEqual(fromHook.inputs, image ? ["text", "image"] : ["text"]);
+    assert.deepEqual(fromHook.outputs, ["text"]);
+  }
+  // 没声明：两条路都保持「没说」，行为退回 0.2.12
+  assert.equal(hostView(viaConfigHook(modalitiesField(undefined))).imageSaid, false);
+  assert.equal(hostView(capabilitiesField(undefined)).imageSaid, false);
+});
+
+test("配置钩子路径: 每个模型在宿主眼里都是「说过了」（不能是「没说」）", () => {
+  for (const [id, v] of Object.entries(codeartsModels())) {
+    assert.equal(hostView(viaConfigHook(v)).imageSaid, true, `${id} 必须明确声明收不收图`);
+  }
 });
 
 test("codeartsModels（配置钩子路径）: 每个模型都带 modalities，text 打头", () => {
@@ -1265,12 +1331,18 @@ test("provider.models: 云端模型带 capabilities.input.image（钩子路径�
     const r = await plugin.provider.models({ models: {} }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
     // 🔴 宿主对 provider.models 的返回值是**原样采用**的，不走 modalities 转换 ——
     // 这里写 modalities 会被静默丢掉，imageSaid 永远是 false
-    assert.equal(r["deepseek-v4-pro-0813"].capabilities.input.image, true, "能看图的模型要 image:true");
-    assert.equal(r["deepseek-v4-pro-0813"].capabilities.input.text, true, "text 不能被 image 挤掉");
-    assert.deepEqual(r["deepseek-v4.1-flash"].capabilities.input, { text: true }, "纯文本模型要明确说不收图");
+    assert.equal(hostView(r["deepseek-v4-pro-0813"]).imageSaid, true, "能看图的模型要「说过了」");
+    assert.equal(hostView(r["deepseek-v4-pro-0813"]).image, true);
+    assert.deepEqual(hostView(r["deepseek-v4-pro-0813"]).inputs, ["text", "image"]);
+    // 纯文本模型必须落在「明确说不收」这一态，不是「没说」——
+    // 只有前者会让宿主在带图请求里跳过它
+    assert.equal(hostView(r["deepseek-v4.1-flash"]).imageSaid, true, "纯文本模型要明确说不收图，不能是「没说」");
+    assert.equal(hostView(r["deepseek-v4.1-flash"]).image, false);
+    assert.deepEqual(hostView(r["deepseek-v4.1-flash"]).inputs, ["text"]);
     assert.equal(r["deepseek-v4.1-flash"].modalities, undefined, "这条路上 modalities 是死字段");
     // 表里没有的模型：保持「没说」，宁可退回 0.2.12 行为也不编一个可能错的 false
     assert.equal(r["brand-new-model"].capabilities, undefined, "查不到就不写，保持「没说」");
+    assert.equal(hostView(r["brand-new-model"]).imageSaid, false, "查不到 = 没说 = 带图请求仍会尝试它");
   } finally {
     globalThis.fetch = real;
     channelCache.clear();
