@@ -6,10 +6,10 @@
 |---|---|
 | 授权 | 华为云访问密钥 **AK/SK**（华为云官方 SDK-HMAC-SHA256 签名），登录时自动验证有效性 |
 | **每日签到** ⭐ | 实现 magpie 原生 `auth.checkin` 钩子（magpie ≥ v0.1.1083）——Settings → Usage → Plugins 打开 **Daily check-in**，每天每账号自动签到领 **1000 积分**（`/v1/ops/delivery` → `claim` → `confirm`，四态状态机） |
-| **积分余额** | `auth.usage` 显示**积分**（控制台上那个 12000+ 就是它）：已用/总量 + 套餐到期日 |
+| **积分余额** | `auth.usage` 显示**积分**（控制台上那个 12000+ 就是它）：已用/总量 + 套餐到期日 + 即将过期的那部分 |
 | ~~免费 Token 池~~ | **2026-10-20 官方已结束**（论坛公告 + 活动 PDF 目录移除 + 实测 `4000 invalid channel, group not found`），只剩积分一本账 |
 | 对话 | `POST snap-access /api/v2/chat/completions`（OpenAI 形态），按模型自动选通道 |
-| 模型 | 点「重新获取模型」实时拉 `snap-access /v1/model/builtin`（与 IDE 模型下拉同源），华为上新/下架**无需改插件**；失败才回退内置列表。**逐模型实测声明收不收图**（见 [图片能力](#图片能力0215-定论codearts-全线不收图)） |
+| 模型 | 点「重新获取模型」实时拉 `snap-access /v1/model/builtin`（与 IDE 模型下拉同源），华为上新/下架**无需改插件**；失败才回退内置列表。每个模型带**消耗系数**（IDE 的「0.7x」）与**免费**标记。**逐模型实测声明收不收图**（见 [图片能力](#图片能力0215-定论codearts-全线不收图)） |
 
 ## 安装
 
@@ -137,6 +137,12 @@ magpie 的 `usage()` window 字段，本插件按宿主源码逐条对齐：
 | `unit` | 计量单位文案 | 拼在数字后（积分窗口是 `积分`，token 池是 `tokens`） |
 | `aside` | `true` = 只展示，**不参与路由、不参与「用尽」判定** | 侧栏一行 |
 
+**积分窗口的 `display`** 还会带上 「套餐到期日」与「其中 N 即将过期」（上游
+`package_credit_expiring_amount`，已含在 `remain` 里，所以只写文案、不动 `used` ——
+否则同一笔积分会被算两次）。**Token 池只有在积分窗口也在时才标 `aside`**：两本账里
+积分才是把关的那本；Token 计费账号没有积分窗口，池子是唯一额度，标成只展示就等于
+账号永不判用尽。
+
 **踩坑记录一（0.2.2）**：`used` 被填成绝对值 `299530`，`magpie quota` 显示成 `299530%`。
 受控实验（`used:50 → 50%`）定论：**`used` 是百分比**。
 
@@ -164,6 +170,9 @@ magpie 的 `usage()` window 字段，本插件按宿主源码逐条对齐：
 这条**并发**错误里的「已达**上限**」命中了宿主 `internal/gateway/routing.go` 的
 `usedUpWords` 正则（含中文词 `上限`），于是被判成 `failQuota`，账号被标「额度用尽」
 并休息 15 分钟（`quotaRest`）—— 而此时额度可能一格都没少。
+（0.2.23 从 magpie 的 app 二进制里直接确认了这条正则的词表：
+`(?i)quota|insufficient|balance|credit|…|余额|额度|欠费|限流|频率|套餐|用量|上限`。
+所以插件**任何**给宿主的文案都不该出现这些词 —— 除非它真的是额度问题。）
 
 **证据**：宿主的路由日志里有一条 `used: 0, amount: 10000000`（额度满格）的账号
 仍被标 `fail: "quota"`；某天 78 条 `TM.00001041` 中有 55 条 `rest.why = "quota"`。
@@ -204,7 +213,9 @@ magpie 的 `usage()` window 字段，本插件按宿主源码逐条对齐：
   现在它是纯状态行，不带 `limit`、`used` 恒为 0。
 
 > **宿主的责任仍在**：把并发错误归类成 `failQuota` 是 magpie 的判定缺陷，
-> 插件只能避开它、不能改它。若你用的是别的 CodeArts 插件，仍会遇到同样的问题。
+> 插件只能避开它、不能改它。0.2.23 起这条错误回的是 **429 + 不含额度词的文案**
+> （宿主据此换另一个账号重试，而不是把账号歇 15 分钟）。若你用的是别的 CodeArts
+> 插件，仍会遇到同样的问题。
 
 ## 对话通道（重要）
 
@@ -245,6 +256,49 @@ CODEARTS_AK=... CODEARTS_SK=... node scripts/probe-session.mjs <模式> [并发�
 3. **丢弃云端 `channel` 字段** —— 该字段正是上游构建 `AGENT_MODELS` 的依据；本版保留并写入运行期缓存。
 
 此外补齐了 `ineligible` / `captcha` / `inactive` 三种签到 outcome（骨架版遇到会落到 `failed` 并每 30 分钟无意义重试）。
+
+## 0.2.23（2026-10-21：逐条对比社区插件 `magpie-community/plugins` 的 codearts 实现后吸纳的几处）
+
+对照 [magpie-community/plugins → packages/codearts](https://github.com/magpie-community/plugins)
+（`@magpie-community/opencode-codearts-auth` 0.2.0，2264 行 / 91 条测试）读完两边的实现，
+**它强在 OAuth 登录与请求内重试，本插件强在签到状态机、通道熔断与模型清单**。
+本版只吸纳**验证过确实更好**的部分，其余保持原样并写明原因。
+
+### 吸纳的 6 处
+
+| # | 改动 | 为什么 |
+|---|---|---|
+| 1 | 对话体里的 `model` **剥掉 `codearts/` 前缀** | 实测 `codearts/glm-5.3` 原样发上去是 `404 InferHub.002002009.404 The model is not registered`，裸 id 才是 200（本条已直连复验：带前缀现在返回 200）。OpenCode / Cherry Studio 这类客户端都会把「provider/model」整串写进 body。顺带修好通道判定 —— 之前带前缀的 id 在 channel 表里查不到，会掉进黑名单兜底，把 agent 通道的模型误判成 benefit 通道（多带三个签名头 → 4004） |
+| 2 | 额度/限流类错误改回 **429** | 宿主只按状态码 failover：以前一律 400，于是「这台额度用完、另一台空着」也不会换账号，整组直接失败。现在 `InferHub.4291.*` / `8111x` / 裸 `429` / 并发满仓全部 429 |
+| 3 | 并发满仓的文案**避开「上限」** | 宿主判断「额度用尽」是对错误文案跑正则（从 app 二进制里确认，词表含 `额度\|用量\|套餐\|上限\|限流\|频率\|余额`），命中就把账号标成额度用尽、休息 15 分钟。上游原文「并发会话数已达**上限**」正好踩中，而它与额度无关 —— 改写成「并发会话数已满，请稍后重试（TM.00001041）」，错误码保留 |
+| 4 | 每日免费 Token 池标 `aside`（**仅当已有积分窗口时**） | 两本账：池子见底不代表账号不能用。但 Token 计费账号没有积分窗口，那时池子是唯一额度，标成「只展示」等于账号永不判用尽 —— 所以按「有没有积分窗口」决定，不无脑标 |
+| 5 | 签到 **claim 失败后复查一次活动清单** | 「被拒」≠「今天没签」：claim 可能已经写进去只是回执丢了（那时状态是 CLAIMED，补 confirm 收尾），或者刚在 IDE 里签过（CONFIRMED）。以前直接报 failed，宿主 30 分钟后再来，活动卡在 CLAIMED。复查只有一次、预算不够就不查，仍是 ELIGIBLE 才把原错误交出去 |
+| 6 | 模型条目发布 `rate`（消耗系数）与 `free` | 都是宿主模型 schema 里的真实字段（`plugin-providers.json` 里存的形状可证）。`rate` 取内置清单 `credit[0].ratio_display`（实测 GLM-5.2 0.7x、openpangu-2.0-flash 0.32x、glm-5.3 0.79x、deepseek-v4.1-flash 0.18x）；`free` 只给福利通道、且**熔断中的不算**（那时它其实在扣积分）。两者互斥。顺手把 `package_credit_expiring_amount`（即将过期积分）写进积分窗口的 display |
+
+`rate` / `free` 这两个字段不改变任何行为，只让界面显示得更准 —— 它们不影响路由。
+
+### 明确**不**采纳的 4 处
+
+- **并发闸门 + `maxConcurrency: 3`**：社区插件把并发压到 3 再排队。实测本插件的稳定
+  `x-ot-session-id` 让 **16 路并发**全部通过（上游按**会话**记并发，我们的会话 id 由 AK
+  派生、恒定），压到 3 是纯降级。
+- **强制 `stream: true` 再折叠回非流式**：他们这么做是因为「只有流式才会被上游记账/出内容」。
+  实测本插件非流式请求**扣 0 积分**（同一模型流式扣 0.02），保持现状对用户更省。
+- **`provider.models` 失败静默返回旧清单**：他们的 `catch { return provider.models }`。
+  本插件刻意上抛给宿主显示 `listError` —— 0.2.22 的 bug 正是「静默回退」造成的。
+- **OAuth PKCE + DPoP 登录**：这是他们最大的体验优势（不用手贴 AK/SK），也是
+  **唯一值得后续单独做**的一项：需要内嵌 `codearts.cn-north-4` 的 client id、
+  DPoP 密钥对与 token 刷新，改动面远大于本版其余全部。AK/SK 路径继续保留。
+
+另外他们有、但本插件已验证**用不上**的：agent-center `agents/detail` 取真实上下文窗口 ——
+本账号该接口一律 `400 HDN.1000 "id : unknown exception"`（`agent_id` 与 `build`/`CodeAgent`
+都试过），他们的 `parseAgentModel` 也因此在本账号静默失效。上下文窗口继续用
+`context: 0`（不设限），不猜。
+
+测试 216 → 232 条。14 个突变（不剥前缀 / 一律 400 / 满仓不算 429 / 不改满仓文案 /
+池子永远 aside / 池子永不 aside / 不显示即将过期 / 领失败不复查 / 复查只认 done /
+已知结论也复查 / free 不看熔断 / rate 读错字段 / free 也写 rate / 剥任意前缀）
+逐个验证都能让测试变红。
 
 ## 0.2.22（2026-10-21：修好「重新获取模型」—— 它此前根本拿不到新模型）
 

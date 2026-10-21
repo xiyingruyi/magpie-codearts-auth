@@ -15,6 +15,7 @@ const {
   channelCache, channelTable, MODEL_META, VISION_MODELS, AGENT_MODELS, RETIRED_MODELS, modelRetired,
   benefitBroken, markBenefitBroken, benefitGone, gatewayRetired, benefitDown, BENEFIT_DOWN_MS,
   modalitiesField, capabilitiesField, imageCapable,
+  errorResponse, errorStatus, SESSION_LIMIT_CODE, creditRate, bareModelId,
   SNAP_HOST, CHAT_PATH, OPENGW_HOST,
   STATS_PATH, OPS_DELIVERY_PATH, OPS_CHANNEL, AGENT_TYPE_HEADER, BUILTIN_MODELS_PATH,
 } = mod._internal;
@@ -2781,4 +2782,242 @@ test("snapEnvelope: 有 deadline 时重发按剩余时间算，见底就不再�
     globalThis.fetch = real;
   }
   assert.equal(calls, 1, "预算见底时不该再发重发请求");
+});
+
+// ---------------------------------------------------------------------------
+// 0.2.23：与社区插件（magpie-community/plugins/codearts）对比后吸纳的几处
+// ---------------------------------------------------------------------------
+
+test("normalizeChatBody: 去掉 model 上的 codearts/ 前缀（上游只认裸 id）", () => {
+  // 实测：`codearts/glm-5.3` 原样发上去回
+  //   404 {"error_code":"InferHub.002002009.404","error_msg":"The model is not registered"}
+  const got = JSON.parse(normalizeChatBody(JSON.stringify({ model: "codearts/glm-5.3", messages: [], stream: false })));
+  assert.equal(got.model, "glm-5.3");
+  // 别的 provider 的前缀不替人改（这段代码只负责自己这一层）
+  assert.equal(normalizeChatBody(JSON.stringify({ model: "openrouter/x", stream: false })), null);
+  // 裸 id / 非字符串 / 没有 model 一律不动
+  assert.equal(normalizeChatBody(JSON.stringify({ model: "glm-5.3", stream: false })), null);
+  assert.equal(normalizeChatBody(JSON.stringify({ model: 42, stream: false })), null);
+  assert.equal(normalizeChatBody(JSON.stringify({ stream: false })), null);
+  // 剥完必须**真的**算改写过（changed=true）：否则调用方沿用旧 body 去签名，
+  // 发出去的内容与签名对不上。
+  assert.notEqual(normalizeChatBody(JSON.stringify({ model: "codearts/GLM-5.2" })), null);
+  assert.equal(bareModelId("codearts/"), "");
+  assert.equal(bareModelId(" codearts/x"), " codearts/x", "只认开头，不做模糊匹配");
+});
+
+test("loader.fetch: 带 codearts/ 前缀的模型名剥离后再发，通道也按剥离后的 id 判", async () => {
+  // 🔴 一个 bug 两处症状：除了上游 404，通道判定也错 —— channel 表按裸 id 建，
+  //    带前缀查不到就掉进黑名单兜底，把 agent 通道的模型误判成 benefit（多带三头 → 4004）。
+  benefitDown.clear();
+  channelCache.clear();
+  channelTable(AK).set("glm-5.3", "agent");
+  const plugin = await mod.default({}, {});
+  let seen;
+  const s = await callLoader(plugin, {
+    init: { method: "POST", body: JSON.stringify({ model: "codearts/glm-5.3", messages: [], stream: false }) },
+    respond: async (u, i) => { seen = i; return jsonResponse({ id: "ok", choices: [] }); },
+  });
+  try {
+    assert.equal(JSON.parse(seen.body).model, "glm-5.3");
+    assert.equal(seen.headers.get("maas_type"), null, "剥离后查得到 agent 通道，不能再带福利三头");
+    assert.equal(s.res.status, 200);
+  } finally {
+    channelCache.clear();
+  }
+});
+
+test("errorResponse: 额度/限流/并发满仓交给宿主 429（它据此换账号），其余仍是 400", async () => {
+  // 宿主只按状态码 failover：一律 400 时「这台满了、另一台空着」也不会换。
+  for (const code of ["InferHub.4291.200", "81111", "81119", "429", "InferHub.429.200", SESSION_LIMIT_CODE]) {
+    assert.equal(errorStatus(code), 429, `${code} 应是 429`);
+  }
+  for (const code of ["InferHub.002002009.404", "4004", "4005", "40001", "", undefined]) {
+    assert.equal(errorStatus(code), 400, `${code} 应是 400`);
+  }
+  // 容易误判的：4291 之外带 429 字样的普通码（`14029`）不该命中
+  assert.equal(errorStatus("14029"), 400);
+  const ok = errorResponse({ code: "InferHub.002002009.404", message: "The model is not registered" });
+  assert.equal(ok.status, 400);
+  assert.equal(JSON.parse(await ok.text()).error.type, "codearts_error");
+  const busy = errorResponse({ code: SESSION_LIMIT_CODE, message: "x" });
+  assert.equal(busy.status, 429);
+  assert.equal(JSON.parse(await busy.text()).error.type, "rate_limit_exceeded");
+});
+
+test("errorResponse: 并发满仓的文案必须避开宿主的「额度用尽」判定词", async () => {
+  // 宿主对错误文案跑 `usedUpWords` 正则（含 额度|用量|套餐|上限|限流|频率|余额），
+  // 命中就把账号标成额度用尽、休息 15 分钟。上游原文「并发会话数已达上限」正好踩中
+  // `上限`，而它与额度无关 —— 账号是好的，只是这一会话并发满了。
+  const res = errorResponse({ code: SESSION_LIMIT_CODE, message: "并发会话数已达上限" });
+  const b = JSON.parse(await res.text());
+  assert.doesNotMatch(b.error.message, /上限|额度|用量|套餐|限流|频率|余额/);
+  assert.match(b.error.message, new RegExp(SESSION_LIMIT_CODE.replace(/\./g, "\\.")), "错误码要留在文案里，便于对账");
+  assert.equal(b.error.code, SESSION_LIMIT_CODE);
+});
+
+test("loader.fetch: 上游把限流藏在 HTTP 200 里时，交出去的也是 429", async () => {
+  channelCache.clear();
+  const plugin = await mod.default({}, {});
+  const s = await callLoader(plugin, {
+    init: { method: "POST", body: JSON.stringify({ model: "glm-5.3", messages: [], stream: false }) },
+    respond: async () => jsonResponse({ error_code: "InferHub.4291.200", error_msg: "rate limit exceeded" }),
+  });
+  assert.equal(s.res.status, 429, "藏起来的限流同样要变成 429，否则宿主不会换账号");
+  assert.equal(JSON.parse(await s.res.text()).error.code, "InferHub.4291.200");
+});
+
+test("usage: 即将过期的积分写进 display，但不进 used（它已含在 remain 里）", async () => {
+  const payload = statsPayload({
+    metrics: [
+      { name: "usageTotalPackageCredit", package_credit_amount: 12500, package_credit_used: 337.2, package_credit_remain: 12162.8, package_credit_expiring_amount: 5000 },
+    ],
+  });
+  const u = await usageWith(accountsResponder(payload, undefined));
+  const w = u.windows[0];
+  assert.match(w.display, /5000 即将过期/);
+  assert.equal(w.amount, 337.2, "已用不变：再把它算进 used 就是同一笔积分算两次");
+  assert.equal(w.limit, 12500);
+  // 0 / 缺失时不写（绝大多数账号是 0，写了只会占地方）
+  const zero = await usageWith(accountsResponder(statsPayload(), undefined));
+  assert.doesNotMatch(zero.windows[0].display, /即将过期/);
+});
+
+test("usage: 有积分窗口时，每日 token 池标 aside（池子见底不该停账号）", async () => {
+  const u = await usageWith(
+    accountsResponder(statsPayload(), { total_quota: 10000000, total_balance: 9000000, used_amount: 1000000 }),
+  );
+  const pool = u.windows.find((w) => w.name === "每日免费 Token");
+  assert.ok(pool, "token 池应照常画出来");
+  assert.equal(pool.aside, true, "它是另一本账：积分还在就不该因为池子见底停账号");
+  assert.ok(!("aside" in u.windows.find((w) => w.name === "积分")), "积分是唯一把关的窗口，绝不能标 aside");
+});
+
+test("usage: 只有 token 池时它就是唯一额度，不能标 aside", async () => {
+  // 反过来漏掉这一层，Token 计费账号就完全没人把关，只能等上游报错。
+  const u = await usageWith(accountsResponder(undefined, { total_quota: 10000000, total_balance: 9000000, used_amount: 1000000 }));
+  assert.equal(u.windows.length, 1);
+  assert.ok(!("aside" in u.windows[0]), "唯一窗口标成只展示 = 账号永不判用尽");
+});
+
+test("checkinFlow: claim 失败后复查 —— 其实已经领上（CLAIMED）就补确认并报 done", async () => {
+  // 场景：claim 这次真的写进去了，但回执丢了（502）。直接报 failed 会让宿主
+  // 30 分钟后再来，期间活动卡在 CLAIMED，积分到账了但状态不是终态。
+  let deliveries = 0;
+  const f = opsResponder({
+    delivery: () =>
+      jsonResponse(
+        ++deliveries === 1
+          ? deliveryOf([dailyCampaign()])
+          : deliveryOf([dailyCampaign({ status: "CLAIMED", claimable: false })]),
+      ),
+    claim: () => jsonResponse({ error_code: "APIG.0502", error_msg: "bad gateway" }, 502),
+  });
+  const r = await checkinWith(f);
+  assert.equal(r.outcome, "done", "上游状态说领到了，就不能报 failed");
+  assert.equal(r.credit, 1000);
+  assert.deepEqual(
+    f.calls.map((c) => `${c.method} ${c.path}`),
+    ["GET /v1/ops/delivery", "POST /v1/ops/claim", "GET /v1/ops/delivery", "POST /v1/ops/confirm"],
+    "复查后要把它从 CLAIMED 推进到终态",
+  );
+});
+
+test("checkinFlow: claim 失败后复查仍是 ELIGIBLE → 照旧报 failed（不能把真失败说成已签）", async () => {
+  const f = opsResponder({
+    delivery: deliveryOf([dailyCampaign()]),
+    claim: () => jsonResponse({ error_code: "APIG.0502", error_msg: "bad gateway" }, 502),
+  });
+  const r = await checkinWith(f);
+  assert.equal(r.outcome, "failed");
+  assert.deepEqual(
+    f.calls.map((c) => `${c.method} ${c.path}`),
+    ["GET /v1/ops/delivery", "POST /v1/ops/claim", "GET /v1/ops/delivery"],
+    "复查一次就够，不能无限重试；也不该发 confirm",
+  );
+});
+
+test("checkinFlow: 40001（今天已领）直接给结论，不再多打一次活动清单", async () => {
+  // 复查是给「判不出结论」的错误用的。40001 已经能判死（今天领过了），
+  // 再查一次只是白白多一个请求、多占一点 17 秒预算。
+  const f = opsResponder({
+    delivery: deliveryOf([dailyCampaign()]),
+    claim: { code: 40001, message: "尚未到达权益刷新时间" },
+  });
+  const r = await checkinWith(f);
+  assert.equal(r.outcome, "done");
+  assert.equal(f.calls.filter((c) => c.path.endsWith("/v1/ops/delivery")).length, 1, "只查一次");
+});
+
+test("checkinFlow: claim 失败后复查显示已在别处签过（CONFIRMED）→ done", async () => {
+  let deliveries = 0;
+  const f = opsResponder({
+    delivery: () =>
+      jsonResponse(
+        ++deliveries === 1
+          ? deliveryOf([dailyCampaign()])
+          : deliveryOf([dailyCampaign({ status: "CONFIRMED", claimable: false })]),
+      ),
+    claim: { code: 50000, message: "internal error" },
+  });
+  const r = await checkinWith(f);
+  assert.equal(r.outcome, "done");
+  assert.doesNotMatch(f.calls.map((c) => c.path).join(","), /confirm/, "已终态不需要再确认");
+});
+
+test("creditRate: 取第一档 ratio_display（「0.79x」→ 0.79），拿不到就是 0", () => {
+  assert.equal(creditRate({ credit: [{ ratio_display: "0.7x" }] }), 0.7);
+  assert.equal(creditRate({ credit: [{ ratio_display: "0.18x" }, { ratio_display: "0.09x" }] }), 0.18, "只取第一档：写最贵的那档才不低估成本");
+  assert.equal(creditRate({ credit: [] }), 0);
+  assert.equal(creditRate({}), 0);
+  assert.equal(creditRate({ credit: [{ ratio: "0.05" }] }), 0, "ratio 是另一个量，不能当系数");
+  assert.equal(creditRate(null), 0);
+});
+
+test("provider.models: 发布消耗系数 rate，福利通道的标 free 且不写 rate", async () => {
+  channelCache.clear();
+  benefitDown.clear();
+  const plugin = await mod.default({}, {});
+  const real = globalThis.fetch;
+  globalThis.fetch = async () =>
+    builtin([
+      bm("glm-5.3", { credit: [{ ratio_display: "0.79x" }] }),
+      bm("benefit-x", { channel_source: "benefit", credit: [{ ratio_display: "0.5x" }] }),
+    ]);
+  let out;
+  try {
+    out = await plugin.provider.models({ models: {} }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
+  } finally { globalThis.fetch = real; }
+  assert.equal(out["glm-5.3"].rate, 0.79);
+  assert.equal(out["glm-5.3"].free, undefined);
+  assert.equal(out["benefit-x"].free, true);
+  assert.equal(out["benefit-x"].rate, undefined, "免费模型再报系数只会让人以为「免费」是假的");
+});
+
+test("provider.models: 福利通道已熔断的模型不能标免费（它其实在扣积分）", async () => {
+  channelCache.clear();
+  benefitDown.clear();
+  markBenefitBroken(AK, "benefit-x");
+  const plugin = await mod.default({}, {});
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => builtin([bm("benefit-x", { channel_source: "benefit" })]);
+  let out;
+  try {
+    out = await plugin.provider.models({ models: {} }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
+  } finally { globalThis.fetch = real; benefitDown.clear(); }
+  assert.equal(out["benefit-x"].free, undefined);
+  assert.equal(isBenefitChannel("benefit-x", "", AK), true, "通道判定本身仍是 benefit，只是不再宣称免费");
+});
+
+test("provider.models: 没有 credit 时不写 rate（默认值交给宿主）", async () => {
+  channelCache.clear();
+  const plugin = await mod.default({}, {});
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => builtin([bm("GLM-5.2")]);
+  let out;
+  try {
+    out = await plugin.provider.models({ models: {} }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
+  } finally { globalThis.fetch = real; }
+  assert.ok(!("rate" in out["GLM-5.2"]));
+  assert.ok(!("free" in out["GLM-5.2"]));
 });

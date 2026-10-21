@@ -820,7 +820,35 @@ async function checkinFlow(ak, sk) {
     try {
       claimed = await opsClaim(ak, sk, daily.campaignId, Date.now(), opts);
     } catch (e) {
-      return checkinErrorOutcome(e, plan, "claim");
+      // 领取被拒 ≠ 今天没签到。两种常见情形都该判成「已签」而不是 failed：
+      //   · 同一账号刚在 IDE / 另一台机器上签过（我们把状态读早了，或者上一次
+      //     claim 其实已经写进去、只是响应没回来）—— 状态现在是 CLAIMED 或
+      //     CONFIRMED，再领当然被拒；
+      //   · 上游对「今天已领」回的是业务码（40001 一类），本来就不是错误。
+      // 已经能判死的错误码（40001/4006/40401）直接交出结论，不再多打一次接口；
+      // 只剩 failed 时才重读一次活动清单（一次 GET，预算不够就不查），按真实
+      // 状态收尾：已签就补确认 + done，仍是 ELIGIBLE 才把原来的错误交出去。
+      const known = checkinErrorOutcome(e, plan, "claim");
+      if (known.outcome !== "failed") return known;
+      if (left() >= SNAP_MIN_TIMEOUT_MS) {
+        const again = await fetchCampaigns(ak, sk, opts).then(pickDailyCampaign).catch(() => null);
+        const after = again ? checkinPlan(again) : null;
+        if (after?.action === "confirm") {
+          // 我们这次 claim 其实成功了，只是没看到回执：把确认补掉，别让它卡在 CLAIMED。
+          try {
+            await opsConfirm(ak, sk, again.campaignId, opts);
+          } catch {
+            // 下一轮签到会按 CLAIMED 再补
+          }
+          await confirmStrays();
+          return finish({ outcome: "done", credit: after.credit ?? plan.credit, message: "今日已签到（领取时上游已记账）" });
+        }
+        if (after?.action === "none" && after.outcome === "done") {
+          await confirmStrays();
+          return finish({ outcome: "done", credit: after.credit ?? plan.credit, message: "今日已签到" });
+        }
+      }
+      return known;
     }
     // 领到之后**一律**补一次 confirm。上游确实会要求补（那时 data.id 非空），
     // 但 `id` 只是「服务端要求」的提示，不能当唯一依据：字段缺失时漏掉这一步，
@@ -957,11 +985,44 @@ function outputLimit(v) {
   return n === undefined ? undefined : Math.min(n, MAX_OUTPUT_TOKENS);
 }
 
+/**
+ * 消耗系数（IDE 模型下拉里那个「0.7x」）→ magpie 的 `rate`。
+ *
+ * 数据源是内置清单每条模型的 `credit[]`，取**第一档**的 `ratio_display`
+ * （实测：GLM-5.2 0.7x、openpangu-2.0-flash 0.32x、glm-5.3 0.79x、
+ * deepseek-v4.1-flash 0.18x）。`ratio` 是另一个量（0.05 这种），别拿它当系数；
+ * 谷时段的第二档（`time_slot_id: off_peak`）也不取 —— `rate` 只有一个值，
+ * 写最贵的那一档才不会让人低估成本。
+ *
+ * 拿不到就返回 0（调用方据此不写这个字段，宿主显示默认值）。
+ */
+function creditRate(m) {
+  const tiers = Array.isArray(m?.credit) ? m.credit : [];
+  const first = tiers.find((t) => t && typeof t === "object");
+  const n = parseFloat(String(first?.ratio_display ?? first?.ratioDisplay ?? ""));
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
 /** 余额字段取值：只有拿到有限数才算「有值」（0 合法，null / "" / NaN 不算）。 */
 function num(v) {
   if (v === null || v === undefined || v === "") return undefined;
   const n = Number(v);
   return Number.isFinite(n) ? n : undefined;
+}
+
+/** 本插件在 magpie 里的 provider id（`config.provider.<id>` 的键）。 */
+const PROVIDER_ID = "codearts";
+
+/**
+ * 去掉模型名上的 provider 前缀：`codearts/glm-5.3` → `glm-5.3`。
+ * 不带前缀、或前缀不是本 provider 的，一律原样返回（别替别的 provider 改名）。
+ * 不是字符串（数字、对象、缺字段）一律返回空串 —— 那种请求上游自己会报参数错，
+ * 我们不改它的形状。
+ */
+function bareModelId(v) {
+  if (typeof v !== "string") return "";
+  const p = `${PROVIDER_ID}/`;
+  return v.startsWith(p) ? v.slice(p.length) : v;
 }
 
 /**
@@ -986,6 +1047,16 @@ function num(v) {
  *    已经有 `stream` 字段的请求**一律不动** —— magpie 的翻译路径会显式写
  *    `stream: true` 并期待 SSE，改它会破坏那条路径。
  *
+ * ③ **去掉 `model` 上的 provider 前缀**（`codearts/glm-5.3` → `glm-5.3`）
+ *    OpenAI 兼容客户端常把「provider/model」整串当模型名写进 body（OpenCode、
+ *    Cherry Studio 都这样）。上游只认裸 id：带前缀时实测
+ *      `404 {"error_code":"InferHub.002002009.404","error_msg":"The model is not registered"}`
+ *    而 magpie 的路由**已经**按 `providerID/modelID` 拆过一次，能走到这里的
+ *    前缀只可能是客户端自己带的。
+ *    🔴 这一步还兼着「通道判定」：下面 loader 是从**改写后的 body** 里取 model，
+ *    带前缀的 id 在 channel 表里查不到，会掉进黑名单兜底、把 agent 通道的模型
+ *    误判成 benefit 通道（多带三个签名头 → 4004）。同一个 bug，两处症状。
+ *
  * 返回改写后的 body 字符串；没有改动时返回 `null`（调用方沿用原 body 与签名）。
  */
 function normalizeChatBody(bodyStr) {
@@ -994,6 +1065,11 @@ function normalizeChatBody(bodyStr) {
   try { obj = JSON.parse(bodyStr); } catch { return null; }
   if (!obj || typeof obj !== "object" || Array.isArray(obj)) return null;
   let changed = false;
+  const bare = bareModelId(obj.model);
+  if (bare && bare !== obj.model) {
+    obj.model = bare;
+    changed = true;
+  }
   for (const k of ["max_tokens", "max_completion_tokens", "max_output_tokens"]) {
     const n = Number(obj[k]);
     if (Number.isFinite(n) && n > MAX_OUTPUT_TOKENS) {
@@ -1036,17 +1112,52 @@ function upstreamError(text) {
 }
 
 /**
- * 错误响应：400 + OpenAI 错误形态（magpie 的 APIError 从中取出 message）。
+ * 上游错误码 → 交给宿主的 HTTP 状态。
+ *
+ * 宿主的 failover 是按**状态码**做的：429 才代表「这个账号/这条模型现在挤不进去，
+ * 换一个再试」。以前这里一律 400，于是额度耗尽、限流、并发满仓全被当成
+ * 「请求本身有问题」—— magpie 直接把整组判失败，另一个账号明明还空着也不会被用上。
+ *
+ *   · 429：额度/限流（`InferHub.4291.200`、`8111x`、裸 `429`）与并发满仓
+ *     （`TM.00001041`，上游按会话记并发，没有稳定会话 id 时一分钟三个请求就满）
+ *   · 400：模型不存在、参数非法、通道不对 —— 换账号也没用，重试只是白撞
+ *
+ * 只认明确的码，猜不出来的一律留在 400（宁可少一次 failover，也不把真错误说成限流）。
+ */
+const SESSION_LIMIT_CODE = "TM.00001041";
+
+function errorStatus(code) {
+  const c = String(code ?? "");
+  if (c === SESSION_LIMIT_CODE) return 429;
+  if (/4291|8111\d|(^|\.)429(\.|$)/.test(c)) return 429;
+  return 400;
+}
+
+/**
+ * 错误响应：OpenAI 错误形态（magpie 的 APIError 从中取出 message）。
  *
  * 🔴 这里必须脱敏：上游的报错体会**回显 Access Key**（`the access key … is
- *    malformed` 之类），而这个 400 的 body 会一路进客户端、magpie 日志和会话
- *    记录。`prepare` 是本次请求的 `(text) => text` 脱敏器（见 loader）。
+ *    malformed` 之类），而这个 body 会一路进客户端、magpie 日志和会话记录。
+ *    `prepare` 是本次请求的 `(text) => text` 脱敏器（见 loader）。
+ *
+ * 🔴 并发满仓那一句必须换文案。宿主判断「额度用尽」靠的是对错误文案的正则
+ *    （`usedUpWords`，含 `额度|用量|套餐|上限|限流|频率|余额` 这些词），命中就把
+ *    账号标成额度用尽、**休息 15 分钟**。而上游原文「并发会话数已达上限」正好踩中
+ *    `上限` —— 它与额度半点关系都没有，账号是好的，只是这一会话的并发满了。
+ *    换一句不含这些词的说明，同时把错误码保留在括号里以便对账。
  */
 function errorResponse({ code, message }, prepare = (t) => t) {
-  const body = JSON.stringify({ error: { message: prepare(message), type: "codearts_error", code } });
+  const status = errorStatus(code);
+  const shown =
+    String(code ?? "") === SESSION_LIMIT_CODE
+      ? `并发会话数已满，请稍后重试（${SESSION_LIMIT_CODE}）`
+      : message;
+  const body = JSON.stringify({
+    error: { message: prepare(shown), type: status === 429 ? "rate_limit_exceeded" : "codearts_error", code },
+  });
   return new Response(body, {
-    status: 400,
-    statusText: "Bad Request",
+    status,
+    statusText: status === 429 ? "Too Many Requests" : "Bad Request",
     headers: { "content-type": "application/json" },
   });
 }
@@ -1659,6 +1770,12 @@ export default async function codeartsPlugin(_input, options) {
             //    不参与用尽判定」—— 这恰恰是这里**唯一**的额度窗口，标成只展示
             //    会让积分耗尽也不触发账号用尽。所以并进 display。
             if (credits.endDate) w.display += ` · ${credits.packageName ?? "套餐"} 到期 ${credits.endDate}`;
+            // 套餐里**即将过期**的那部分（上游 `package_credit_expiring_amount`）。
+            // 它已含在 remain 里，所以只做提示、不改 used：否则同一笔积分会被
+            // 算成「用掉一次、又剩一次」。0 或缺失就不写（多数账号是 0）。
+            if (credits.expiring !== undefined && credits.expiring > 0) {
+              w.display += ` · 其中 ${round1(credits.expiring)} 即将过期`;
+            }
             windows.push(w);
           } else if (credits && credits.isCreditPackage === false) {
             creditsError = "该账号是 Token 计费账户，没有积分余额";
@@ -1688,6 +1805,12 @@ export default async function codeartsPlugin(_input, options) {
             } else if (left !== undefined) {
               w.display = `${Math.round(left)} tokens`;
             }
+            // 两本账：token 池（opengw）用光不代表账号不能用 —— 积分账还在，
+            // 福利通道的模型才走这座池子。所以在**已经有积分窗口把关**时，把它标成
+            // aside（只展示、不参与「账号用尽」判定），免得池子见底就把整个账号停掉。
+            // 反过来，Token 计费账号（没有积分窗口）里它是唯一的额度，必须参与判定，
+            // 否则宿主要等到上游报错才知道 —— 那一层不能省。
+            if (windows.length) w.aside = true;
             windows.push(w);
             poolLeft = left;
           }
@@ -1778,6 +1901,11 @@ export default async function codeartsPlugin(_input, options) {
             const channel = src === "codearts" || src === "agent" ? "agent" : src === "benefit" ? "benefit" : "";
             if (channel) table.set(key, channel);
 
+            // 免费 = 走福利通道（花的是每日免费 token 池，不扣积分）。
+            // 🔴 熔断中的不算：那时它其实走普通通道、照常扣积分，标 `free` 是撒谎。
+            const free = channel === "benefit" && !benefitBroken(ak, id);
+            const rate = creditRate(m);
+
             out[id] = {
               name: String(m.model_name ?? m.modelName ?? m.name ?? id),
               id,
@@ -1789,6 +1917,11 @@ export default async function codeartsPlugin(_input, options) {
               },
               reasoning: false,
               tool_call: true,
+              // 宿主的两个展示字段（都是它的模型 schema 里的真实字段）：
+              //   free —— 界面上打「免费」标；rate —— 每次请求的消耗系数。
+              // 两者互斥：免费模型再报系数只会让人以为「免费」是假的。
+              ...(free ? { free: true } : {}),
+              ...(!free && rate > 0 ? { rate } : {}),
               // 明确声明收不收图（**不许留空**：留空 = 「没说」= 宿主照发图片 → 406）。
               // 即使上游写着 supports_images:true 也不采信 —— 0.2.13/0.2.15 实测
               // 走 magpie 的图片格式一律 406，唯一可信来源是 VISION_MODELS（实测过才加）。
@@ -1817,6 +1950,7 @@ export const _internal = {
   checkinPlan, checkinErrorOutcome, checkinFlow,
   startOfTodayMs, isBenefitChannel, codeartsModels, clampChatBody,
   upstreamSessionId, sessionHeaders, num, round1, optNumber, outputLimit, CN_OFFSET_MS,
+  creditRate, bareModelId, errorStatus, SESSION_LIMIT_CODE, errorResponse, PROVIDER_ID,
   channelCache, channelTable, MODEL_META, VISION_MODELS, AGENT_MODELS, MAX_OUTPUT_TOKENS,
   RETIRED_MODELS, modelRetired,
   benefitBroken, markBenefitBroken, benefitGone, gatewayRetired, benefitDown, BENEFIT_DOWN_MS,
