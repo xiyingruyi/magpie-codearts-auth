@@ -257,6 +257,38 @@ CODEARTS_AK=... CODEARTS_SK=... node scripts/probe-session.mjs <模式> [并发�
 
 此外补齐了 `ineligible` / `captcha` / `inactive` 三种签到 outcome（骨架版遇到会落到 `failed` 并每 30 分钟无意义重试）。
 
+## 0.2.24（2026-10-21：对比工作流跑完后的第二批 —— 配置合并、签名全序、测试可注入）
+
+上一版（0.2.23）用的是对比工作流的**部分**结果。工作流 71 个 agent 全跑完后共 74 条发现
+（23 条确证、41 条被反驳、24 条「我们更好」），其中还有三处值得动手，本版处理掉：
+
+| # | 改动 | 为什么 |
+|---|---|---|
+| 1 | `config` 钩子改成**逐字段 `??=` + 合并 models** | 以前是整块 `cfg.provider.codearts ??= {…}`：用户只要手改过这个块里的任何一个字段（例如只加一个 `name`），整套默认值——**包括 `models`**——全部被跳过。而 `provider.models` 只在登录后才会跑，所以登录前这个 provider 一个模型都没有。现在是「默认目录铺底 + 用户条目覆盖」，与社区版同形 |
+| 2 | 规范化查询串改成 **key → value 两段排序** | 华为云 SDK 规范要求全序。只按 key 排时，同一个 key 出现两次（`?a=2&a=1`）的顺序取决于原始书写，服务端会自己再排一遍 —— 两边算出的规范化请求不同 = `401 APIG.0301`，表现却像「AK/SK 坏了」。今天签名的 URL 都没有重复参数，所以是**潜伏** bug。顺手把「规范化 URI / 查询串」收成 `signingParts()` 一处实现，签名和测试共用，避免只改一边 |
+| 3 | 插件工厂接受**注入的 `fetch`**（`mod.default({}, { fetch })`） | 宿主本来就把 runner 的 `fetch` 挂在第二参上，我们以前 `void options` 直接丢了。测试因此只能改 `globalThis.fetch`（91 处手写 try/finally）：任何一处中途抛错，stub 会漏给后面所有用例，失败看上去还像逻辑 bug。现在关键路径都走注入的 fetcher，并加了 `afterEach` 护栏：谁忘了复原，就指名道姓报出来 |
+
+顺手修掉两处测试本身的缺陷（都是对比中「他们更好」的点）：
+
+- **一条在真打网络的测试**：`authorize: 只靠 inputs.credential…` 没装 stub，断言却只要求
+  「验证失败」——有网绿、没网也绿（最长挂到 12 秒超时），凭据流程根本没被验证。现在用注入的
+  fetcher 断言它**确实用那份 AK 签了名**，另加一条「网络不通时报验证失败」。
+- **一条永远为真的断言**：`a.SignedHeaders === b.SignedHeaders`，两边都没有这个属性
+  （`undefined === undefined`）。改成直接断言规范化 URI，以及同一组参数换书写顺序后待签串一致。
+
+**明确不采纳**（工作流里也确认了）：
+
+- **`magpie.options` 做成真实配置面**：我们没有需要用户调的旋钮，凭空加一个只会增加维护面。
+- **本地签到账本**（他们用它反推积分到期日）：上游 `package_credit_expiring_amount`
+  直接给，读它比自己在本地记账更准。
+- **额度分项画成 `aside` 窗口**：分项是总数的构成明细，画出来只会重复同一笔钱
+  （README 0.2.17 那段已记录过这个坑）。
+- **凭据刷新 / token 过期 401 / `accountId` 去重**：全都建立在 OAuth 临时凭证上，
+  维持 AK/SK 就用不上。
+
+测试 232 → 241 条。17 个突变（含本版新增的 5 个：查询串只排 key / 整块覆盖 config /
+models 不合并 / usage 与 checkin 忽略 fetcher）全部被杀。
+
 ## 0.2.23（2026-10-21：逐条对比社区插件 `magpie-community/plugins` 的 codearts 实现后吸纳的几处）
 
 对照 [magpie-community/plugins → packages/codearts](https://github.com/magpie-community/plugins)

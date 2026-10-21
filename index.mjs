@@ -514,9 +514,9 @@ function rfc3986(v) {
  */
 function sdkSignedHeaders(method, url, bodyStr, ak, sk, extraHeaders = {}) {
   const u = new URL(url);
-  const canonicalUri = u.pathname.endsWith("/") ? u.pathname : `${u.pathname}/`;
-  const params = [...u.searchParams.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
-  const canonicalQuery = params.map(([k, v]) => `${rfc3986(k)}=${rfc3986(v)}`).join("&");
+  // 规范化 URI / 查询串**只从这里算**（`signingParts` 是唯一实现）：两处各写一遍，
+  // 迟早只改一处 —— 测试盯着那边、请求走的是这边，看着绿其实错的。
+  const { canonicalUri, canonicalQuery } = signingParts(method, url, bodyStr);
 
   const sdkDate = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
   const headers = {
@@ -528,6 +528,7 @@ function sdkSignedHeaders(method, url, bodyStr, ak, sk, extraHeaders = {}) {
   const signedNames = Object.keys(headers).sort();
   const canonicalHeaders = signedNames.map((n) => `${n}:${String(headers[n]).trim()}\n`).join("");
   const signedHeaders = signedNames.join(";");
+  // 规范化请求与待签串拆出来，测试才能单独复算（也才能在失败时把差异指出来）。
   const payloadHash = createHash("sha256").update(bodyStr ?? "").digest("hex");
   const canonicalRequest = `${method.toUpperCase()}\n${canonicalUri}\n${canonicalQuery}\n${canonicalHeaders}\n${signedHeaders}\n${payloadHash}`;
   const stringToSign = `SDK-HMAC-SHA256\n${sdkDate}\n${createHash("sha256").update(canonicalRequest).digest("hex")}`;
@@ -539,6 +540,28 @@ function sdkSignedHeaders(method, url, bodyStr, ak, sk, extraHeaders = {}) {
   return out;
 }
 
+/**
+ * 只算签名**之前**的那些中间量（规范化 URI / 查询串 / 待签串），不发请求。
+ *
+ * 给测试用：签名算法如果只在测试里重算一遍，等于用同一份实现验证自己 ——
+ * 实现里那个 bug 会被原样复制到断言里。真正的护栏是「钉死的已知答案」，
+ * 这组中间量就是拿来跟手算结果逐段对照的。
+ */
+function signingParts(method, url, bodyStr) {
+  const u = new URL(url);
+  const canonicalUri = u.pathname.endsWith("/") ? u.pathname : `${u.pathname}/`;
+  // 🔴 华为云 SDK 规范：查询串按 **key 再逐个比 value** 排序（两段比较）。
+  //    只比 key 不是全序 —— 同一个 key 出现两次时（`?a=2&a=1`）顺序取决于
+  //    浏览器给的原始顺序，而服务端会自己排一遍，两边算出的规范化请求就不一样，
+  //    结果是 `401 APIG.0301`（看起来像 AK/SK 坏了）。今天签名的 URL 恰好都没有
+  //    重复参数，所以这是个潜伏 bug：等哪天出现一个，排查成本极高。
+  const params = [...u.searchParams.entries()].sort((a, b) =>
+    a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0,
+  );
+  const canonicalQuery = params.map(([k, v]) => `${rfc3986(k)}=${rfc3986(v)}`).join("&");
+  return { canonicalUri, canonicalQuery, method: method.toUpperCase(), body: bodyStr ?? "" };
+}
+
 // ---------------------------------------------------------------------------
 // opengw 信封（error_code "0000" 成功，数据在 result）
 // ---------------------------------------------------------------------------
@@ -547,7 +570,7 @@ function sdkSignedHeaders(method, url, bodyStr, ak, sk, extraHeaders = {}) {
 //    `context.WithTimeout(ctx, 20*time.Second)`，从钩子被调起那一刻开始算。
 //    这里原来给 30 秒 —— 上游一慢，宿主先放弃、插件后报超时，卡片上就是
 //    「暂时无法获取最新额度」，签到则记成 failed。opengw 实测 p50 约 40ms。
-async function envelope(path, { method = "GET", body, ak, sk, timeout = 12_000 }) {
+async function envelope(path, { method = "GET", body, ak, sk, timeout = 12_000, fetcher = fetch }) {
   const url = `${OPENGW_HOST}${path}`;
   const bodyStr = body !== undefined ? JSON.stringify(body) : "";
   // 会话头只发给**对话端点**：并发上限是按对话会话算的，余额/签到这些
@@ -556,7 +579,7 @@ async function envelope(path, { method = "GET", body, ak, sk, timeout = 12_000 }
   const headers = sdkSignedHeaders(method, url, bodyStr, ak, sk);
   let res, text;
   try {
-    res = await fetch(url, {
+    res = await fetcher(url, {
       method,
       headers,
       ...(bodyStr ? { body: bodyStr } : {}),
@@ -593,7 +616,7 @@ async function envelope(path, { method = "GET", body, ak, sk, timeout = 12_000 }
  *    万一上游改成「小写也不许签」，我们去掉这个可选头再发一次就能自愈 ——
  *    它是可选头，去掉不影响语义。
  */
-async function snapEnvelope(path, { method = "GET", body, ak, sk, query, timeout = SNAP_TIMEOUT_MS, deadline } = {}) {
+async function snapEnvelope(path, { method = "GET", body, ak, sk, query, timeout = SNAP_TIMEOUT_MS, deadline, fetcher = fetch } = {}) {
   const url = new URL(`${SNAP_HOST}${path}`);
   for (const [k, v] of Object.entries(query ?? {})) url.searchParams.set(k, String(v));
   const href = url.toString();
@@ -607,7 +630,7 @@ async function snapEnvelope(path, { method = "GET", body, ak, sk, query, timeout
       throw Object.assign(new Error(`CodeArts ${path} 超出本次调用预算，已跳过`), { errorCode: "BUDGET" });
     }
     const target = extra ? sdkSignedHeaders(method, href, bodyStr, ak, sk, extra) : sdkSignedHeaders(method, href, bodyStr, ak, sk);
-    return fetch(href, {
+    return fetcher(href, {
       method,
       headers: target,
       ...(bodyStr ? { body: bodyStr } : {}),
@@ -653,13 +676,13 @@ async function snapEnvelope(path, { method = "GET", body, ak, sk, query, timeout
 }
 
 /** opengw 的 POST /api/v1/benefit/claim 旧路径已不再用于签到（见 README 0.2.17）。 */
-async function claimStatus(ak, sk) {
-  return envelope(CLAIM_PATH, { ak, sk });
+async function claimStatus(ak, sk, opts = {}) {
+  return envelope(CLAIM_PATH, { ak, sk, ...opts });
 }
 
 /** 免费额度余额：{total_quota, total_balance, used_amount, …}。 */
-function fetchBalance(ak, sk) {
-  return envelope(BALANCE_PATH, { ak, sk });
+function fetchBalance(ak, sk, opts = {}) {
+  return envelope(BALANCE_PATH, { ak, sk, ...opts });
 }
 
 /**
@@ -671,8 +694,8 @@ function fetchBalance(ak, sk) {
  *    数值本身就是积分，不要再套「1 积分 = 10000 token」的折算 —— 那条只适用于
  *    每日 token 池，套到这里会把 12000 积分算成 1.2 亿。
  */
-async function fetchCredits(ak, sk) {
-  const r = await snapEnvelope(STATS_PATH, { ak, sk });
+async function fetchCredits(ak, sk, opts = {}) {
+  const r = await snapEnvelope(STATS_PATH, { ak, sk, ...opts });
   const metrics = (Array.isArray(r.metrics) ? r.metrics : []).filter((m) => m && typeof m === "object");
   const by = (name) => metrics.find((m) => m.name === name) ?? {};
   const total = by("usageTotalPackageCredit");
@@ -768,13 +791,13 @@ function opsConfirm(ak, sk, campaignId, opts = {}) {
  * confirm 只是把状态推进到 CONFIRMED，所以这一步不会多发也不会少发；
  * 失败只忽略，不影响签到本身的结论。
  */
-async function checkinFlow(ak, sk) {
+async function checkinFlow(ak, sk, fetcher = fetch) {
   const startedAt = Date.now();
   // 🔴 整条链共用一条 deadline，而不是每个请求各自拿一份 6 秒。
   //    snapEnvelope 的 401 重发也会按**剩余**时间算，所以最坏耗时不会超过它。
   const deadline = startedAt + CHECKIN_BUDGET_MS;
   const left = () => deadline - Date.now();
-  const opts = { deadline };
+  const opts = { deadline, fetcher };
   const items = await fetchCampaigns(ak, sk, opts);
   const daily = pickDailyCampaign(items);
   const plan = checkinPlan(daily);
@@ -895,8 +918,8 @@ async function checkinFlow(ak, sk) {
  * 🔴 失败**不吞**：吞成空数组会让调用方分不清「真的没有模型」和「这次没拉到」，
  * 进而把缓存清空、拿静态兜底清单去判定通道。网络/业务错误一律往上抛。
  */
-async function fetchBuiltinModels(ak, sk) {
-  const r = await snapEnvelope(BUILTIN_MODELS_PATH, { ak, sk });
+async function fetchBuiltinModels(ak, sk, opts = {}) {
+  const r = await snapEnvelope(BUILTIN_MODELS_PATH, { ak, sk, ...opts });
   // 「这次没拿到」与「确实没有模型」必须分开（同 fetchCampaigns 的 BAD_ITEMS）
   if (!Array.isArray(r?.builtinModels)) {
     throw Object.assign(new Error("CodeArts 内置模型清单格式异常（缺 builtinModels）"), { errorCode: "BAD_BUILTIN" });
@@ -1514,21 +1537,30 @@ function codeartsModels() {
 // ---------------------------------------------------------------------------
 
 export default async function codeartsPlugin(_input, options) {
-  void options;
+  // 宿主把插件 runner 的 `fetch` 挂在第二参上（与 `globalThis.fetch` 同一个实现）。
+  // 存一份，测试就能注入假实现而**不用改全局** —— 全局 stub 的用例一旦中途抛错，
+  // stub 会漏给后面所有用例，失败看上去还像逻辑 bug。取不到就退回全局（生产等价）。
+  const fetcher = typeof options?.fetch === "function" ? options.fetch : undefined;
 
   return {
     config: async (cfg) => {
       cfg.provider ??= {};
-      cfg.provider.codearts ??= {
-        name: "CodeArts 码道 (Huawei)",
-        npm: "@ai-sdk/openai-compatible",
-        // 这里是 **base**，不是完整端点：宿主会把它当作 `baseURL + "/chat/completions"`
-        // 的兜底基址（plugins.go 的 `firstOf(o.BaseURL, m.URL, pp.API, …)`）。
-        // 写完整端点会让兜底路径拼出 `…/api/v2/chat/completions/chat/completions`。
-        // 主机名部分对 `Provider.Origin()` 仍然正确。
-        api: `${SNAP_HOST}/api/v2`,
-        models: codeartsModels(),
-      };
+      // 🔴 逐字段 `??=` + 合并 models，**不能**整块 `cfg.provider.codearts ??= {...}`。
+      //    整块赋值时，用户只要手改过 codearts 块里的任何一个字段（哪怕只是改个
+      //    显示名），整个默认对象（含 models）都会被跳过 —— 登录前模型选择器是空的，
+      //    而 provider.models 只在**登录后**才有机会补回来。用户看到的是「这个
+      //    provider 一个模型都没有」。
+      //    合并顺序：先铺默认目录，再让用户自己写的条目覆盖（用户手加/微调的模型
+      //    优先级最高）。社区的 codearts 插件同样是这个形状。
+      const p = (cfg.provider.codearts ??= {});
+      p.name ??= "CodeArts 码道 (Huawei)";
+      p.npm ??= "@ai-sdk/openai-compatible";
+      // 这里是 **base**，不是完整端点：宿主会把它当作 `baseURL + "/chat/completions"`
+      // 的兜底基址（plugins.go 的 `firstOf(o.BaseURL, m.URL, pp.API, …)`）。
+      // 写完整端点会让兜底路径拼出 `…/api/v2/chat/completions/chat/completions`。
+      // 主机名部分对 `Provider.Origin()` 仍然正确。
+      p.api ??= `${SNAP_HOST}/api/v2`;
+      p.models = { ...codeartsModels(), ...(p.models ?? {}) };
     },
 
     auth: {
@@ -1574,7 +1606,7 @@ export default async function codeartsPlugin(_input, options) {
             //    积分账那条接口一直活着，而且正是签到攒积分的那本账，更适合当探针。
             //    （签到接口本身幂等，不在这里触发。）
             try {
-              await fetchCredits(ak, sk);
+              await fetchCredits(ak, sk, { fetcher });
             } catch (e) {
               // 老套餐 token 账户在积分账上可能没有指标，但**调用本身**是通的；
               // 只有「整条通道没了」才值得换一个探针再确认，否则 401 就该直接报。
@@ -1582,7 +1614,7 @@ export default async function codeartsPlugin(_input, options) {
                 return { type: "failed", error: `AK/SK 验证失败: ${redact(e?.message ?? String(e), ak, sk)}` };
               }
               try {
-                await fetchBalance(ak, sk);
+                await fetchBalance(ak, sk, { fetcher });
               } catch (e2) {
                 return { type: "failed", error: `AK/SK 验证失败: ${redact(e2?.message ?? String(e2), ak, sk)}` };
               }
@@ -1725,11 +1757,11 @@ export default async function codeartsPlugin(_input, options) {
           let credits = null;
           let creditsError = "";
           const [creditsRes, bal] = await Promise.all([
-            fetchCredits(ak, sk).then(
+            fetchCredits(ak, sk, { fetcher }).then(
               (c) => ({ c }),
               (e) => ({ e }),
             ),
-            fetchBalance(ak, sk).catch(() => null),
+            fetchBalance(ak, sk, { fetcher }).catch(() => null),
           ]);
           if (creditsRes.c) credits = creditsRes.c;
           else creditsError = redact(creditsRes.e?.message ?? String(creditsRes.e), ak, sk);
@@ -1760,7 +1792,10 @@ export default async function codeartsPlugin(_input, options) {
               w.amount = round1(usedC);
               w.limit = credits.amount;
               const remainShown = clampRemain(credits) ?? credits.amount - usedC;
-              w.display = `${round1(remainShown)} / ${credits.amount}`;
+              // 🔴 写清「剩余」：宿主同一张卡片里 amount/limit 是**已用**/总量
+              //    （`337.2 / 12500`），旁边那个百分比也是已用。这里若光写
+              //    `12162.8 / 12500`，读起来像「用了 97%」。加三个字就不歧义了。
+              w.display = `剩余 ${round1(remainShown)} / ${credits.amount}`;
             } else {
               w.display = `${round1(clampRemain(credits) ?? credits.remain)} 积分`;
             }
@@ -1847,7 +1882,7 @@ export default async function codeartsPlugin(_input, options) {
           // 签到 = snap 侧的「活动」三步（查活动 → claim → confirm），
           // 不再碰 opengw 的福利通道 —— 那是另一本账（免费 token 池），
           // 而且 2026-10-20 起已经整组下线（见 README 0.2.17）。
-          return await checkinFlow(ak, sk);
+          return await checkinFlow(ak, sk, fetcher);
         } catch (e) {
           return checkinErrorOutcome(e);
         }
@@ -1865,7 +1900,7 @@ export default async function codeartsPlugin(_input, options) {
           return provider.models;
         }
         try {
-          const rows = await fetchBuiltinModels(ak, sk);
+          const rows = await fetchBuiltinModels(ak, sk, { fetcher });
           // 只替换**本账号**那一层：channel 跟账号走，留着别的账号的判定会串通道；
           // 但也不能整体清空，否则另一个账号的缓存会被这次拉取抹掉。
           // 空清单同样要替换 —— 否则本账号的旧记录会一直生效。
@@ -1944,7 +1979,7 @@ export default async function codeartsPlugin(_input, options) {
 
 /** 测试辅助（宿主不会把它当插件调用）。 */
 export const _internal = {
-  rfc3986, sdkSignedHeaders, envelope, snapEnvelope, creds, bare, parseCredential, redact,
+  rfc3986, sdkSignedHeaders, signingParts, envelope, snapEnvelope, creds, bare, parseCredential, redact,
   claimStatus, fetchBalance, fetchBuiltinModels,
   fetchCredits, fetchCampaigns, pickDailyCampaign, usableCampaignId, opsClaim, opsConfirm,
   checkinPlan, checkinErrorOutcome, checkinFlow,

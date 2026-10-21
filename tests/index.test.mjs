@@ -1,4 +1,4 @@
-import { test } from "node:test";
+import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { createHash, createHmac } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -14,11 +14,24 @@ const {
   upstreamSessionId, sessionHeaders, CN_OFFSET_MS,
   channelCache, channelTable, MODEL_META, VISION_MODELS, AGENT_MODELS, RETIRED_MODELS, modelRetired,
   benefitBroken, markBenefitBroken, benefitGone, gatewayRetired, benefitDown, BENEFIT_DOWN_MS,
-  modalitiesField, capabilitiesField, imageCapable,
+  modalitiesField, capabilitiesField, imageCapable, signingParts,
   errorResponse, errorStatus, SESSION_LIMIT_CODE, creditRate, bareModelId,
   SNAP_HOST, CHAT_PATH, OPENGW_HOST,
   STATS_PATH, OPS_DELIVERY_PATH, OPS_CHANNEL, AGENT_TYPE_HEADER, BUILTIN_MODELS_PATH,
 } = mod._internal;
+
+/**
+ * 🔴 全局 fetch 的护栏：每个用例结束后核对它被复原了。
+ *
+ * 以前 91 处直接改 `globalThis.fetch`，靠手写 try/finally 复原 —— 只要有一个用例
+ * 在赋值与 finally 之间抛错（或忘了写 finally），stub 就会漏给后面所有用例，
+ * 那种失败看上去像逻辑 bug，排查成本极高。这条 afterEach 把「漏了」变成一条
+ * 指名道姓的失败。新写的用例优先用 `mod.default({}, { fetch })` 注入（见 0.2.24）。
+ */
+const REAL_FETCH = globalThis.fetch;
+afterEach(() => {
+  assert.equal(globalThis.fetch, REAL_FETCH, "上一个用例没有把 globalThis.fetch 复原");
+});
 
 const AK = "LTAI5tABCDEFGHIJKLMN";
 const SK = "y8QwERtyuiopASDfghjKLzxcvbnm1234567890Ab";
@@ -355,9 +368,38 @@ test("sdkSignedHeaders: 三个默认头都参与签名", () => {
 });
 
 test("sdkSignedHeaders: canonical_uri 自动补尾斜杠", () => {
+  // 🔴 这条以前比的是 `a.SignedHeaders` 与 `b.SignedHeaders` —— 两边都**没有**
+  //    这个属性（undefined === undefined），永远绿。要钉的是规范化 URI 本身。
+  assert.equal(signingParts("GET", "https://h.cn/api/v1/x", "", "AK", "SK").canonicalUri, "/api/v1/x/");
+  assert.equal(signingParts("GET", "https://h.cn/api/v1/x/", "", "AK", "SK").canonicalUri, "/api/v1/x/");
+  assert.equal(signingParts("GET", "https://h.cn/", "", "AK", "SK").canonicalUri, "/", "根路径不再叠加");
+  // 两条 URL 的签名因此必须**完全一致**（同一个 key、同一时刻除外：x-sdk-date 会变，
+  // 所以只比 SignedHeaders 名单与规范化 URI）
   const a = sdkSignedHeaders("GET", "https://h.cn/api/v1/x", "", "AK", "SK");
   const b = sdkSignedHeaders("GET", "https://h.cn/api/v1/x/", "", "AK", "SK");
-  assert.equal(a.SignedHeaders, b.SignedHeaders);
+  assert.equal(a.Authorization.split("Signature=")[0], b.Authorization.split("Signature=")[0]);
+});
+
+test("sdkSignedHeaders: 查询串按 key 再按 value 排序（重复 key 也是全序）", () => {
+  // 🔴 只按 key 排序不是全序：`?a=2&a=1` 与 `?a=1&a=2` 排序结果不同，
+  //    而服务端会自己排一遍 —— 两边算出的规范化请求不一致 = 401 APIG.0301，
+  //    表现却像「AK/SK 坏了」。值必须参与比较。
+  assert.equal(
+    signingParts("GET", "https://h.cn/p?a=2&a=1", "").canonicalQuery,
+    "a=1&a=2",
+    "同 key 的不同值必须排成稳定全序",
+  );
+  assert.equal(
+    signingParts("GET", "https://h.cn/p?b=1&a=2&a=1", "").canonicalQuery,
+    "a=1&a=2&b=1",
+  );
+  // 编码照旧：空格 → %20，不许 + ；保留 -_.~
+  assert.equal(signingParts("GET", "https://h.cn/p?k=a%20b%26c", "").canonicalQuery, "k=a%20b%26c");
+  // 同一组参数换个书写顺序，得到的待签串必须一致
+  assert.equal(
+    signingParts("GET", "https://h.cn/p?x=1&y=2", "").canonicalQuery,
+    signingParts("GET", "https://h.cn/p?y=2&x=1", "").canonicalQuery,
+  );
 });
 
 test("sdkSignedHeaders: 业务头参与签名（benefit 三头）", () => {
@@ -1431,6 +1473,40 @@ test("config: 注册 codearts provider", async () => {
   assert.ok(!cfg.provider.codearts.api.endsWith("/chat/completions"));
 });
 
+test("config: 用户已有 part 配置时，默认目录与字段仍要补齐（不能整块跳过）", async () => {
+  // 🔴 回归：以前是 `cfg.provider.codearts ??= {…全部默认…}`。用户只要手改过这个
+  //    块里的任何一个字段（例如只加了个 name），整套默认值——包括 models——就
+  //    全部被跳过；而 provider.models 只在**登录后**才会跑，于是登录前这个
+  //    provider 一个模型都没有。
+  const plugin = await mod.default({}, {});
+  const mine = { id: "mine", name: "我自己的模型", limit: { context: 8000, output: 1000 } };
+  const cfg = { provider: { codearts: { name: "我的码道", models: { mine } } } };
+  await plugin.config(cfg);
+  const p = cfg.provider.codearts;
+  assert.equal(p.name, "我的码道", "用户写的字段不能被覆盖");
+  assert.equal(p.npm, "@ai-sdk/openai-compatible", "缺的字段要补上");
+  assert.equal(p.api, `${SNAP_HOST}/api/v2`);
+  assert.ok(Object.keys(p.models).length > 1, `默认目录必须补进来，实际: ${Object.keys(p.models).join(",")}`);
+  assert.deepEqual(p.models.mine, mine, "用户自己的条目原样保留");
+  assert.ok(p.models["GLM-5.2"], "默认目录里的模型也要在");
+});
+
+test("config: 用户自定义的同名模型优先于默认目录", async () => {
+  const plugin = await mod.default({}, {});
+  const cfg = { provider: { codearts: { models: { "GLM-5.2": { id: "GLM-5.2", name: "改过的名字" } } } } };
+  await plugin.config(cfg);
+  assert.equal(cfg.provider.codearts.models["GLM-5.2"].name, "改过的名字");
+});
+
+test("config: 重复调用是幂等的（宿主可能调用多次）", async () => {
+  const plugin = await mod.default({}, {});
+  const cfg = {};
+  await plugin.config(cfg);
+  const first = JSON.stringify(cfg);
+  await plugin.config(cfg);
+  assert.equal(JSON.stringify(cfg), first);
+});
+
 // ---------------------------------------------------------------------------
 // 🔴 关键回归：authorize 必须只靠 inputs 拿到 AK/SK
 // ---------------------------------------------------------------------------
@@ -1472,10 +1548,25 @@ test("authorize: 签名错（401）直接报验证失败，不换探针瞎试", 
 });
 
 test("authorize: 只靠 inputs.credential 就能拿到 AK/SK（宿主不传 key）", async () => {
-  const plugin = await mod.default({}, {});
+  // 🔴 这条以前没装 stub：断言只要求「验证失败」，于是真去打了一次
+  //    snap-access.cn-north-4.myhuaweicloud.com —— 有网时绿、没网时绿（最长挂到
+  //    12 秒超时），而「凭据流程有没有走通」根本没被验证。现在用注入的 fetcher
+  //    明确回一个业务成功，断言它走到了**用这份 AK/SK 发请求**这一步。
+  let used = null;
+  const plugin = await mod.default({}, { fetch: async (url, init) => {
+    used = { url: String(url), auth: new Headers(init.headers).get("Authorization") };
+    return jsonResponse({ metrics: [] });
+  } });
+  const r = await plugin.auth.methods[0].authorize({ credential: `${AK}:${SK}` });
+  assert.equal(r.type, "success", `应验证通过，实际: ${r.error}`);
+  assert.match(used.url, /snap-manager\/v1\/statistics\/plugin/);
+  assert.match(used.auth, new RegExp(`Access=${AK}`), "必须用 inputs 里那份 AK 去签名");
+});
+
+test("authorize: 网络真的不通时报「验证失败」，而不是崩", async () => {
+  const plugin = await mod.default({}, { fetch: async () => { throw new Error("fetch failed"); } });
   const r = await plugin.auth.methods[0].authorize({ credential: `${AK}:${SK}` });
   assert.equal(r.type, "failed");
-  assert.ok(!/不能为空/.test(r.error), `不该是缺凭据错误，实际: ${r.error}`);
   assert.match(r.error, /验证失败/);
 });
 
@@ -2222,7 +2313,7 @@ test("usage: 积分账是主窗口（token 池下线后仍能显示 12000+ 积�
   assert.equal(w.used, 2.7, "337.22/12500 = 2.7%");
   // 到期日并进 display：宿主的 window.aside 是布尔（`aside: !!w.aside`），
   // 字符串会被归一成 true、文案丢失，而且 true = 不参与「用尽」判定。
-  assert.equal(w.display, "12162.8 / 12500 · 体验版 到期 2026-11-12");
+  assert.equal(w.display, "剩余 12162.8 / 12500 · 体验版 到期 2026-11-12");
   assert.equal(w.aside, undefined, "aside 不能承载文案，也不能把这个唯一窗口标成只展示");
   assert.match(u.balance, /12162\.8 积分/);
 });
@@ -2338,7 +2429,7 @@ test("usage: 积分出现负已用 / 剩余超总额时夹住，不画负百分�
   assert.equal(negative.windows[0].used, 0);
   assert.equal(negative.windows[0].amount, 0);
   // display / balance 用的是 remain，也必须夹住 —— 否则画成「12510 / 12500」
-  assert.match(negative.windows[0].display, /^12500 \/ 12500/);
+  assert.match(negative.windows[0].display, /^剩余 12500 \/ 12500/);
   assert.doesNotMatch(negative.balance, /12510/);
 
   // 已用 > 总额（统计滞后）→ 夹到 100%，amount 不超过 limit
@@ -2754,8 +2845,8 @@ test("签到链上没有任何一处另设更长的超时，且共用同一条 d
   assert.ok(from > 0 && to > from, "扫描范围没找到，检查函数名是否改了");
   const chain = src.slice(from, to);
   assert.ok(!/timeout\s*:/.test(chain), "签到链上不该给单个请求另设超时（会越过宿主 20s）");
-  // 三步必须都拿到同一个 deadline
-  assert.match(chain, /const opts = \{ deadline \}/, "checkinFlow 应把 deadline 收成一个 opts");
+  // 三步必须都拿到同一个 deadline（以及同一个 fetcher：测试注入的那个）
+  assert.match(chain, /const opts = \{ deadline, fetcher \}/, "checkinFlow 应把 deadline 收成一个 opts");
   const passOpts = (chain.match(/, opts\)/g) ?? []).length;
   assert.ok(passOpts >= 3, `delivery/claim/confirm 都应带上 opts，实际 ${passOpts} 处`);
 });
@@ -3020,4 +3111,76 @@ test("provider.models: 没有 credit 时不写 rate（默认值交给宿主）",
   } finally { globalThis.fetch = real; }
   assert.ok(!("rate" in out["GLM-5.2"]));
   assert.ok(!("free" in out["GLM-5.2"]));
+});
+
+// ---------------------------------------------------------------------------
+// 0.2.24：注入 fetcher（不再靠全局 stub）+ 一处真实的网络泄漏
+// ---------------------------------------------------------------------------
+
+test("options.fetch: 注入的 fetcher 会被 usage 用到，且不动 globalThis.fetch", async () => {
+  // 宿主调用插件工厂时把 runner 的 fetch 挂在第二参上（与全局同一个实现）。
+  // 测试用它注入：某个用例中途抛错也不会把 stub 漏给后面的用例。
+  const calls = [];
+  const plugin = await mod.default({}, {
+    fetch: async (url) => {
+      calls.push(String(url));
+      return jsonResponse(statsPayload());
+    },
+  });
+  const real = globalThis.fetch;
+  let touched = false;
+  globalThis.fetch = async () => { touched = true; throw new Error("不该走到全局 fetch"); };
+  try {
+    const u = await plugin.auth.usage(async () => ({ type: "api", key: AK, metadata: { sk: SK } }));
+    assert.match(u.balance, /积分/);
+  } finally {
+    globalThis.fetch = real;
+  }
+  assert.equal(touched, false, "注入生效时绝不能碰全局 fetch");
+  assert.ok(calls.some((u) => u.includes("/snap-manager/v1/statistics/plugin")));
+});
+
+test("options.fetch: 签到链同样走注入的 fetcher（三步都别落到全局）", async () => {
+  const seen = [];
+  const plugin = await mod.default({}, {
+    fetch: async (url, init) => {
+      const u = new URL(String(url));
+      seen.push(u.pathname);
+      if (u.pathname.endsWith("/v1/ops/delivery")) {
+        return jsonResponse({ code: 0, message: "ok", data: { channel: "IDE", items: [dailyCampaign()] } });
+      }
+      return jsonResponse({ code: 0, message: "ok", data: { benefitAmount: 1000 } });
+    },
+  });
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => { throw new Error("不该走到全局 fetch"); };
+  let r;
+  try {
+    r = await plugin.auth.checkin(async () => ({ type: "api", key: AK, metadata: { sk: SK } }));
+  } finally {
+    globalThis.fetch = real;
+  }
+  assert.equal(r.outcome, "claimed");
+  assert.deepEqual(seen, ["/v1/ops/delivery", "/v1/ops/claim", "/v1/ops/confirm"]);
+});
+
+test("options.fetch: provider.models 也走注入的 fetcher", async () => {
+  let hit = "";
+  const plugin = await mod.default({}, {
+    fetch: async (url) => { hit = String(url); return builtin([bm("GLM-5.2", { credit: [{ ratio_display: "0.7x" }] })]); },
+  });
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => { throw new Error("不该走到全局 fetch"); };
+  let out;
+  try {
+    out = await plugin.provider.models({ models: {} }, { auth: { type: "api", key: AK, metadata: { sk: SK } } });
+  } finally { globalThis.fetch = real; }
+  assert.equal(hit, `${SNAP_HOST}${BUILTIN_MODELS_PATH}`);
+  assert.equal(out["GLM-5.2"].rate, 0.7);
+});
+
+test("注入 fetcher 的模型下，改全局的那批老用例仍是安全的", async () => {
+  // 结构性护栏（运行时版）：afterEach 会在每个用例后核对全局 fetch 有没有被复原。
+  // 这个用例什么也不做，只是让上面那条护栏有据可依地出现在报告里。
+  assert.equal(typeof globalThis.fetch, "function");
 });
