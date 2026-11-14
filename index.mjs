@@ -791,12 +791,18 @@ function pickDailyCampaign(items) {
 function pickClaimableCampaigns(items, daily = pickDailyCampaign(items)) {
   const list = (Array.isArray(items) ? items : []).filter((i) => i && typeof i === "object");
   const out = daily ? [daily] : [];
+  // 🔴 按 campaignId 去重，不是按对象身份（i === daily）：上游若把同一条活动下发成
+  //    两行（type/文案不同、id 相同），按身份去重会让它被 claim 两次，而幂等键
+  //    带毫秒时间戳、两次调用不保证落在同一毫秒，服务端拦不住。
+  const seen = new Set(out.map((i) => usableCampaignId(i?.campaignId)).filter((v) => v !== undefined));
   for (const i of list) {
     if (i === daily) continue;
-    if (usableCampaignId(i?.campaignId) === undefined) continue;
+    const id = usableCampaignId(i?.campaignId);
+    if (id === undefined || seen.has(id)) continue;
     if (AUTO_CLAIM_DENY_TYPES.has(String(i?.type ?? "").toUpperCase())) continue;
     if (String(i?.status ?? "").toUpperCase() !== "ELIGIBLE") continue;
     if (i?.claimable === false) continue;
+    seen.add(id);
     out.push(i);
   }
   return out;
@@ -829,9 +835,13 @@ function opsConfirm(ak, sk, campaignId, opts = {}) {
  * 所以常规路径的 outcome / credit / message 与旧版逐字一致。
  *
  * 优先级是**故意**的：
- *   failed  > captcha > claimed > inactive > done > ineligible
+ *   failed  > captcha > claimed > done > inactive > ineligible
  * 任何一条失败都要报 failed —— 宿主只对 failed 在 30 分钟后重试；报 claimed 会让
  * 「每日签到成功、活动领取失败」的当天直接丢掉那次活动。
+ *
+ * `inactive` 排在 done / claimed **之后**：它只描述某一条活动（比如「未开通该权益」），
+ * 常规签到已经拿到手时不该把整轮结论改写成 inactive —— 宿主会把 inactive 当终态，
+ * 连着那天签到的 100 积分一起从「已领」里抹掉。inactive 的说明仍会并进 message。
  *
  * credit 汇总 claimed 与 done 两种（done 的额度是今天已经到账的那份，旧版也照报），
  * failed / captcha 那几条不计数：钱没到账，不能写进余额。
@@ -852,16 +862,18 @@ function mergeCheckin(daily, extras = []) {
       ? "captcha"
       : parts.some((p) => p.outcome === "claimed")
         ? "claimed"
-        : parts.some((p) => p.outcome === "inactive")
-          ? "inactive"
-          : parts.some((p) => p.outcome === "done")
-            ? "done"
+        : parts.some((p) => p.outcome === "done")
+          ? "done"
+          : parts.some((p) => p.outcome === "inactive")
+            ? "inactive"
             : "ineligible";
   const credit = sumCredit(parts.filter((p) => p.outcome === "claimed" || p.outcome === "done"));
   const messages = [];
   for (const p of parts) {
     if (!p.message) continue;
-    if (p !== daily && !["claimed", "failed", "captcha", "inactive"].includes(p.outcome)) continue;
+    // 额外活动的「没领到」也要说清楚：ineligible 是名额领完/活动下线，用户得知道原因，
+    // 否则面板上看着像插件把这条活动忘了。
+    if (p !== daily && !["claimed", "failed", "captcha", "inactive", "ineligible"].includes(p.outcome)) continue;
     if (!messages.includes(p.message)) messages.push(p.message);
   }
   return {
@@ -1024,13 +1036,29 @@ async function checkinFlow(ak, sk, fetcher = fetch) {
     }
     try {
       const claimed = await opsClaim(ak, sk, c.campaignId, Date.now(), opts);
-      // 与每日签到同一条规矩：领到之后一律补一次 confirm（字段提示不可信）
+      const credit = num(claimed?.benefitAmount) ?? num(claimed?.credit) ?? num(claimed?.credits) ?? cp.credit;
+      // 与每日签到同一条规矩：领到之后一律补一次 confirm（字段提示不可信）。
+      // 🔴 confirm 失败**不能吞**：积分在 claim 时已到账，但活动会停在 CLAIMED（非终态），
+      //    整轮若报 claimed，宿主就不会为它重试，活动要等到明天才可能被补确认。
+      //    报 failed 让宿主下一轮再来：那时这条活动是 CLAIMED、不再是 ELIGIBLE，
+      //    不会进 extras，而是落进 confirmStrays 被补确认 —— 正好收尾，不会重复发积分。
+      let confirmErr = null;
       try {
         await opsConfirm(ak, sk, c.campaignId, opts);
-      } catch {
-        // 积分在 claim 时已到账；下一轮签到会按 CLAIMED 再补
+      } catch (e) {
+        confirmErr = e;
       }
-      const credit = num(claimed?.benefitAmount) ?? num(claimed?.credit) ?? num(claimed?.credits) ?? cp.credit;
+      if (confirmErr) {
+        const cOut = checkinErrorOutcome(confirmErr, { credit }, "confirm");
+        if (cOut.outcome !== "done") {
+          extraParts.push({
+            outcome: "failed",
+            title,
+            message: `已领取「${title}」${credit === undefined ? "" : `${credit} 积分，`}确认未完成，稍后重试`,
+          });
+          continue;
+        }
+      }
       extraParts.push({
         outcome: "claimed",
         credit,
@@ -1038,8 +1066,19 @@ async function checkinFlow(ak, sk, fetcher = fetch) {
         message: credit === undefined ? `已领取「${title}」` : `已领取「${title}」${credit} 积分`,
       });
     } catch (e) {
-      // 40001「未到刷新时间」按已领处理（同每日签到）；其余错误原样交出去
+      // 40001「未到刷新时间」按已领处理（同每日签到 —— 同一套码的两种含义见
+      // checkinErrorOutcome 的注释）。但我们的判据是 claim 前的快照：别处（IDE /
+      // 另一台机器）刚领过时，它现在是 CLAIMED，而它还在 targetIds 里，confirmStrays
+      // 会跳过它 —— 所以这里自己补一次 confirm，把 CLAIMED 收尾掉（没有待确认记录时
+      // 同样回 40001，无副作用）。
       const mapped = checkinErrorOutcome(e, cp, "claim");
+      if (mapped.outcome === "done" && canSpendOneMore()) {
+        try {
+          await opsConfirm(ak, sk, c.campaignId, opts);
+        } catch {
+          // 下一轮签到按 CLAIMED 再补
+        }
+      }
       extraParts.push({ ...mapped, title, message: `「${title}」${mapped.message}` });
     }
   }
