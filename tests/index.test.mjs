@@ -6,7 +6,7 @@ import { readFileSync } from "node:fs";
 const mod = await import("../index.mjs");
 const {
   rfc3986, sdkSignedHeaders, envelope, snapEnvelope, creds, parseCredential, num, round1,
-  checkinPlan, checkinErrorOutcome, checkinFlow,
+  checkinPlan, checkinErrorOutcome, checkinFlow, pickClaimableCampaigns, mergeCheckin,
   fetchCredits, fetchCampaigns, opsClaim, opsConfirm, pickDailyCampaign, usableCampaignId,
   startOfTodayMs, isBenefitChannel, codeartsModels, redact, clampChatBody,
   outputLimit, MAX_OUTPUT_TOKENS, normalizeChatBody,
@@ -512,6 +512,54 @@ test("checkinPlan: ELIGIBLE 但服务端说 claimable=false → failed（自相�
   assert.equal(p.outcome, "failed");
 });
 
+test("pickClaimableCampaigns: 每日签到排第一，其余 ELIGIBLE 活动按上游顺序跟上", () => {
+  const daily = dailyCampaign();
+  const skill = { campaignId: 7, type: "SKILL_CONTEST_LOGIN", status: "ELIGIBLE", claimable: true };
+  const done = { campaignId: 8, type: "OTHER", status: "CONFIRMED", claimable: false };
+  const noClaim = { campaignId: 9, type: "SKILL_CONTEST_LOGIN", status: "ELIGIBLE", claimable: false };
+  const noId = { type: "SKILL_CONTEST_LOGIN", status: "ELIGIBLE", claimable: true };
+  const invite = { campaignId: 3, type: "INVITE_USER", status: "ELIGIBLE", claimable: true };
+  assert.deepEqual(
+    pickClaimableCampaigns([skill, done, daily, noClaim, noId, invite]).map((i) => i.campaignId),
+    [1, 7],
+    "每日签到 + 赛事签到礼；已签 / 不可领 / 无活动号 / 邀请类全部排除",
+  );
+});
+
+test("mergeCheckin: 失败优先于已领（否则宿主当天不再重试）", () => {
+  const r = mergeCheckin({ outcome: "claimed", credit: 100, message: "已领取今日签到积分" }, [
+    { outcome: "failed", credit: 1000, title: "X", message: "「X」签到失败" },
+  ]);
+  assert.equal(r.outcome, "failed");
+  assert.equal(r.credit, 100, "没到账的额度不能算进余额");
+  assert.match(r.message, /X/);
+});
+
+test("mergeCheckin: 没有额外活动时与旧版逐字一致", () => {
+  const daily = { outcome: "done", credit: 100, message: "今日已签到（另补确认 1 个待确认活动）" };
+  assert.deepEqual(mergeCheckin(daily), daily);
+});
+
+test("mergeCheckin: 单条活动 inactive 不压过已经领到的签到", () => {
+  // 额外活动「账号未开通该权益」只描述它自己；把它抬成整轮 inactive，宿主会把当天
+  // 签到一起当成终态里的「未领取」。结论仍按签到走，原因留在 message 里。
+  const r = mergeCheckin({ outcome: "claimed", credit: 100, message: "已领取今日签到积分" }, [
+    { outcome: "inactive", title: "Y", message: "「Y」账号未开通该权益或未实名认证" },
+  ]);
+  assert.equal(r.outcome, "claimed");
+  assert.equal(r.credit, 100);
+  assert.match(r.message, /Y/);
+});
+
+test("mergeCheckin: 额外活动没领到也要说清原因（ineligible 的文案不吞）", () => {
+  const r = mergeCheckin({ outcome: "done", credit: 100, message: "今日已签到" }, [
+    { outcome: "ineligible", title: "Z", message: "「Z」签到名额已被领完" },
+  ]);
+  assert.equal(r.outcome, "done");
+  assert.match(r.message, /Z/);
+  assert.match(r.message, /名额/);
+});
+
 test("checkinPlan: status 大小写不敏感", () => {
   assert.equal(checkinPlan(dailyCampaign({ status: "eligible" })).action, "claim");
   assert.equal(checkinPlan(dailyCampaign({ status: "claimed" })).action, "confirm");
@@ -764,7 +812,7 @@ test("checkinFlow: 第一步（活动清单）就失败也要映射成契约，�
   assert.ok(["claimed", "done", "ineligible", "inactive", "captcha", "failed"].includes(r.outcome));
 });
 
-test("checkinFlow: 活动清单里多条每日活动时取第一条（顺序确定，不随机）", async () => {
+test("checkinFlow: 多条可领活动都领，顺序按上游下发（不随机）", async () => {
   const f = opsResponder({
     delivery: deliveryOf([
       { campaignId: 1, type: "USER_LOGIN", benefitAmount: 1000, status: "ELIGIBLE", claimable: true },
@@ -772,8 +820,189 @@ test("checkinFlow: 活动清单里多条每日活动时取第一条（顺序确�
     ]),
   });
   const r = await checkinWith(f);
-  assert.equal(r.credit, 1000, "取第一条（上游下发的顺序即优先级）");
-  assert.equal(f.calls.find((c) => c.method === "POST").body.campaignId, 1);
+  assert.equal(r.outcome, "claimed");
+  assert.equal(r.credit, 2000, "两条各发 1000（以 claim 回执为准）");
+  const claims = f.calls.filter((c) => c.path.endsWith("/v1/ops/claim"));
+  assert.deepEqual(claims.map((c) => c.body.campaignId), [1, 99], "上游下发的顺序即领取顺序");
+});
+
+test("checkinFlow: 「活动福利」里的其它可领活动（Skill 创新赛每日签到礼）一并领，积分合计", async () => {
+  // 2026-11 Skill 创新大赛：独立 campaignId、每天 1000 积分，和常规签到同一个接口。
+  // 没有把它写进 type 白名单 —— 判据只有「服务端说 ELIGIBLE 且不是事件触发型」。
+  const skill = {
+    campaignId: 7,
+    title: "Skill创新赛每日签到礼",
+    type: "SKILL_CONTEST_LOGIN",
+    benefitAmount: 1000,
+    status: "ELIGIBLE",
+    claimable: true,
+  };
+  const f = opsResponder({
+    delivery: deliveryOf([dailyCampaign({ benefitAmount: 100 }), skill]),
+    claim: (body) =>
+      jsonResponse({ code: 0, message: "ok", data: { id: 42, benefitAmount: body.campaignId === 7 ? 1000 : 100 } }),
+  });
+  const r = await checkinWith(f);
+  assert.equal(r.outcome, "claimed");
+  assert.equal(r.credit, 1100, "常规签到 100 + 赛事签到礼 1000");
+  assert.match(r.message, /Skill创新赛每日签到礼/, "文案要点出额外领的是哪条活动");
+  assert.deepEqual(
+    f.calls.filter((c) => c.method === "POST").map((c) => `${c.path.endsWith("/claim") ? "claim" : "confirm"}:${c.body.campaignId}`),
+    ["claim:1", "confirm:1", "claim:7", "confirm:7"],
+    "额外活动领到后同样要补 confirm",
+  );
+  const claimCalls = f.calls.filter((c) => c.path.endsWith("/v1/ops/claim"));
+  assert.match(String(claimCalls[1].body.idempotentKey), /^claim_7_\d+$/, "额外活动用同一个幂等键格式");
+});
+
+test("checkinFlow: 额外活动领取失败要报 failed，让宿主 30 分钟后重试（每日签到的积分照报）", async () => {
+  const skill = {
+    campaignId: 7,
+    title: "Skill创新赛每日签到礼",
+    type: "SKILL_CONTEST_LOGIN",
+    benefitAmount: 1000,
+    status: "ELIGIBLE",
+    claimable: true,
+  };
+  const f = opsResponder({
+    delivery: deliveryOf([dailyCampaign({ benefitAmount: 100 }), skill]),
+    claim: (body) =>
+      body.campaignId === 7
+        ? jsonResponse({ code: 40010, message: "领取失败，请稍后再试" })
+        : jsonResponse({ code: 0, message: "ok", data: { id: 42, benefitAmount: 100 } }),
+  });
+  const r = await checkinWith(f);
+  assert.equal(r.outcome, "failed", "报 claimed 的话，今天这次赛事礼就再也补不上了");
+  assert.equal(r.credit, 100, "只报真正到账的那部分");
+  assert.match(r.message, /Skill创新赛每日签到礼/);
+  assert.match(r.message, /稍后/);
+});
+
+test("checkinFlow: INVITE_USER / STUDENT_CERTIFIED 即使 ELIGIBLE 也不自动领", async () => {
+  const f = opsResponder({
+    delivery: deliveryOf([
+      dailyCampaign({ status: "CONFIRMED", claimable: false }),
+      { campaignId: 3, title: "推荐码上有礼", type: "INVITE_USER", benefitAmount: 1000, status: "ELIGIBLE", claimable: true },
+      { campaignId: 2, title: "学生认证领4000积分", type: "STUDENT_CERTIFIED", benefitAmount: 4000, status: "ELIGIBLE", claimable: true },
+    ]),
+  });
+  const r = await checkinWith(f);
+  assert.equal(r.outcome, "done");
+  assert.ok(
+    !f.calls.some((c) => c.method === "POST"),
+    "自动刷邀请/学生认证违反活动条款，这两类只保留人工领取",
+  );
+});
+
+test("checkinFlow: 额外活动今天已经领过（CONFIRMED）就一个写接口都不打", async () => {
+  const skill = {
+    campaignId: 7,
+    title: "Skill创新赛每日签到礼",
+    type: "SKILL_CONTEST_LOGIN",
+    benefitAmount: 1000,
+    status: "CONFIRMED",
+    claimable: false,
+  };
+  const f = opsResponder({ delivery: deliveryOf([dailyCampaign(), skill]) });
+  const r = await checkinWith(f);
+  assert.equal(r.outcome, "claimed");
+  assert.equal(r.credit, 1000, "额外活动已签，不重复计");
+  assert.deepEqual(f.calls.map((c) => c.method), ["GET", "POST", "POST"], "只动每日签到");
+});
+
+test("checkinPlan: 额外活动 ELIGIBLE 但 claimable=false 不硬领（不发起写请求）", async () => {
+  const f = opsResponder({
+    delivery: deliveryOf([
+      dailyCampaign({ status: "CONFIRMED", claimable: false }),
+      { campaignId: 7, title: "Skill创新赛每日签到礼", type: "SKILL_CONTEST_LOGIN", benefitAmount: 1000, status: "ELIGIBLE", claimable: false },
+    ]),
+  });
+  const r = await checkinWith(f);
+  assert.equal(r.outcome, "done");
+  assert.ok(!f.calls.some((c) => c.method === "POST"));
+});
+
+test("checkinFlow: 同一条 campaign 在清单里出现两行也只领一次（按 campaignId 去重）", async () => {
+  // 上游把一条活动下发成两行（type/文案不同、id 相同）时，按对象身份去重会 claim 两次；
+  // 幂等键带毫秒时间戳，两次调用未必落在同一毫秒，服务端拦不住 —— 必须自己按 id 去重。
+  const f = opsResponder({
+    delivery: deliveryOf([
+      dailyCampaign({ status: "CONFIRMED", claimable: false }),
+      { campaignId: 7, title: "Skill创新赛每日签到礼", type: "SKILL_CONTEST_LOGIN", benefitAmount: 1000, status: "ELIGIBLE", claimable: true },
+      { campaignId: 7, title: "Skill创新赛每日签到礼（重复行）", type: "USER_LOGIN", benefitAmount: 1000, status: "ELIGIBLE", claimable: true },
+    ]),
+  });
+  const r = await checkinWith(f);
+  assert.equal(r.outcome, "claimed");
+  assert.equal(r.credit, 2000, "每日签到已签的额度 + 只领到一次的那 1000");
+  assert.deepEqual(
+    f.calls.filter((c) => c.path.endsWith("/claim")).map((c) => c.body.campaignId),
+    [7],
+  );
+});
+
+test("checkinFlow: status 不是 ELIGIBLE 的活动即使 claimable=true 也不领（判据以状态为准）", async () => {
+  // claimable 是服务端给的辅助位，真正决定「今天能不能领」的是 status；这条用例把
+  // pickClaimableCampaigns 的 ELIGIBLE 判据钉死 —— 去掉那个 continue 就会红。
+  const f = opsResponder({
+    delivery: deliveryOf([
+      dailyCampaign({ status: "CONFIRMED", claimable: false }),
+      { campaignId: 7, title: "Skill创新赛每日签到礼", type: "SKILL_CONTEST_LOGIN", benefitAmount: 1000, status: "CONFIRMED", claimable: true },
+    ]),
+  });
+  const r = await checkinWith(f);
+  assert.equal(r.outcome, "done");
+  assert.ok(!f.calls.some((c) => c.method === "POST"), "已签的活动不发写请求");
+});
+
+test("checkinFlow: 额外活动领到但 confirm 失败 → failed（报 claimed 会让它一直卡在 CLAIMED）", async () => {
+  const skill = {
+    campaignId: 7,
+    title: "Skill创新赛每日签到礼",
+    type: "SKILL_CONTEST_LOGIN",
+    benefitAmount: 1000,
+    status: "ELIGIBLE",
+    claimable: true,
+  };
+  const f = opsResponder({
+    delivery: deliveryOf([dailyCampaign({ benefitAmount: 100 }), skill]),
+    claim: (body) =>
+      jsonResponse({ code: 0, message: "ok", data: { id: 42, benefitAmount: body.campaignId === 7 ? 1000 : 100 } }),
+    confirm: (body) =>
+      body.campaignId === 7
+        ? jsonResponse({ code: 50000, message: "系统繁忙" })
+        : jsonResponse({ code: 0, message: "ok", data: {} }),
+  });
+  const r = await checkinWith(f);
+  assert.equal(r.outcome, "failed", "宿主只对 failed 重试；下一轮这条活动是 CLAIMED，会走 confirmStrays 补确认");
+  assert.equal(r.credit, 100, "confirm 没过，这条的额度不计入");
+  assert.match(r.message, /已领取「Skill创新赛每日签到礼」1000 积分/);
+  assert.match(r.message, /确认未完成/);
+});
+
+test("checkinFlow: 额外活动 claim 回 40001（别处刚领过）也补一次 confirm，把 CLAIMED 收尾", async () => {
+  const skill = {
+    campaignId: 7,
+    title: "Skill创新赛每日签到礼",
+    type: "SKILL_CONTEST_LOGIN",
+    benefitAmount: 1000,
+    status: "ELIGIBLE",
+    claimable: true,
+  };
+  const f = opsResponder({
+    delivery: deliveryOf([dailyCampaign({ status: "CONFIRMED", claimable: false }), skill]),
+    claim: (body) =>
+      body.campaignId === 7
+        ? jsonResponse({ code: 40001, message: "尚未到达权益刷新时间" })
+        : jsonResponse({ code: 0, message: "ok", data: { id: 42, benefitAmount: 100 } }),
+  });
+  const r = await checkinWith(f);
+  assert.equal(r.outcome, "done");
+  assert.deepEqual(
+    f.calls.filter((c) => c.method === "POST").map((c) => `${c.path.endsWith("/claim") ? "claim" : "confirm"}:${c.body.campaignId}`),
+    ["claim:7", "confirm:7"],
+    "它可能正卡在 CLAIMED，targetIds 会让 confirmStrays 跳过它 —— 只能这里自己补",
+  );
 });
 
 test("checkinFlow: 活动清单必须按 channel=IDE 查（网页端才是 WEB）", async () => {
