@@ -5,7 +5,7 @@
 | 能力 | 说明 |
 |---|---|
 | 授权 | 华为云访问密钥 **AK/SK**（华为云官方 SDK-HMAC-SHA256 签名），登录时自动验证有效性 |
-| **每日签到** ⭐ | 实现 magpie 原生 `auth.checkin` 钩子（magpie ≥ v0.1.1083）——Settings → Usage → Plugins 打开 **Daily check-in**，每天每账号自动签到领 **1000 积分**（`/v1/ops/delivery` → `claim` → `confirm`，四态状态机） |
+| **每日签到** ⭐ | 实现 magpie 原生 `auth.checkin` 钩子（magpie ≥ v0.1.1083）——Settings → Usage → Plugins 打开 **Daily check-in**，每天每账号自动签到领 **1000 积分**（`/v1/ops/delivery` → `claim` → `confirm`，四态状态机）；「活动福利」里其它当天可领的活动（如 **Skill 创新赛每日签到礼** 1000 积分/天）一并领掉 |
 | **积分余额** | `auth.usage` 显示**积分**（控制台上那个 12000+ 就是它）：已用/总量 + 套餐到期日 + 即将过期的那部分 |
 | ~~免费 Token 池~~ | **2026-10-20 官方已结束**（论坛公告 + 活动 PDF 目录移除 + 实测 `4000 invalid channel, group not found`），只剩积分一本账 |
 | 对话 | `POST snap-access /api/v2/chat/completions`（OpenAI 形态），按模型自动选通道 |
@@ -113,6 +113,36 @@ Token、0 点清零」，但那是 **2026-09-02 的缓存版本**，页面从未
 > 但「福利网关 2026-10-20 整组下线」之后签到就跟着报 `ineligible`（「福利活动结束，无需
 > 签到」）—— 而**积分签到一直都在**，只是我们从没打对过接口：它挂在 snap 引擎上，前缀
 > 规则还和余额接口相反发展。上游也确有一个接口能读到签到状态，即 `/v1/ops/delivery`。
+
+### 一次签到领的不止一条活动（0.2.25）
+
+「活动福利」面板里同时挂着多条活动，它们**共用同一组 `/v1/ops/*` 接口**，只是
+`campaignId` / `type` 不同。0.2.24 及以前只认 `USER_LOGIN` 那一条，于是面板上后来出现的
+**「Skill 创新赛每日签到礼」**（独立活动、同样每天 1000 积分，活动期
+2026-11-11 → 2026-12-05，积分有效期至 2026-12-26）每天都要手工点一次。
+
+0.2.25 改成「**这一轮能领的全领**」，判据只取上游自己的字段：
+
+1. 每日签到仍按 `type=USER_LOGIN` 认（回落到 `campaignId=1`），结论、文案、金额口径全部不变；
+2. 其余活动只要 `status=ELIGIBLE` 且 `claimable !== false` 就一起领 —— 服务端只在**今天确实
+   能领**时才置 `ELIGIBLE`，比维护一份 type 白名单准确，也不会因为上游换活动名/换 id 而静默失效；
+3. `INVITE_USER` / `STUDENT_CERTIFIED` **硬排除**：它们要真实的「好友注册 / 学生认证」事件才
+   置 `ELIGIBLE`，服务端也拒绝直接 claim（`40001 该活动类型需要先通过触发接口激活`）。
+   多账号自动去领等于刷邀请，活动条款明令禁止 —— 这两类只保留人工领取，有单测锁定。
+
+领取与每日签到完全同一条规矩：`claim`（积分到账）→ 一律补一次 `confirm`（推进状态），
+幂等键 `claim_<id>_<毫秒>`。结论合并：
+
+| 情形 | outcome | credit |
+|---|---|---|
+| 全部领到 | `claimed` | 各条 `claim` 回执金额之和 |
+| 有一条失败 | `failed`（宿主 30 分钟后重试，已领到的不会重复发） | 只算已到账的那部分 |
+| 都在今天已签 | `done` | 今天已到账的额度（含各条） |
+| 需要人机验证 | `captcha` | 已到账的那部分 |
+
+**为什么失败要压过成功**：宿主只对 `failed` 重试。若「每日签到成功、赛事礼失败」报
+`claimed`，当天那次赛事礼就再也补不上了；报 `failed` 后下一轮重试时，已签的那条会走
+`CONFIRMED → done`，失败那条再领一次，不会重复发积分。
 
 插件向 magpie 返回的标准 outcome：
 
@@ -256,6 +286,30 @@ CODEARTS_AK=... CODEARTS_SK=... node scripts/probe-session.mjs <模式> [并发�
 3. **丢弃云端 `channel` 字段** —— 该字段正是上游构建 `AGENT_MODELS` 的依据；本版保留并写入运行期缓存。
 
 此外补齐了 `ineligible` / `captcha` / `inactive` 三种签到 outcome（骨架版遇到会落到 `failed` 并每 30 分钟无意义重试）。
+
+## 0.2.25（2026-11-14：签到不再只领一条 ——「活动福利」里其它当天可领的活动一并领）
+
+**背景**：Skill 创新大赛（2026-11-11 → 12-05）给**报名账号**每天额外 1000 积分，入口仍然是
+码道「活动福利」面板（卡片文案「Skill创新赛每日签到礼 / 每日签到领取1000积分」）。官方规则：
+报名赠 2000、报名后首次开通码道再加 3000、**每日签到礼 1000/天**，积分有效期至 2026-12-26
+（[帮助中心](https://support.huaweicloud.com/offers-codeartsagent/codeartsagent_offers_0008.html)、
+[赛事页](https://developer.huaweicloud.com/competition/information/1300000350/html1)）。
+它在接口上是**一条独立 campaign** —— 和常规每日签到同一组 `/v1/ops/*`，只是 `campaignId` /
+`type` 不同。0.2.24 只按 `type=USER_LOGIN` 挑一条，所以这份每天要手工点一次。
+
+| # | 改动 | 为什么 |
+|---|---|---|
+| 1 | 新增 `pickClaimableCampaigns`：每日签到（`USER_LOGIN`，回落 `campaignId=1`）排第一，其余 `status=ELIGIBLE` 且 `claimable !== false` 的活动按上游顺序一起领 | **不维护 type 白名单**：赛事礼的 type 没有公开文档，上游下次换活动名/换 id，白名单就会静默失效。服务端只在「今天确实能领」时置 `ELIGIBLE`，拿它当判据既准确又面向未来 |
+| 2 | `INVITE_USER` / `STUDENT_CERTIFIED` 硬排除（`AUTO_CLAIM_DENY_TYPES`） | 这两类要真实的「好友注册 / 学生认证」事件，服务端回 `40001 该活动类型需要先通过触发接口激活`；多账号自动去领等于刷邀请，条款明令禁止。单测锁定「即使 ELIGIBLE 也不发写请求」 |
+| 3 | 新增 `mergeCheckin`：**失败压过成功**；`credit` 只汇总 `claimed` / `done` 两条路径 | 宿主只对 `failed` 重试：「每日签到成功、赛事礼失败」若报 `claimed`，当天那次就再也补不上；报 `failed` 后下一轮重试时已签的走 `CONFIRMED → done`，失败那条再领一次，不会重复发 |
+| 4 | 额外活动 `claim` 之后**同样**补一次 `confirm`，幂等键仍为 `claim_<id>_<毫秒>` | 与每日签到同一套状态机：少这一步会永远卡在 `CLAIMED`（积分已到账但状态不是终态） |
+| 5 | 没有额外活动时 `checkinFlow` 直接返回每日签到的原结论 | 权威路径（单条签到）的 outcome / credit / message 逐字不变，老测试一条不改也能全绿 |
+
+文案上额外活动只说「已领取「Skill创新赛每日签到礼」1000 积分」这类**带标题**的句子 ——
+不写死在代码里的活动名会被上游改文案，标题直接取活动清单里的 `title`。
+
+测试 241 → 249（新增：赛事礼一并领 + 积分合计、失败压过成功、已签不重复计、`claimable=false`
+不硬领、邀请/学生认证不碰、`pickClaimableCampaigns` 顺序、`mergeCheckin` 逐字回归）。
 
 ## 0.2.24（2026-10-21：对比工作流跑完后的第二批 —— 配置合并、签名全序、测试可注入）
 
