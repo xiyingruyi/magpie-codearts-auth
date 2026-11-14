@@ -87,19 +87,6 @@ const DAILY_CAMPAIGN_TYPE = "USER_LOGIN";
 const DAILY_CAMPAIGN_ID = 1;
 
 /**
- * 「活动福利」里**不能自动领**的活动类型。
- *
- * 这两类要真实的「好友注册」「学生认证」事件才置 ELIGIBLE，服务端也拒绝直接 claim
- * （回 40001「该活动类型需要先通过触发接口激活」）。多账号自动刷邀请违反活动条款，
- * 所以一律不碰 —— 只保留人工领取。
- *
- * 反过来说，**其余类型**只要服务端自己把 status 置成 ELIGIBLE，就是「现在能领」：
- * 2026-11 的 Skill 创新大赛每日签到礼就是这样一条独立活动（campaignId 不是 1，
- * 每天 1000 积分），和常规每日签到的接口完全一样，没必要为它写死一个 type。
- */
-const AUTO_CLAIM_DENY_TYPES = new Set(["INVITE_USER", "STUDENT_CERTIFIED"]);
-
-/**
  * snap 侧的可选头。🔴 必须用小写 `agent-type` **并参与签名**：
  * 大写的 `Agent-Type` 在 APIG 眼里是系统头，不入 SignedHeaders 直接
  * 401 `APIG.0301 verify ak sk signature fail`（实测；小写不签也能过，
@@ -776,38 +763,6 @@ function pickDailyCampaign(items) {
   );
 }
 
-/**
- * 挑出这一轮该动的全部活动：每日签到（永远排第一）+ 其它「服务端说现在能领」的活动。
- *
- * 判据全部来自上游自己的字段，不猜标题、不猜 id：
- *   · status=ELIGIBLE 且 claimable !== false —— 服务端已经把它置成「今天可领」；
- *   · type 不在 AUTO_CLAIM_DENY_TYPES —— 靠真实事件触发的活动不碰。
- *
- * 🔴 这里**不按 type 白名单**挑。Skill 创新大赛的每日签到礼是一条独立活动，
- *    type / campaignId 都没有公开文档，写死任何一个都会在下次换活动时静默失效；
- *    而服务端只在「今天确实能领」时才置 ELIGIBLE，拿这个当唯一判据既准确又面向未来。
- *    每日签到仍按 type 认（pickDailyCampaign），它的文案/回退语义是单独一条线。
- */
-function pickClaimableCampaigns(items, daily = pickDailyCampaign(items)) {
-  const list = (Array.isArray(items) ? items : []).filter((i) => i && typeof i === "object");
-  const out = daily ? [daily] : [];
-  // 🔴 按 campaignId 去重，不是按对象身份（i === daily）：上游若把同一条活动下发成
-  //    两行（type/文案不同、id 相同），按身份去重会让它被 claim 两次，而幂等键
-  //    带毫秒时间戳、两次调用不保证落在同一毫秒，服务端拦不住。
-  const seen = new Set(out.map((i) => usableCampaignId(i?.campaignId)).filter((v) => v !== undefined));
-  for (const i of list) {
-    if (i === daily) continue;
-    const id = usableCampaignId(i?.campaignId);
-    if (id === undefined || seen.has(id)) continue;
-    if (AUTO_CLAIM_DENY_TYPES.has(String(i?.type ?? "").toUpperCase())) continue;
-    if (String(i?.status ?? "").toUpperCase() !== "ELIGIBLE") continue;
-    if (i?.claimable === false) continue;
-    seen.add(id);
-    out.push(i);
-  }
-  return out;
-}
-
 /** 领取（积分在 claim 这一步就到账，confirm 只推进状态）。 */
 function opsClaim(ak, sk, campaignId, now = Date.now(), opts = {}) {
   const id = usableCampaignId(campaignId);
@@ -829,66 +784,7 @@ function opsConfirm(ak, sk, campaignId, opts = {}) {
 }
 
 /**
- * 把「每日签到」与其余活动的结论合成一个 magpie 契约。
- *
- * 只有存在多余活动时才会走到这里；只有一条每日签到时 checkinFlow 直接返回它的结论，
- * 所以常规路径的 outcome / credit / message 与旧版逐字一致。
- *
- * 优先级是**故意**的：
- *   failed  > captcha > claimed > done > inactive > ineligible
- * 任何一条失败都要报 failed —— 宿主只对 failed 在 30 分钟后重试；报 claimed 会让
- * 「每日签到成功、活动领取失败」的当天直接丢掉那次活动。
- *
- * `inactive` 排在 done / claimed **之后**：它只描述某一条活动（比如「未开通该权益」），
- * 常规签到已经拿到手时不该把整轮结论改写成 inactive —— 宿主会把 inactive 当终态，
- * 连着那天签到的 100 积分一起从「已领」里抹掉。inactive 的说明仍会并进 message。
- *
- * credit 汇总 claimed 与 done 两种（done 的额度是今天已经到账的那份，旧版也照报），
- * failed / captcha 那几条不计数：钱没到账，不能写进余额。
- */
-function mergeCheckin(daily, extras = []) {
-  const parts = [daily, ...extras].filter(Boolean);
-  const sumCredit = (list) => {
-    let total;
-    for (const p of list) {
-      const c = num(p.credit);
-      if (c !== undefined) total = (total ?? 0) + c;
-    }
-    return total;
-  };
-  const outcome = parts.some((p) => p.outcome === "failed")
-    ? "failed"
-    : parts.some((p) => p.outcome === "captcha")
-      ? "captcha"
-      : parts.some((p) => p.outcome === "claimed")
-        ? "claimed"
-        : parts.some((p) => p.outcome === "done")
-          ? "done"
-          : parts.some((p) => p.outcome === "inactive")
-            ? "inactive"
-            : "ineligible";
-  const credit = sumCredit(parts.filter((p) => p.outcome === "claimed" || p.outcome === "done"));
-  const messages = [];
-  for (const p of parts) {
-    if (!p.message) continue;
-    // 额外活动的「没领到」也要说清楚：ineligible 是名额领完/活动下线，用户得知道原因，
-    // 否则面板上看着像插件把这条活动忘了。
-    if (p !== daily && !["claimed", "failed", "captcha", "inactive", "ineligible"].includes(p.outcome)) continue;
-    if (!messages.includes(p.message)) messages.push(p.message);
-  }
-  return {
-    outcome,
-    ...(credit !== undefined ? { credit } : {}),
-    message: messages.join("；"),
-  };
-}
-
-/**
- * 走一遍签到：查活动 → 按状态决定 claim / confirm → 返回 magpie 契约。
- *
- * 2026-11 起「活动福利」里除了常规每日签到，还挂着 Skill 创新大赛的每日签到礼
- * （独立 campaignId、同样每天 1000 积分）。这类活动上游同样按天把 status 置
- * ELIGIBLE，claim/confirm 接口一模一样，所以一起领 —— 见 pickClaimableCampaigns。
+ * 走一遍每日签到：查活动 → 按状态决定 claim / confirm → 返回 magpie 契约。
  *
  * 顺手把其它卡在 CLAIMED 的活动补上 confirm（例如「新用户注册送 4000 积分」：
  * 上游是 AUTO_GRANT，发放后停在 CLAIMED，等客户端确认）。积分在 claim 时就已到账，
@@ -904,10 +800,7 @@ async function checkinFlow(ak, sk, fetcher = fetch) {
   const opts = { deadline, fetcher };
   const items = await fetchCampaigns(ak, sk, opts);
   const daily = pickDailyCampaign(items);
-  // 这一轮我们会主动 claim 的活动。confirmStrays 要跳过它们（自己会补确认），
-  // 免得对同一条活动发两次 confirm。
-  const targets = pickClaimableCampaigns(items, daily);
-  const targetIds = new Set(targets.map((i) => usableCampaignId(i?.campaignId)).filter((v) => v !== undefined));
+  const plan = checkinPlan(daily);
   const confirmed = [];
   // 补确认是「顺手做的好事」，不能拖垮签到本身：只留够**一次** confirm 的余量，
   // 装不下就这轮不补，下一轮签到会再试（状态仍是 CLAIMED）。
@@ -930,7 +823,7 @@ async function checkinFlow(ak, sk, fetcher = fetch) {
     const strays = items.filter(
       (i) =>
         i &&
-        !targetIds.has(usableCampaignId(i?.campaignId)) &&
+        i !== daily &&
         String(i.status ?? "").toUpperCase() === "CLAIMED" &&
         usableCampaignId(i?.campaignId) !== undefined,
     );
@@ -945,144 +838,71 @@ async function checkinFlow(ak, sk, fetcher = fetch) {
     }
   };
 
-  const runDaily = async () => {
-    const plan = checkinPlan(daily);
-
-    if (plan.action === "claim") {
-      let claimed;
-      try {
-        claimed = await opsClaim(ak, sk, daily.campaignId, Date.now(), opts);
-      } catch (e) {
-        // 领取被拒 ≠ 今天没签到。两种常见情形都该判成「已签」而不是 failed：
-        //   · 同一账号刚在 IDE / 另一台机器上签过（我们把状态读早了，或者上一次
-        //     claim 其实已经写进去、只是响应没回来）—— 状态现在是 CLAIMED 或
-        //     CONFIRMED，再领当然被拒；
-        //   · 上游对「今天已领」回的是业务码（40001 一类），本来就不是错误。
-        // 已经能判死的错误码（40001/4006/40401）直接交出结论，不再多打一次接口；
-        // 只剩 failed 时才重读一次活动清单（一次 GET，预算不够就不查），按真实
-        // 状态收尾：已签就补确认 + done，仍是 ELIGIBLE 才把原来的错误交出去。
-        const known = checkinErrorOutcome(e, plan, "claim");
-        if (known.outcome !== "failed") return known;
-        if (left() >= SNAP_MIN_TIMEOUT_MS) {
-          const again = await fetchCampaigns(ak, sk, opts).then(pickDailyCampaign).catch(() => null);
-          const after = again ? checkinPlan(again) : null;
-          if (after?.action === "confirm") {
-            // 我们这次 claim 其实成功了，只是没看到回执：把确认补掉，别让它卡在 CLAIMED。
-            try {
-              await opsConfirm(ak, sk, again.campaignId, opts);
-            } catch {
-              // 下一轮签到会按 CLAIMED 再补
-            }
-            await confirmStrays();
-            return finish({ outcome: "done", credit: after.credit ?? plan.credit, message: "今日已签到（领取时上游已记账）" });
-          }
-          if (after?.action === "none" && after.outcome === "done") {
-            await confirmStrays();
-            return finish({ outcome: "done", credit: after.credit ?? plan.credit, message: "今日已签到" });
-          }
-        }
-        return known;
-      }
-      // 领到之后**一律**补一次 confirm。上游确实会要求补（那时 data.id 非空），
-      // 但 `id` 只是「服务端要求」的提示，不能当唯一依据：字段缺失时漏掉这一步，
-      // 活动就卡在 CLAIMED（积分已到账但状态不是终态）。没有待确认记录时
-      // confirm 回 40001「该活动没有可确认的权益记录」，属于正常，忽略即可。
-      try {
-        await opsConfirm(ak, sk, daily.campaignId, opts);
-      } catch {
-        // 积分在 claim 时已到账；确认失败下一轮签到会按 CLAIMED 再补
-      }
-      await confirmStrays();
-      return finish({
-        outcome: "claimed",
-        credit: num(claimed?.benefitAmount) ?? num(claimed?.credit) ?? num(claimed?.credits) ?? plan.credit,
-        message: "已领取今日签到积分",
-      });
-    }
-
-    if (plan.action === "confirm") {
-      try {
-        await opsConfirm(ak, sk, daily.campaignId, opts);
-      } catch (e) {
-        return checkinErrorOutcome(e, plan, "confirm");
-      }
-      await confirmStrays();
-      return finish({ outcome: "done", credit: plan.credit, message: "今日已签到（补确认）" });
-    }
-
-    // action === "none"：已签或不在活动期，仍然把别处卡住的确认补掉
-    await confirmStrays();
-    return finish({ outcome: plan.outcome, credit: plan.credit, message: plan.message });
-  };
-  const dailyPart = await runDaily();
-
-  // 其余活动（Skill 创新大赛每日签到礼这类）：同一条 claim/confirm 流程，一条一条来。
-  // 没有额外活动时直接交出每日签到的结论 —— 常规路径的返回值与旧版逐字一致。
-  const extras = targets.filter((c) => c !== daily);
-  if (!extras.length) return dailyPart;
-
-  const extraParts = [];
-  for (const c of extras) {
-    const cp = checkinPlan(c);
-    const title = String(c.title ?? "").trim() || `活动 ${usableCampaignId(c.campaignId)}`;
-    if (cp.action !== "claim") {
-      extraParts.push({ ...cp, title });
-      continue;
-    }
-    if (!canSpendOneMore()) {
-      // 时间不够就先不领；报 failed 让宿主下一轮（30 分钟后）接着领
-      extraParts.push({ outcome: "failed", credit: cp.credit, title, message: `「${title}」时间预算不足，稍后重试` });
-      continue;
-    }
+  if (plan.action === "claim") {
+    let claimed;
     try {
-      const claimed = await opsClaim(ak, sk, c.campaignId, Date.now(), opts);
-      const credit = num(claimed?.benefitAmount) ?? num(claimed?.credit) ?? num(claimed?.credits) ?? cp.credit;
-      // 与每日签到同一条规矩：领到之后一律补一次 confirm（字段提示不可信）。
-      // 🔴 confirm 失败**不能吞**：积分在 claim 时已到账，但活动会停在 CLAIMED（非终态），
-      //    整轮若报 claimed，宿主就不会为它重试，活动要等到明天才可能被补确认。
-      //    报 failed 让宿主下一轮再来：那时这条活动是 CLAIMED、不再是 ELIGIBLE，
-      //    不会进 extras，而是落进 confirmStrays 被补确认 —— 正好收尾，不会重复发积分。
-      let confirmErr = null;
-      try {
-        await opsConfirm(ak, sk, c.campaignId, opts);
-      } catch (e) {
-        confirmErr = e;
-      }
-      if (confirmErr) {
-        const cOut = checkinErrorOutcome(confirmErr, { credit }, "confirm");
-        if (cOut.outcome !== "done") {
-          extraParts.push({
-            outcome: "failed",
-            title,
-            message: `已领取「${title}」${credit === undefined ? "" : `${credit} 积分，`}确认未完成，稍后重试`,
-          });
-          continue;
-        }
-      }
-      extraParts.push({
-        outcome: "claimed",
-        credit,
-        title,
-        message: credit === undefined ? `已领取「${title}」` : `已领取「${title}」${credit} 积分`,
-      });
+      claimed = await opsClaim(ak, sk, daily.campaignId, Date.now(), opts);
     } catch (e) {
-      // 40001「未到刷新时间」按已领处理（同每日签到 —— 同一套码的两种含义见
-      // checkinErrorOutcome 的注释）。但我们的判据是 claim 前的快照：别处（IDE /
-      // 另一台机器）刚领过时，它现在是 CLAIMED，而它还在 targetIds 里，confirmStrays
-      // 会跳过它 —— 所以这里自己补一次 confirm，把 CLAIMED 收尾掉（没有待确认记录时
-      // 同样回 40001，无副作用）。
-      const mapped = checkinErrorOutcome(e, cp, "claim");
-      if (mapped.outcome === "done" && canSpendOneMore()) {
-        try {
-          await opsConfirm(ak, sk, c.campaignId, opts);
-        } catch {
-          // 下一轮签到按 CLAIMED 再补
+      // 领取被拒 ≠ 今天没签到。两种常见情形都该判成「已签」而不是 failed：
+      //   · 同一账号刚在 IDE / 另一台机器上签过（我们把状态读早了，或者上一次
+      //     claim 其实已经写进去、只是响应没回来）—— 状态现在是 CLAIMED 或
+      //     CONFIRMED，再领当然被拒；
+      //   · 上游对「今天已领」回的是业务码（40001 一类），本来就不是错误。
+      // 已经能判死的错误码（40001/4006/40401）直接交出结论，不再多打一次接口；
+      // 只剩 failed 时才重读一次活动清单（一次 GET，预算不够就不查），按真实
+      // 状态收尾：已签就补确认 + done，仍是 ELIGIBLE 才把原来的错误交出去。
+      const known = checkinErrorOutcome(e, plan, "claim");
+      if (known.outcome !== "failed") return known;
+      if (left() >= SNAP_MIN_TIMEOUT_MS) {
+        const again = await fetchCampaigns(ak, sk, opts).then(pickDailyCampaign).catch(() => null);
+        const after = again ? checkinPlan(again) : null;
+        if (after?.action === "confirm") {
+          // 我们这次 claim 其实成功了，只是没看到回执：把确认补掉，别让它卡在 CLAIMED。
+          try {
+            await opsConfirm(ak, sk, again.campaignId, opts);
+          } catch {
+            // 下一轮签到会按 CLAIMED 再补
+          }
+          await confirmStrays();
+          return finish({ outcome: "done", credit: after.credit ?? plan.credit, message: "今日已签到（领取时上游已记账）" });
+        }
+        if (after?.action === "none" && after.outcome === "done") {
+          await confirmStrays();
+          return finish({ outcome: "done", credit: after.credit ?? plan.credit, message: "今日已签到" });
         }
       }
-      extraParts.push({ ...mapped, title, message: `「${title}」${mapped.message}` });
+      return known;
     }
+    // 领到之后**一律**补一次 confirm。上游确实会要求补（那时 data.id 非空），
+    // 但 `id` 只是「服务端要求」的提示，不能当唯一依据：字段缺失时漏掉这一步，
+    // 活动就卡在 CLAIMED（积分已到账但状态不是终态）。没有待确认记录时
+    // confirm 回 40001「该活动没有可确认的权益记录」，属于正常，忽略即可。
+    try {
+      await opsConfirm(ak, sk, daily.campaignId, opts);
+    } catch {
+      // 积分在 claim 时已到账；确认失败下一轮签到会按 CLAIMED 再补
+    }
+    await confirmStrays();
+    return finish({
+      outcome: "claimed",
+      credit: num(claimed?.benefitAmount) ?? num(claimed?.credit) ?? num(claimed?.credits) ?? plan.credit,
+      message: "已领取今日签到积分",
+    });
   }
-  return mergeCheckin(dailyPart, extraParts);
+
+  if (plan.action === "confirm") {
+    try {
+      await opsConfirm(ak, sk, daily.campaignId, opts);
+    } catch (e) {
+      return checkinErrorOutcome(e, plan, "confirm");
+    }
+    await confirmStrays();
+    return finish({ outcome: "done", credit: plan.credit, message: "今日已签到（补确认）" });
+  }
+
+  // action === "none"：已签或不在活动期，仍然把别处卡住的确认补掉
+  await confirmStrays();
+  return finish({ outcome: plan.outcome, credit: plan.credit, message: plan.message });
 }
 
 /**
@@ -2162,7 +1982,7 @@ export const _internal = {
   rfc3986, sdkSignedHeaders, signingParts, envelope, snapEnvelope, creds, bare, parseCredential, redact,
   claimStatus, fetchBalance, fetchBuiltinModels,
   fetchCredits, fetchCampaigns, pickDailyCampaign, usableCampaignId, opsClaim, opsConfirm,
-  checkinPlan, checkinErrorOutcome, checkinFlow, pickClaimableCampaigns, mergeCheckin,
+  checkinPlan, checkinErrorOutcome, checkinFlow,
   startOfTodayMs, isBenefitChannel, codeartsModels, clampChatBody,
   upstreamSessionId, sessionHeaders, num, round1, optNumber, outputLimit, CN_OFFSET_MS,
   creditRate, bareModelId, errorStatus, SESSION_LIMIT_CODE, errorResponse, PROVIDER_ID,
@@ -2175,5 +1995,5 @@ export const _internal = {
   SNAP_HOST, CHAT_PATH, OPENGW_HOST,
   STATS_PATH, OPS_DELIVERY_PATH, OPS_CLAIM_PATH, OPS_CONFIRM_PATH, OPS_CHANNEL,
   BUILTIN_MODELS_PATH,
-  DAILY_CAMPAIGN_TYPE, DAILY_CAMPAIGN_ID, AUTO_CLAIM_DENY_TYPES, AGENT_TYPE_HEADER,
+  DAILY_CAMPAIGN_TYPE, DAILY_CAMPAIGN_ID, AGENT_TYPE_HEADER,
 };
