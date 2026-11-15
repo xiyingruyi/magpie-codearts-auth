@@ -784,6 +784,40 @@ test("checkinFlow: claim 响应不带金额时回退到活动清单的额度", a
   assert.equal(r.credit, 1000);
 });
 
+test("checkinFlow: 线上真实形态（#42 已领 / #40 赛事签到礼 / #34 常规签到）→ 两条都领，额度只算今天真拿到的", async () => {
+  const deliveryItems = [
+    { campaignId: 42, title: "Skill创新赛报名礼", type: "USER_LOGIN", benefitAmount: 2000, claimable: false, status: "CONFIRMED" },
+    { campaignId: 40, title: "Skill创新赛每日签到礼", type: "USER_LOGIN", benefitAmount: 1000, claimable: true, status: "ELIGIBLE" },
+    { campaignId: 34, title: "每日签到领100积分", type: "USER_LOGIN", benefitAmount: 100, claimable: true, status: "ELIGIBLE" },
+  ];
+  const f = opsResponder({
+    delivery: deliveryOf(deliveryItems),
+    claim: (body) => jsonResponse({ code: 0, message: "ok", data: { benefitAmount: body.campaignId === 40 ? 1000 : 100 } }),
+  });
+  const r = await checkinWith(f);
+  assert.equal(r.outcome, "claimed");
+  assert.equal(r.credit, 1100, "常规 100 + 赛事签到礼 1000；#42 昨天就领过，不能算进今天");
+  assert.match(r.message, /Skill创新赛每日签到礼/);
+  const claims = f.calls.filter((c) => c.path.endsWith("/v1/ops/claim")).map((c) => c.body.campaignId);
+  assert.deepEqual(claims, [34, 40], "每日签到在前，额外活动按上游顺序跟上；已 CONFIRMED 的 #42 不碰");
+});
+
+test("checkinFlow: 三条都领过时报「今日已签到 +100」，不是报名礼的 2000", async () => {
+  // 回归：pickDailyCampaign 原来取「第一条 USER_LOGIN」= #42，它 CONFIRMED 之后
+  // 整轮结论就是 done / 2000，而当天真正到账的是常规签到的 100。
+  const f = opsResponder({
+    delivery: deliveryOf([
+      { campaignId: 42, title: "Skill创新赛报名礼", type: "USER_LOGIN", benefitAmount: 2000, claimable: false, status: "CONFIRMED" },
+      { campaignId: 40, title: "Skill创新赛每日签到礼", type: "USER_LOGIN", benefitAmount: 1000, claimable: false, status: "CONFIRMED" },
+      { campaignId: 34, title: "每日签到领100积分", type: "USER_LOGIN", benefitAmount: 100, claimable: false, status: "CONFIRMED" },
+    ]),
+  });
+  const r = await checkinWith(f);
+  assert.equal(r.outcome, "done");
+  assert.equal(r.credit, 100);
+  assert.equal(f.calls.filter((c) => c.method === "POST").length, 0, "全领过就不该有任何写请求");
+});
+
 test("checkinFlow: claim 成功但每日活动的 confirm 失败 → 仍然报 claimed（积分已到账）", async () => {
   // confirm 只是收尾：它失败不能把「已经领到积分」说成签到失败。
   // 变异：把 claim 分支里那次 confirm 的 try/catch 去掉 → 异常穿透到钩子外层
@@ -1439,6 +1473,34 @@ test("pickDailyCampaign: 活动号不可用的条目直接跳过（发了就是�
   assert.equal(pickDailyCampaign([{ campaignId: "abc", type: "USER_LOGIN" }]), null);
   // 字符串数字是上游真实出现过的形态，要认
   assert.equal(pickDailyCampaign([{ campaignId: "1", type: "USER_LOGIN" }]).campaignId, "1");
+});
+
+test("pickDailyCampaign: 同为 USER_LOGIN 时挑「今天可领 + id 最小」，不是顺序第一条", () => {
+  // 线上真实形态（2026-11-16 TQ8X 实测）：#42 报名礼 2000（一次性、已领）、
+  // #40 Skill 创新赛每日签到礼 1000/天、#34 常规签到 100/天，三条同为 USER_LOGIN。
+  const signup = { campaignId: 42, type: "USER_LOGIN", status: "CONFIRMED", benefitAmount: 2000 };
+  const contest = { campaignId: 40, type: "USER_LOGIN", status: "ELIGIBLE", benefitAmount: 1000 };
+  const base = { campaignId: 34, type: "USER_LOGIN", status: "ELIGIBLE", benefitAmount: 100 };
+  assert.equal(pickDailyCampaign([signup, contest, base]).campaignId, 34, "两条都可领时选常规签到（id 最小）");
+  // 全都领过：退回 id 最小的常规签到 —— 不能把报名礼的 2000 当成「今日签到」
+  assert.equal(pickDailyCampaign([signup, { ...contest, status: "CONFIRMED" }, { ...base, status: "CONFIRMED" }]).campaignId, 34);
+  // 只有报名礼可领（报名当天）：每日签到仍是 #34（今日已签），#42 走额外活动
+  const onlySignup = [{ ...signup, status: "ELIGIBLE" }, { ...contest, status: "CONFIRMED" }, { ...base, status: "CONFIRMED" }];
+  assert.equal(pickDailyCampaign(onlySignup).campaignId, 34);
+  assert.deepEqual(
+    pickClaimableCampaigns(onlySignup).map((i) => i.campaignId),
+    [34, 42],
+    "报名礼排进额外活动，照样会被领",
+  );
+});
+
+test("pickDailyCampaign: 全是 USER_LOGIN 但都不是今天可领 → 仍取 id 最小的那条", () => {
+  const items = [
+    { campaignId: 42, type: "USER_LOGIN", status: "CONSUMED", benefitAmount: 2000 },
+    { campaignId: 40, type: "USER_LOGIN", status: "CONFIRMED", benefitAmount: 1000 },
+    { campaignId: 34, type: "USER_LOGIN", status: "CONFIRMED", benefitAmount: 100 },
+  ];
+  assert.equal(pickDailyCampaign(items).campaignId, 34);
 });
 
 test("usableCampaignId: 只认正整数（含字符串数字）", () => {

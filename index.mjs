@@ -769,11 +769,16 @@ function usableCampaignId(v) {
 function pickDailyCampaign(items) {
   const list = (Array.isArray(items) ? items : []).filter((i) => i && usableCampaignId(i?.campaignId) !== undefined);
   const wanted = DAILY_CAMPAIGN_TYPE.toUpperCase();
-  return (
-    list.find((i) => String(i?.type ?? "").toUpperCase() === wanted) ??
-    list.find((i) => usableCampaignId(i?.campaignId) === DAILY_CAMPAIGN_ID) ??
-    null
-  );
+  const idOf = (i) => usableCampaignId(i?.campaignId);
+  // 🔴 「第一条 type=USER_LOGIN」不等于「每日签到」。上游把一个季度里所有登录类活动
+  //    都塞进 USER_LOGIN：常规签到（#34，100/天）、Skill 创新赛每日签到礼（#40，
+  //    1000/天）、报名礼（#42，2000，一次性）。按顺序取第一条，线上会落到报名礼上 ——
+  //    它一旦 CONFIRMED，整轮就变成「今日已签到 +2000」，而当天实际到账的是 100，
+  //    宿主面板上的数字是假的（2026-11-16 线上实测：报 3100，实际 1100）。
+  //    所以这里只取 campaignId 最小的那条（常规签到是最早的活动，id 最小、额度最低、
+  //    天天都有），其余同类活动一律走 pickClaimableCampaigns 的「额外活动」分支。
+  const candidates = list.filter((i) => String(i?.type ?? "").toUpperCase() === wanted).sort((a, b) => idOf(a) - idOf(b));
+  return candidates[0] ?? list.find((i) => idOf(i) === DAILY_CAMPAIGN_ID) ?? null;
 }
 
 /**

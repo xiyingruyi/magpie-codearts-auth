@@ -123,7 +123,9 @@ Token、0 点清零」，但那是 **2026-09-02 的缓存版本**，页面从未
 
 0.2.25 改成「**这一轮能领的全领**」，判据只取上游自己的字段：
 
-1. 每日签到仍按 `type=USER_LOGIN` 认（回落到 `campaignId=1`），结论、文案、金额口径全部不变；
+1. 每日签到仍按 `type=USER_LOGIN` 认，同类里取 `campaignId` 最小那条（常规签到是最早的活动；
+   同类下还挂着赛事签到礼、报名礼，见下面 0.2.28 的实测），
+   结论、文案、金额口径全部不变；
 2. 其余活动只要 `status=ELIGIBLE` 且 `claimable !== false` 就一起领 —— 服务端只在**今天确实
    能领**时才置 `ELIGIBLE`，比维护一份 type 白名单准确，也不会因为上游换活动名/换 id 而静默失效；
 3. `INVITE_USER` / `STUDENT_CERTIFIED` **硬排除**：它们要真实的「好友注册 / 学生认证」事件才
@@ -286,6 +288,32 @@ CODEARTS_AK=... CODEARTS_SK=... node scripts/probe-session.mjs <模式> [并发�
 3. **丢弃云端 `channel` 字段** —— 该字段正是上游构建 `AGENT_MODELS` 的依据；本版保留并写入运行期缓存。
 
 此外补齐了 `ineligible` / `captcha` / `inactive` 三种签到 outcome（骨架版遇到会落到 `failed` 并每 30 分钟无意义重试）。
+
+## 0.2.28（2026-11-16：三条都是 `USER_LOGIN`，别把报名礼当成「每日签到」）
+
+2026-11-16 01:10 用 0.2.27 对 TQ8X 真跑，清单是：
+
+```
+#42 USER_LOGIN CONFIRMED claimable=false 2000「Skill创新赛报名礼」
+#40 USER_LOGIN ELIGIBLE  claimable=true  1000「Skill创新赛每日签到礼」
+#34 USER_LOGIN ELIGIBLE  claimable=true   100「每日签到领100积分」
+```
+
+`claimed` 结果对，但**报的额度是 `3100`，当天实际只进 1100**。原因在
+`pickDailyCampaign`：它取「第一条 `type=USER_LOGIN`」，线上那条是报名礼 `#42`。报名礼
+昨天就 CONFIRMED 了，于是本轮被当成「今日签到已完成 / +2000」，再加上 `#40` 的 1000 和
+归一化后并进来的 `#34` 的 100 —— 数字是拼出来的，不是到账的。
+
+| 改动 | 说明 |
+|---|---|
+| `pickDailyCampaign` 改为「同类里取 `campaignId` 最小」 | 常规签到是最早那条（`#34`，额度最低、天天有），报名礼（`#42`）与赛事签到礼（`#40`）一律走额外活动分支 |
+| 类型判据仍是 `DAILY_CAMPAIGN_TYPE`，`claimable` / `status` 判据不变 | 只是同类里不再按上游下发顺序取第一条 |
+| 新增 4 条测试 | 真实形态挑 `#34`、全 CONFIRMED 仍挑 `#34`（不能报 2000）、真实形态一轮领 `#40`+`#34` 且 `credit=1100`、三条全领过时 `done`/`100` 且零 POST |
+
+实跑复核（同一份线上清单）：`pickDailyCampaign -> 34`、`pickClaimableCampaigns -> 34`、
+`checkinFlow -> {"outcome":"done","credit":100,"message":"今日已签到"}`。#40 与 #34 在这轮
+之前已经领到手，所以这里是 `done`；明天 00:00 之后 #40 回到 `ELIGIBLE` 就会是一次
+`claimed` / `1100`。测试 255 → 259。
 
 ## 0.2.27（2026-11-15：恢复 0.2.25 / 0.2.26 —— 并补上当时没验证成的那半边）
 
